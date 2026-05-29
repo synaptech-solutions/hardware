@@ -15,9 +15,10 @@ For each step:
     4. Drop throttle, disarm (AUX2 → 1000 us)
     5. Rest 3 s with motors truly off (disarmed)
 
-Channel layout verified against the user's Betaflight dump:
-    aux 0 0 1 1200 2100  → ARM on AUX2 (CRSF ch 6, array index 5)
-    aux 1 1 2 1300 1700  → ANGLE on AUX3 in 1300-1700 (we hold 1500)
+Channel layout from the AIR75 Betaflight dump:
+    aux 0 0 1 1300 1700  → ARM on AUX2 (CRSF ch 6, array index 5) — arm with ~1500
+    aux 1 1 2 1300 1700  → ANGLE on AUX3 (index 6) — hold 1500
+    aux 6 36 5 1700 2100 → PREARM on AUX6 (index 9) — cycle to 1800
 
 Safety:
     - Requires typed "YES" to start
@@ -37,9 +38,7 @@ import sys
 import time
 import threading
 import atexit
-import os
-import datetime
-from typing import Optional, TextIO
+from typing import Optional
 
 try:
     import serial
@@ -65,7 +64,7 @@ MODE_IDX = 6         # AUX3 — `aux 1 1 2 1300 1700`     mode 1 (ANGLE)
 # --- Channel values ---
 THROTTLE_MIN_US = 1000   # 0% throttle, also < min_check=1050 (arms allowed)
 NEUTRAL_US = 1500
-ARM_HIGH_US = 1800       # inside ARM range 1200-2100
+ARM_HIGH_US = 1500       # inside AIR75 ARM range 1300-1700 (was 1800 for Meteor75 — out of range!)
 ARM_LOW_US = 1000        # outside ARM range
 PREARM_HIGH_US = 1800    # inside PREARM range 1700-2100
 PREARM_LOW_US = 1000     # outside PREARM range
@@ -91,37 +90,8 @@ def pct_to_us(pct: float) -> int:
 
 # --- Logging ---
 
-_LOG_FILE: Optional[TextIO] = None
-_T0: float = 0.0
-
-
-def log_open(path: str):
-    global _LOG_FILE, _T0
-    _LOG_FILE = open(path, "w", buffering=1)  # line-buffered
-    _T0 = time.time()
-    _LOG_FILE.write(f"# motor_ramp_test log — started {datetime.datetime.now().isoformat()}\n")
-
-
-def log_close():
-    global _LOG_FILE
-    if _LOG_FILE is not None:
-        try:
-            _LOG_FILE.write(f"# log closed {datetime.datetime.now().isoformat()}\n")
-            _LOG_FILE.close()
-        except Exception:
-            pass
-        _LOG_FILE = None
-
-
 def log(msg: str = ""):
-    """Print to stdout and write to log file with a relative timestamp."""
     print(msg)
-    if _LOG_FILE is not None:
-        try:
-            t = time.time() - _T0
-            _LOG_FILE.write(f"[{t:8.3f}s] {msg}\n")
-        except Exception:
-            pass
 
 
 # --- Shared state between threads ---
@@ -326,18 +296,9 @@ def run_cycles(state: State):
 
 
 def main():
-    # Open the log file before any output so the run is captured from the start.
-    log_dir = os.path.dirname(os.path.abspath(__file__))
-    log_path = os.path.join(
-        log_dir, f"motor_ramp_{datetime.datetime.now():%Y%m%d_%H%M%S}.log"
-    )
-    log_open(log_path)
-    atexit.register(log_close)
-
     log("=" * 72)
-    log("  THROTTLE RAMP TEST — Meteor75 Pro via Ranger")
+    log("  THROTTLE RAMP TEST — AIR75 via Ranger")
     log("=" * 72)
-    log(f"  Log file: {log_path}")
     log("")
     log("  Pulses throttle stick from 5% up to 40% in 5% steps.")
     log("  Each pulse: 1.5 s on, 3 s off (drone disarmed between cycles).")
@@ -348,11 +309,6 @@ def main():
     log("    • Keep clear of motors; idle current draws are still hot.")
     log("    • Press Ctrl-C at any time to abort and disarm.")
     log("")
-    resp = input("  Type YES (uppercase) to proceed: ").strip()
-    log(f"  user input: {resp!r}")
-    if resp != "YES":
-        log("  Aborted by user.")
-        sys.exit("Aborted.")
 
     port = (sys.argv[1] if len(sys.argv) > 1 else autodetect_port()) or "/dev/ttyUSB0"
     log(f"\nOpening {port} @ 420000 baud")

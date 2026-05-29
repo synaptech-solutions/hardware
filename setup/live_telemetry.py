@@ -9,6 +9,7 @@ dashboard updated at ~10 Hz showing:
   - Attitude (pitch / roll / yaw, decoded from CRSF ATTITUDE 0x1E)
   - Battery (voltage / current / capacity / remaining, BATTERY 0x08)
   - Flight mode (FLIGHT_MODE 0x21)
+    - Raw IMU via MSP_RAW_IMU (acc/gyro/mag, 9x int16)
   - Link statistics both directions (LINK_STATISTICS 0x14)
   - Device names seen (DEVICE_INFO 0x29, TX/RX/FC)
   - Freshness timer per field, so stale data is obvious
@@ -16,6 +17,8 @@ dashboard updated at ~10 Hz showing:
 Usage:
     python3 live_telemetry.py                     # auto-detect port
     python3 live_telemetry.py /dev/ttyUSB0 420000
+                                                # (MSP_RAW_IMU probe on Ranger link)
+    python3 live_telemetry.py /dev/ttyUSB0 420000 /dev/ttyACM0 115200
 
 Ctrl-C to exit. The script transmits neutral sticks (1500 µs every
 channel, AUX1 low) so even if the drone were somehow armed it stays put.
@@ -52,6 +55,8 @@ T_ATTITUDE = 0x1E
 T_FLIGHT_MODE = 0x21
 T_DEVICE_PING = 0x28
 T_DEVICE_INFO = 0x29
+T_MSP_REQ = 0x7A
+T_MSP_RESP = 0x7B
 
 RF_MODE_NAMES = {
     20: "LoRa 2G4 25Hz", 21: "LoRa 2G4 50Hz (init)",
@@ -62,6 +67,154 @@ RF_MODE_NAMES = {
     30: "FLRC 2G4 250Hz DVDA", 31: "FLRC 2G4 500Hz DVDA",
     32: "FLRC 2G4 500Hz", 33: "FLRC 2G4 1000Hz",
 }
+
+# --- MSP (Betaflight) helpers ---
+MSP_RAW_IMU_CMD = 102  # MSP_RAW_IMU: 9x int16 (acc xyz, gyro xyz, mag xyz)
+
+# MSP_RAW_IMU scaling (common Betaflight MPU defaults).
+# For many BF targets, accelerometer raw units are ~2048 LSB per 1 g.
+ACC_LSB_PER_G = 2048.0
+GYRO_LSB_PER_DPS = 16.4
+G_MPS2 = 9.80665
+
+
+def build_msp_request(cmd: int) -> bytes:
+    size = 0
+    chk = size ^ (cmd & 0xFF)
+    return bytes([0x24, 0x4D, 0x3C, size, cmd & 0xFF, chk & 0xFF])
+
+
+def build_crsf_msp_v2_request(cmd: int, payload: bytes = b"") -> bytes:
+        """Build CRSF MSP_REQ (0x7A) carrying one MSPv2 request chunk.
+
+        Encapsulated MSP payload format:
+            <status><flags><fn_lo><fn_hi><len_lo><len_hi><payload...><msp_crc>
+        where status 0x50 means MSPv2 + new frame + seq 0 + no error.
+        """
+        payload_len = len(payload)
+        msp = bytearray()
+        msp.append(0x50)  # status: v2 + start + seq0
+        msp.append(0x00)  # flags
+        msp.append(cmd & 0xFF)
+        msp.append((cmd >> 8) & 0xFF)
+        msp.append(payload_len & 0xFF)
+        msp.append((payload_len >> 8) & 0xFF)
+        msp.extend(payload)
+        # MSP-over-CRSF checksum is over flags+function+length+payload (status excluded).
+        msp.append(crc8_dvb_s2(bytes(msp[1:])))
+        ext_payload = bytes([CRSF_ADDR_FC, CRSF_ADDR_RADIO]) + bytes(msp)
+        return build_crsf_frame(T_MSP_REQ, ext_payload)
+
+
+class MspParser:
+    """MSP v1 response parser ($M> ...)."""
+    def __init__(self):
+        self.buf = bytearray()
+
+    def feed(self, data: bytes):
+        self.buf.extend(data)
+        while True:
+            i = self.buf.find(b"$M>")
+            if i < 0:
+                if len(self.buf) > 2048:
+                    del self.buf[:-128]
+                return
+            if i > 0:
+                del self.buf[:i]
+            if len(self.buf) < 6:
+                return
+            size = self.buf[3]
+            total = 6 + size
+            if len(self.buf) < total:
+                return
+            cmd = self.buf[4]
+            payload = bytes(self.buf[5:5 + size])
+            chk = 0
+            for b in self.buf[3:5 + size]:
+                chk ^= b
+            frame_chk = self.buf[5 + size]
+            del self.buf[:total]
+            if chk != frame_chk:
+                continue
+            yield cmd, payload
+
+
+class CrsfMspParser:
+    """Reassembles MSP-over-CRSF chunks (0x7A/0x7B) into complete MSP frames."""
+    def __init__(self):
+        self.buf = bytearray()
+        self.expected = None
+        self.version = None
+        self.cmd = None
+        self.last_seq = None
+
+    def reset(self):
+        self.buf.clear()
+        self.expected = None
+        self.version = None
+        self.cmd = None
+        self.last_seq = None
+
+    def feed_chunk(self, payload: bytes):
+        # payload: <dest><orig><status><msp_body_chunk...>
+        if len(payload) < 3:
+            return
+        status = payload[2]
+        chunk = payload[3:]
+        seq = status & 0x0F
+        start = bool(status & 0x10)
+        version = (status >> 5) & 0x03
+        error = bool(status & 0x80)
+        if error:
+            self.reset()
+            return
+
+        if start:
+            self.buf = bytearray()
+            self.expected = None
+            self.version = version
+            self.cmd = None
+            self.last_seq = seq
+        else:
+            if self.version is None:
+                return
+            if version != self.version:
+                self.reset()
+                return
+            if self.last_seq is None or seq != ((self.last_seq + 1) & 0x0F):
+                self.reset()
+                return
+            self.last_seq = seq
+
+        self.buf.extend(chunk)
+
+        if self.expected is None:
+            if self.version == 2 and len(self.buf) >= 5:
+                self.cmd = self.buf[1] | (self.buf[2] << 8)
+                data_len = self.buf[3] | (self.buf[4] << 8)
+                self.expected = 5 + data_len
+            elif self.version == 1 and len(self.buf) >= 2:
+                self.cmd = self.buf[1]
+                data_len = self.buf[0]
+                self.expected = 2 + data_len
+
+        if self.expected is None or len(self.buf) < self.expected:
+            return
+
+        frame = bytes(self.buf[:self.expected])
+        if self.version == 2:
+            data_len = frame[3] | (frame[4] << 8)
+            out_payload = frame[5:5 + data_len]
+        elif self.version == 1:
+            data_len = frame[0]
+            out_payload = frame[2:2 + data_len]
+        else:
+            self.reset()
+            return
+
+        out_cmd = self.cmd
+        self.reset()
+        yield out_cmd, out_payload
 
 
 def crc8_dvb_s2(data: bytes) -> int:
@@ -193,6 +346,48 @@ def decode_device_info(payload: bytes):
     return None  # handled inline so we can read source addr
 
 
+def decode_msp_raw_imu(payload: bytes):
+    if len(payload) < 18:
+        return None
+    vals = [int.from_bytes(payload[i:i + 2], "little", signed=True)
+            for i in range(0, 18, 2)]
+    return {
+        "ax": vals[0], "ay": vals[1], "az": vals[2],
+        "gx": vals[3], "gy": vals[4], "gz": vals[5],
+        "mx": vals[6], "my": vals[7], "mz": vals[8],
+    }
+
+
+def convert_msp_raw_imu_units(raw_imu: dict):
+    ax_g = raw_imu["ax"] / ACC_LSB_PER_G
+    ay_g = raw_imu["ay"] / ACC_LSB_PER_G
+    az_g = raw_imu["az"] / ACC_LSB_PER_G
+
+    gx_dps = raw_imu["gx"] / GYRO_LSB_PER_DPS
+    gy_dps = raw_imu["gy"] / GYRO_LSB_PER_DPS
+    gz_dps = raw_imu["gz"] / GYRO_LSB_PER_DPS
+
+    return {
+        "ax_g": ax_g,
+        "ay_g": ay_g,
+        "az_g": az_g,
+        "ax_mps2": ax_g * G_MPS2,
+        "ay_mps2": ay_g * G_MPS2,
+        "az_mps2": az_g * G_MPS2,
+        "gx_dps": gx_dps,
+        "gy_dps": gy_dps,
+        "gz_dps": gz_dps,
+        "gx_rads": math.radians(gx_dps),
+        "gy_rads": math.radians(gy_dps),
+        "gz_rads": math.radians(gz_dps),
+        "mag_norm": math.sqrt(
+            raw_imu["mx"] * raw_imu["mx"]
+            + raw_imu["my"] * raw_imu["my"]
+            + raw_imu["mz"] * raw_imu["mz"]
+        ),
+    }
+
+
 # --- Dashboard ---
 
 CSI = "\033["
@@ -244,6 +439,10 @@ class State:
         self.battery_t: Optional[float] = None
         self.flight_mode: Optional[str] = None
         self.flight_mode_t: Optional[float] = None
+        self.raw_imu = None
+        self.raw_imu_t: Optional[float] = None
+        self.raw_imu_rx_count = 0
+        self.msp_status = "MSP idle"
         self.link = None
         self.link_t: Optional[float] = None
         self.devices: dict[int, str] = {}  # addr -> name
@@ -254,104 +453,90 @@ class State:
         self.start = time.time()
 
 
-def render(s: State, port: str, baud: int):
+
+def _fmt_float(v: Optional[float], unit: str = "", precision: int = 2) -> str:
+    if v is None:
+        return "NA"
+    return f"{v:.{precision}f}{unit}"
+
+
+def _fmt_int(v: Optional[int], unit: str = "") -> str:
+    if v is None:
+        return "NA"
+    return f"{v}{unit}"
+
+
+def render(s: State, port: str, baud: int, msp_port: Optional[str], msp_baud: int):
     now = time.time()
-    sys.stdout.write(CSI + "H" + CSI + "2J")  # home + clear
+    a = s.attitude or {}
+    b = s.battery or {}
+    l = s.link or {}
+    i = s.raw_imu or {}
+    msp_src = f"{msp_port}@{msp_baud}" if msp_port else f"Ranger link {port}@{baud}"
 
-    title = f"  ELRS Drone Telemetry — {port} @ {baud} baud"
-    sys.stdout.write(f"{BOLD}{title}{RESET}\n")
-    sys.stdout.write("  " + "─" * 68 + "\n\n")
-
-    # Connection / link
-    sys.stdout.write(f"  {BOLD}LINK{RESET}\n")
-    if s.link:
-        L = s.link
-        c_up = lq_colour(L["up_lq"])
-        c_dn = lq_colour(L["dn_lq"])
-        rfm = RF_MODE_NAMES.get(L["rf_mode"], f"unknown({L['rf_mode']})")
-        sys.stdout.write(
-            f"    Uplink   {c_up}{L['up_lq']:>3d}%{RESET}  RSSI {L['up_rssi1_dBm']:>+4d} dBm  "
-            f"SNR {L['up_snr_dB']:>+3d} dB   (laptop → drone)\n"
-            f"    Downlink {c_dn}{L['dn_lq']:>3d}%{RESET}  RSSI {L['dn_rssi_dBm']:>+4d} dBm  "
-            f"SNR {L['dn_snr_dB']:>+3d} dB   (drone → laptop)\n"
-            f"    RF mode  {rfm}   TX power idx {L['up_tx_pwr_idx']}\n"
-        )
-    else:
-        sys.stdout.write(f"    {DIM}no link stats received yet{RESET}\n\n\n")
-    sys.stdout.write(f"    updated {fmt_age(s.link_t, now)}\n\n")
-
-    # Attitude
-    sys.stdout.write(f"  {BOLD}ATTITUDE / IMU{RESET}\n")
-    if s.attitude:
-        a = s.attitude
-        sys.stdout.write(
-            f"    Pitch  {CYAN}{a['pitch_deg']:>+8.2f}°{RESET}    "
-            f"Roll   {CYAN}{a['roll_deg']:>+8.2f}°{RESET}    "
-            f"Yaw    {CYAN}{a['yaw_deg']:>+8.2f}°{RESET}\n"
-        )
-    else:
-        sys.stdout.write(f"    {DIM}no attitude data yet{RESET}\n")
-    sys.stdout.write(f"    updated {fmt_age(s.attitude_t, now)}\n\n")
-
-    # Battery
-    sys.stdout.write(f"  {BOLD}BATTERY{RESET}\n")
-    if s.battery:
-        b = s.battery
-        vc = voltage_colour(b["voltage_V"])
-        sys.stdout.write(
-            f"    Voltage   {vc}{b['voltage_V']:>5.2f} V{RESET}    "
-            f"Current   {b['current_A']:>5.2f} A\n"
-            f"    Capacity  {b['capacity_mAh']:>5d} mAh  "
-            f"Remaining {b['remaining_pct']:>3d}%\n"
-        )
-        if b["voltage_V"] < 0.5:
-            sys.stdout.write(
-                f"    {DIM}vbat reads ~0 V → flight battery not on BT2.0 (USB-only?){RESET}\n"
-            )
-    else:
-        sys.stdout.write(f"    {DIM}no battery data yet{RESET}\n\n")
-    sys.stdout.write(f"    updated {fmt_age(s.battery_t, now)}\n\n")
-
-    # Flight mode
-    sys.stdout.write(f"  {BOLD}FLIGHT MODE{RESET}\n")
-    if s.flight_mode is not None:
-        mode = s.flight_mode
-        armed = not mode.endswith("*")
-        armed_lbl = f"{RED}ARMED{RESET}" if armed else f"{GREEN}disarmed{RESET}"
-        sys.stdout.write(f"    {CYAN}{mode!r}{RESET}   ({armed_lbl})\n")
-    else:
-        sys.stdout.write(f"    {DIM}no flight mode data yet{RESET}\n")
-    sys.stdout.write(f"    updated {fmt_age(s.flight_mode_t, now)}\n\n")
-
-    # Devices
-    sys.stdout.write(f"  {BOLD}DEVICES SEEN{RESET}\n")
-    if s.devices:
-        for addr, name in s.devices.items():
-            role = ADDR_NAMES.get(addr, f"0x{addr:02X}")
-            sys.stdout.write(
-                f"    [{role:<5}] {name:<28} (seen {fmt_age(s.devices_t.get(addr), now)})\n"
-            )
-    else:
-        sys.stdout.write(f"    {DIM}no DEVICE_INFO frames yet{RESET}\n")
-
-    # Totals
-    sys.stdout.write("\n  " + "─" * 68 + "\n")
-    runtime = now - s.start
-    sys.stdout.write(
-        f"  frames in: {s.frames_in:<6d}  bytes in: {s.bytes_in:<7d}  "
-        f"bytes out: {s.bytes_out:<7d}  uptime: {runtime:>5.1f}s\n"
+    print("\n" + "=" * 72)
+    print(f"ELRS Live Telemetry | {port}@{baud} | uptime {now - s.start:.1f}s")
+    print("-" * 72)
+    print(
+        "ATTITUDE  "
+        f"pitch={_fmt_float(a.get('pitch_deg'), 'deg')}  "
+        f"roll={_fmt_float(a.get('roll_deg'), 'deg')}  "
+        f"yaw={_fmt_float(a.get('yaw_deg'), 'deg')}"
     )
-    sys.stdout.write(f"  {DIM}Ctrl-C to exit{RESET}\n")
-    sys.stdout.flush()
+    print(
+        "BATTERY   "
+        f"voltage={_fmt_float(b.get('voltage_V'), 'V')}  "
+        f"current={_fmt_float(b.get('current_A'), 'A')}  "
+        f"remaining={_fmt_int(b.get('remaining_pct'), '%')}"
+    )
+    print(
+        "LINK      "
+        f"up_lq={_fmt_int(l.get('up_lq'), '%')}  "
+        f"dn_lq={_fmt_int(l.get('dn_lq'), '%')}  "
+        f"up_rssi={_fmt_int(l.get('up_rssi1_dBm'), 'dBm')}  "
+        f"dn_rssi={_fmt_int(l.get('dn_rssi_dBm'), 'dBm')}"
+    )
+    print(
+        "RAW_IMU   "
+        f"ax={_fmt_int(i.get('ax'))}  ay={_fmt_int(i.get('ay'))}  az={_fmt_int(i.get('az'))}  "
+        f"gx={_fmt_int(i.get('gx'))}  gy={_fmt_int(i.get('gy'))}  gz={_fmt_int(i.get('gz'))}"
+    )
+    print(f"MODE      {s.flight_mode if s.flight_mode is not None else 'NA'}")
+    print(f"MSP       {s.msp_status} | source={msp_src} | frames={s.raw_imu_rx_count}")
+    print(
+        "RX/TX     "
+        f"frames_in={s.frames_in}  bytes_in={s.bytes_in}  bytes_out={s.bytes_out}"
+    )
+    if s.devices:
+        devices = ", ".join(
+            f"{ADDR_NAMES.get(addr, f'0x{addr:02X}')}:{name}" for addr, name in s.devices.items()
+        )
+    else:
+        devices = "none"
+    print(f"DEVICES   {devices}")
+    print("=" * 72)
 
 
 def main():
     port = sys.argv[1] if len(sys.argv) > 1 else autodetect_port()
     baud = int(sys.argv[2]) if len(sys.argv) > 2 else 420000
+    msp_port = sys.argv[3] if len(sys.argv) > 3 else None
+    msp_baud = int(sys.argv[4]) if len(sys.argv) > 4 else 115200
     if not port:
         sys.exit("No USB serial device found. Plug in the Ranger and try again.")
 
     ser = serial.Serial(port, baudrate=baud, timeout=0.02)
+    msp_ser = ser
+    msp_via_ranger = True
+    if msp_port:
+        try:
+            msp_ser = serial.Serial(msp_port, baudrate=msp_baud, timeout=0.02)
+            msp_via_ranger = False
+        except Exception as e:
+            print(f"WARN: cannot open MSP port {msp_port}@{msp_baud}: {e}")
+            msp_port = None
+            msp_ser = ser
+            msp_via_ranger = True
 
     ping = build_device_ping()
     # neutral sticks: throttle low (988 µs), everything else center, AUX low
@@ -361,12 +546,15 @@ def main():
 
     state = State()
     parser = CrsfParser()
+    msp_parser = MspParser()
+    crsf_msp_parser = CrsfMspParser()
+    msp_raw_imu_req = build_msp_request(MSP_RAW_IMU_CMD)
+    crsf_msp_raw_imu_req = build_crsf_msp_v2_request(MSP_RAW_IMU_CMD)
 
     next_ping = 0.0
     next_rc = 0.0
+    next_msp = 0.0
     next_render = 0.0
-
-    sys.stdout.write(CSI + "?25l")  # hide cursor
 
     try:
         while True:
@@ -374,6 +562,9 @@ def main():
             chunk = ser.read(512)
             if chunk:
                 state.bytes_in += len(chunk)
+                if msp_via_ranger:
+                    # Ranger link carries CRSF frames. MSP arrives encapsulated in 0x7B.
+                    pass
                 for ftype, payload in parser.feed(chunk):
                     state.frames_in += 1
                     t = time.time()
@@ -407,6 +598,28 @@ def main():
                             if name:
                                 state.devices[src] = name
                                 state.devices_t[src] = t
+                    elif ftype == T_MSP_RESP and msp_via_ranger:
+                        for cmd, msp_payload in crsf_msp_parser.feed_chunk(payload):
+                            if cmd == MSP_RAW_IMU_CMD:
+                                d = decode_msp_raw_imu(msp_payload)
+                                if d:
+                                    state.raw_imu = d
+                                    state.raw_imu_t = t
+                                    state.raw_imu_rx_count += 1
+                                    state.msp_status = "OK (Ranger CRSF MSP)"
+
+            # Read MSP from dedicated MSP link (FC USB), not CRSF link.
+            if msp_ser is not None and not msp_via_ranger:
+                msp_chunk = msp_ser.read(256)
+                if msp_chunk:
+                    for cmd, payload in msp_parser.feed(msp_chunk):
+                        if cmd == MSP_RAW_IMU_CMD:
+                            d = decode_msp_raw_imu(payload)
+                            if d:
+                                state.raw_imu = d
+                                state.raw_imu_t = time.time()
+                                state.raw_imu_rx_count += 1
+                                state.msp_status = "OK (dedicated MSP port)"
 
             # Keep the link alive
             if now >= next_rc:
@@ -417,17 +630,34 @@ def main():
                 ser.write(ping)
                 state.bytes_out += len(ping)
                 next_ping = now + 2.0
+            if now >= next_msp:
+                if msp_ser is not None:
+                    if msp_via_ranger:
+                        msp_ser.write(crsf_msp_raw_imu_req)
+                        state.bytes_out += len(crsf_msp_raw_imu_req)
+                    else:
+                        msp_ser.write(msp_raw_imu_req)
+                        state.bytes_out += len(msp_raw_imu_req)
+                    if state.raw_imu_t is None:
+                        if msp_via_ranger:
+                            state.msp_status = "waiting for MSP_RAW_IMU over CRSF (0x7B)"
+                        else:
+                            state.msp_status = "waiting for MSP_RAW_IMU response"
+                else:
+                    state.msp_status = "MSP disabled; provide FC MSP port"
+                next_msp = now + 0.10  # 10 Hz MSP_RAW_IMU poll
 
             # Repaint at 10 Hz
             if now >= next_render:
-                render(state, port, baud)
+                render(state, port, baud, msp_port, msp_baud)
                 next_render = now + 0.1
     except KeyboardInterrupt:
         pass
     finally:
-        sys.stdout.write(CSI + "?25h")  # restore cursor
         sys.stdout.write("\n")
         ser.close()
+        if msp_ser is not None and msp_ser is not ser:
+            msp_ser.close()
 
 
 if __name__ == "__main__":

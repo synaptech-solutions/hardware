@@ -1,0 +1,70 @@
+===== RUN START 2026-05-28 16:56:19 =====
+CRSF on /dev/ttyUSB0 @ 420000
+*** LIVE FLIGHT ***
+pilot confirmation input='FLY'
+waiting for CRSF telemetry link...
+link up, mode='STAB*'
+[ARM_SETTLE] FC arm-blocked mode='STAB*' -> R1500 P1500 Y1500 T1000 vis=fresh age=8ms dm=87 tag=0 imu_rp=(+0.5,+0.9) az=nan vision=[capFPS=60 detFPS=60] mode=STAB* batt=4.10V
+[ARM_SETTLE] FC arm-blocked mode='STAB*' -> R1500 P1500 Y1500 T1000 vis=fresh age=9ms dm=85 tag=0 imu_rp=(+0.5,+0.9) az=nan vision=[capFPS=60 detFPS=60] mode=STAB* batt=4.10V
+[ARM_SETTLE] FC arm-blocked mode='STAB*' -> R1500 P1500 Y1500 T1000 vis=fresh age=10ms dm=85 tag=0 imu_rp=(+0.5,+0.9) az=nan vision=[capFPS=60 detFPS=60] mode=STAB* batt=4.10V
+[ARM_SETTLE] FC arm-blocked mode='STAB*' -> R1500 P1500 Y1500 T1000 vis=fresh age=12ms dm=89 tag=0 imu_rp=(+0.5,+0.9) az=nan vision=[capFPS=60 detFPS=60] mode=STAB* batt=4.10V
+[ARM_SETTLE] lock 0.00/0.40s -> R1500 P1500 Y1500 T1000 vis=fresh age=13ms dm=87 tag=0 imu_rp=(+0.5,+0.9) az=nan vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+[ARM_SETTLE] lock 0.12/0.40s -> R1500 P1500 Y1500 T1000 vis=fresh age=15ms dm=87 tag=0 imu_rp=(+0.5,+1.0) az=nan vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+[ARM_SETTLE] lock 0.24/0.40s -> R1500 P1500 Y1500 T1000 vis=fresh age=20ms dm=87 tag=0 imu_rp=(+0.6,+1.0) az=nan vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+[ARM_SETTLE] lock 0.36/0.40s -> R1500 P1500 Y1500 T1000 vis=fresh age=6ms dm=88 tag=0 imu_rp=(+0.7,+1.0) az=nan vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+>> TAKEOFF target: tag=0 fwd=+1.03 lat=+0.00 up=+0.00
+MSP_RAW_IMU polling started
+[TAKEOFF] TAKEOFF t=0.06/0.35s -> R1500 P1500 Y1500 T1381 vis=fresh age=6ms dm=87 tag=0 imu_rp=(+0.7,+1.0) az=nan vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+[TAKEOFF] TAKEOFF t=0.18/0.35s -> R1500 P1500 Y1500 T1385 vis=fresh age=9ms dm=51 tag=0 imu_rp=(+0.7,+1.0) az=nan vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+[TAKEOFF] TAKEOFF t=0.30/0.35s -> R1500 P1500 Y1500 T1361 vis=fresh age=13ms dm=34 tag=0 imu_rp=(+0.7,+1.0) az=nan vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+>> HOVER: vertical + gentle XY hold
+[FLY] tag=0 up=+0.66 lat=-0.69 fwd=+1.01 v=(-0.54,+0.23,-0.21) -> R1488 P1489 Y1500 T1360 vis=fresh age=16ms dm=38 tag=0 imu_rp=(+0.7,+1.0) az=9.96 vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+[FLY] tag=0 up=+0.54 lat=-0.65 fwd=+0.97 v=(-1.01,+0.41,-0.34) -> R1500 P1479 Y1500 T1339 vis=fresh age=17ms dm=40 tag=0 imu_rp=(+0.7,+1.0) az=9.96 vision=[capFPS=60 detFPS=58] mode=STAB batt=4.10V
+[FLY] tag=0 up=+0.42 lat=-0.60 fwd=+0.94 v=(-0.97,+0.40,-0.33) -> R1499 P1478 Y1500 T1339 vis=fresh age=20ms dm=47 tag=0 imu_rp=(+0.7,+1.0) az=9.96 vision=[capFPS=60 detFPS=58] mode=STAB batt=4.10V
+[FLY] tag=0 up=+0.33 lat=-0.58 fwd=+0.93 v=(-0.91,+0.26,-0.13) -> R1490 P1487 Y1500 T1340 vis=fresh age=20ms dm=40 tag=0 imu_rp=(+0.7,+1.0) az=9.96 vision=[capFPS=60 detFPS=58] mode=STAB batt=4.10V
+[FLY] tag=0 up=+0.23 lat=-0.53 fwd=+0.89 v=(-0.86,+0.35,-0.26) -> R1496 P1478 Y1500 T1340 vis=fresh age=7ms dm=56 tag=0 imu_rp=(+0.7,+1.0) az=9.96 vision=[capFPS=60 detFPS=58] mode=STAB batt=4.10V
+[FLY] tag=0 up=+0.15 lat=-0.51 fwd=+0.89 v=(-0.68,+0.27,-0.09) -> R1491 P1486 Y1500 T1342 vis=fresh age=8ms dm=61 tag=0 imu_rp=(+0.7,+1.0) az=9.96 vision=[capFPS=60 detFPS=58] mode=STAB batt=4.10V
+[FLY] tag=0 up=+0.08 lat=-0.48 fwd=+0.89 v=(-0.62,+0.22,+0.00) -> R1487 P1491 Y1500 T1339 vis=fresh age=9ms dm=65 tag=0 imu_rp=(+0.7,+1.0) az=15.02 vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+[FLY] tag=0 up=+0.03 lat=-0.46 fwd=+0.90 v=(-0.56,+0.19,+0.10) -> R1485 P1496 Y1500 T1337 vis=fresh age=12ms dm=73 tag=0 imu_rp=(+0.7,+1.0) az=10.35 vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+[FLY] tag=0 up=-0.02 lat=-0.44 fwd=+0.91 v=(-0.49,+0.19,+0.11) -> R1485 P1498 Y1500 T1337 vis=fresh age=13ms dm=58 tag=0 imu_rp=(+0.7,+1.0) az=10.35 vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+[FLY] tag=0 up=-0.07 lat=-0.42 fwd=+0.94 v=(-0.40,+0.14,+0.24) -> R1481 P1506 Y1500 T1336 vis=fresh age=17ms dm=63 tag=0 imu_rp=(+0.7,+1.0) az=10.35 vision=[capFPS=60 detFPS=60] mode=STAB batt=4.10V
+[FLY] tag=0 up=-0.08 lat=-0.42 fwd=+0.95 v=(-0.31,+0.09,+0.23) -> R1478 P1506 Y1500 T1337 vis=lost age=85ms dm=75 tag=0 imu_rp=(+0.7,+1.0) az=10.35 vision=[capFPS=60 detFPS=54] mode=STAB batt=4.10V
+[FLY] tag=0 up=-0.08 lat=-0.42 fwd=+0.95 v=(-0.21,+0.06,+0.15) -> R1476 P1503 Y1500 T1340 vis=lost age=185ms dm=75 tag=0 imu_rp=(+0.7,+1.0) az=10.35 vision=[capFPS=60 detFPS=54] mode=STAB batt=4.10V
+[FLY] tag=0 up=-0.08 lat=-0.42 fwd=+0.95 v=(-0.13,+0.04,+0.10) -> R1474 P1500 Y1500 T1342 vis=lost age=305ms dm=75 tag=0 imu_rp=(+0.7,+1.0) az=10.35 vision=[capFPS=60 detFPS=54] mode=STAB batt=4.10V
+[FLY] LOST 0.42s descending -> R1500 P1500 Y1500 T1295 vis=lost age=425ms dm=75 tag=0 imu_rp=(+0.7,+1.0) az=10.35 vision=[capFPS=60 detFPS=54] mode=STAB batt=4.10V
+[FLY] LOST 0.54s descending -> R1500 P1500 Y1500 T1223 vis=lost age=545ms dm=75 tag=0 imu_rp=(+0.7,+1.0) az=10.35 vision=[capFPS=60 detFPS=54] mode=STAB batt=4.10V
+[FLY] LOST 0.66s descending -> R1500 P1500 Y1500 T1151 vis=lost age=665ms dm=75 tag=0 imu_rp=(+0.7,+1.0) az=10.35 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] tag=0 up=-0.10 lat=-0.36 fwd=+1.06 v=(-0.17,+0.78,+1.42) -> R1526 P1571 Y1500 T1103 vis=fresh age=17ms dm=30 tag=0 imu_rp=(+0.7,+1.0) az=10.35 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] tag=0 up=-0.10 lat=-0.36 fwd=+1.06 v=(-0.12,+0.52,+0.95) -> R1508 P1547 Y1500 T1163 vis=lost age=102ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=10.35 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] tag=0 up=-0.10 lat=-0.36 fwd=+1.06 v=(-0.07,+0.32,+0.59) -> R1494 P1529 Y1500 T1235 vis=lost age=222ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=9.55 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] tag=0 up=-0.10 lat=-0.36 fwd=+1.06 v=(-0.04,+0.20,+0.37) -> R1486 P1518 Y1500 T1307 vis=lost age=342ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=9.55 vision=[capFPS=60 detFPS=4] mode=STAB batt=4.10V
+[FLY] LOST 0.44s descending -> R1500 P1500 Y1500 T1247 vis=lost age=442ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=11.05 vision=[capFPS=60 detFPS=4] mode=STAB batt=4.10V
+[FLY] LOST 0.56s descending -> R1500 P1500 Y1500 T1175 vis=lost age=562ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=9.76 vision=[capFPS=60 detFPS=4] mode=STAB batt=4.10V
+[FLY] LOST 0.68s descending -> R1500 P1500 Y1500 T1103 vis=lost age=682ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=9.76 vision=[capFPS=60 detFPS=4] mode=STAB batt=4.10V
+[FLY] LOST 0.78s descending -> R1500 P1500 Y1500 T1043 vis=lost age=782ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=6.68 vision=[capFPS=60 detFPS=4] mode=STAB batt=4.10V
+[FLY] LOST 0.90s descending -> R1500 P1500 Y1500 T1000 vis=lost age=902ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=6.68 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 1.00s descending -> R1500 P1500 Y1500 T1000 vis=lost age=1002ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=1.18 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 1.12s descending -> R1500 P1500 Y1500 T1000 vis=lost age=1122ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=-29.00 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 1.22s descending -> R1500 P1500 Y1500 T1000 vis=lost age=1222ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=-29.00 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 1.34s descending -> R1500 P1500 Y1500 T1000 vis=lost age=1342ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=-29.00 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 1.44s descending -> R1500 P1500 Y1500 T1000 vis=lost age=1442ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=-29.00 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 1.54s descending -> R1500 P1500 Y1500 T1000 vis=lost age=1542ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=-29.00 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 1.66s descending -> R1500 P1500 Y1500 T1000 vis=lost age=1662ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=-29.00 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 1.78s descending -> R1500 P1500 Y1500 T1000 vis=lost age=1782ms dm=27 tag=0 imu_rp=(+0.7,+1.0) az=-29.00 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 1.90s descending -> R1500 P1500 Y1500 T1000 vis=lost age=1902ms dm=27 tag=0 imu_rp=(+143.9,+40.0) az=-29.00 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 2.02s descending -> R1500 P1500 Y1500 T1000 vis=lost age=2022ms dm=27 tag=0 imu_rp=(+143.9,+40.0) az=-29.00 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 2.12s descending -> R1500 P1500 Y1500 T1000 vis=lost age=2122ms dm=27 tag=0 imu_rp=(+143.9,+40.0) az=-29.00 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 2.24s descending -> R1500 P1500 Y1500 T1000 vis=lost age=2242ms dm=27 tag=0 imu_rp=(+143.9,+40.0) az=-29.00 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 2.36s descending -> R1500 P1500 Y1500 T1000 vis=lost age=2362ms dm=27 tag=0 imu_rp=(+143.9,+40.0) az=-9.06 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 2.46s descending -> R1500 P1500 Y1500 T1000 vis=lost age=2462ms dm=27 tag=0 imu_rp=(+143.9,+40.0) az=-9.58 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 2.58s descending -> R1500 P1500 Y1500 T1000 vis=lost age=2582ms dm=27 tag=0 imu_rp=(+143.9,+40.0) az=-9.50 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 2.70s descending -> R1500 P1500 Y1500 T1000 vis=lost age=2702ms dm=27 tag=0 imu_rp=(-163.5,-7.7) az=-9.50 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 2.80s descending -> R1500 P1500 Y1500 T1000 vis=lost age=2802ms dm=27 tag=0 imu_rp=(-163.5,-7.7) az=-9.46 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 2.90s descending -> R1500 P1500 Y1500 T1000 vis=lost age=2902ms dm=27 tag=0 imu_rp=(-163.5,-7.7) az=-9.46 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 3.00s descending -> R1500 P1500 Y1500 T1000 vis=lost age=3002ms dm=27 tag=0 imu_rp=(-163.5,-7.7) az=-9.47 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 3.12s descending -> R1500 P1500 Y1500 T1000 vis=lost age=3122ms dm=27 tag=0 imu_rp=(-163.5,-7.7) az=-9.45 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 3.22s descending -> R1500 P1500 Y1500 T1000 vis=lost age=3222ms dm=27 tag=0 imu_rp=(-163.5,-7.7) az=-9.45 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 3.32s descending -> R1500 P1500 Y1500 T1000 vis=lost age=3322ms dm=27 tag=0 imu_rp=(-163.5,-7.7) az=-9.45 vision=[capFPS=60 detFPS=0] mode=STAB batt=4.10V
+[FLY] LOST 3.44s descending -> R1500 P1500 Y1500 T1000 vis=lost age=3442ms dm=27 tag=0 imu_rp=(-163.5,-7.7) az=-9.45 vision=[capFPS=60 detFPS=0] mode=STAB* batt=4.10V
+DISARM: tag lost 3.5s
+===== RUN END 2026-05-28 16:56:28 =====
