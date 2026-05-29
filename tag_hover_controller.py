@@ -102,7 +102,7 @@ def open_ranger(port, baud=420000):
 
 # =================== TUNABLES (edit before flying) ===========================
 
-DRY_RUN = False        # True = never arm; print sticks only
+DRY_RUN = True       # True = never arm; print sticks only
 
 # Single reference tag only.
 TARGET_TAG_ID = 0
