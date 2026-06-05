@@ -4,7 +4,7 @@ Architecture
 ------------
   Outer X-position PID → desired roll angle (deg)
   Outer Z-position PID → desired pitch angle (deg)
-  Altitude velocity-loop PD → throttle (us)
+  Altitude PI velocity loop (integral learns hover throttle) → throttle (us)
   Yaw P+deadband → yaw (us)
 
 Desired roll/pitch angles are converted to CRSF us via the FC's Angle-mode
@@ -75,8 +75,9 @@ def axis_cmd_label(us, pos_name, neg_name):
     return f"{neg_name} [{mag}]"
 
 
-def throttle_cmd_label(us, deadband_us=5):
-    d = int(us - config.HOVER_THROTTLE_US)
+def throttle_cmd_label(us, ref_us, deadband_us=5):
+    """Label throttle relative to ref_us (the controller's learned hover)."""
+    d = int(us - ref_us)
     mag = abs(d)
     if mag <= deadband_us:
         return f"THROTTLE HOLD [{us}]"
@@ -218,7 +219,7 @@ def main():
                     pose_filter.reset(vis_pos, now)
                 pose_filter.update(vis_pos, vis_fresh, now, ground_pinned=True)
             else:
-                ground_pinned = last_thr < (config.HOVER_THROTTLE_US
+                ground_pinned = last_thr < (controller.hover_us
                                             - config.GROUND_PIN_BAND_US)
                 pose_filter.update(vis_pos, vis_fresh, now,
                                    ground_pinned=ground_pinned)
@@ -352,11 +353,15 @@ def main():
                         disarm_and_exit(f"tag lost {est_age:.1f}s")
                         break
                     bleed = config.LAND_DESCENT_US_PER_S * lost
-                    thr = round(clamp(config.HOVER_THROTTLE_US - bleed,
+                    thr = round(clamp(controller.hover_us - bleed,
                                       config.IDLE_THR_US,
-                                      config.HOVER_THROTTLE_US))
+                                      controller.hover_us))
                     last_thr = thr
-                    controller.reset()         # don't let integrators run while blind
+                    # Clear the stale X/Z position integrals while blind, but KEEP
+                    # the altitude hover-throttle trim — it's a slow battery-droop
+                    # estimate, still valid on recovery; zeroing it would lurch
+                    # throttle back to the bare seed each time the tag flickers.
+                    controller.reset(keep_alt_trim=True)
                     note = f"LOST {est_age:.2f}s — descending thr={thr}"
 
             ch = [config.NEUTRAL_US] * 16
@@ -381,7 +386,7 @@ def main():
                     axis_cmd_label(ch[config.CH_ROLL], "ROLL RIGHT", "ROLL LEFT"),
                     axis_cmd_label(ch[config.CH_PITCH], "PITCH UP", "PITCH DOWN"),
                     axis_cmd_label(ch[config.CH_YAW], "YAW RIGHT", "YAW LEFT"),
-                    throttle_cmd_label(ch[config.CH_THR]),
+                    throttle_cmd_label(ch[config.CH_THR], controller.hover_us),
                 ]
                 if ctl_out is not None:
                     panel_lines.append(
@@ -420,7 +425,8 @@ def main():
                                f"des(R,P)=({ctl_out['desired_roll_deg']:+.2f},"
                                f"{ctl_out['desired_pitch_deg']:+.2f})deg "
                                f"intI(X,Z)=({controller.pid_x.integral:+.3f},"
-                               f"{controller.pid_z.integral:+.3f})")
+                               f"{controller.pid_z.integral:+.3f}) "
+                               f"hover_us={ctl_out['hover_us']:.0f}")
                 else:
                     ctl_txt = "ctl=n/a"
                 log(f"[{state}] {note}  -> R{ch[config.CH_ROLL]} "

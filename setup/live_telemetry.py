@@ -540,8 +540,8 @@ def main():
 
     ping = build_device_ping()
     # neutral sticks: throttle low (988 µs), everything else center, AUX low
-    rc_channels = [988] + [1500] * 15
-    rc_channels[2] = 988  # explicit throttle low
+    rc_channels = [1500] * 16
+    rc_channels[2] = 988  # throttle low (index 2 = T in AETR); all else centered
     rc_frame = build_rc_channels_packed(rc_channels)
 
     state = State()

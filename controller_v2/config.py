@@ -3,7 +3,7 @@
 Architecture (FC in Angle mode → inner attitude loop lives in firmware):
   PID_X  : lat-position error (m) → desired roll angle (deg)
   PID_Z  : fwd-position error (m) → desired pitch angle (deg)
-  Altitude (velocity-loop PD, asymmetric throttle trim) → throttle (us)
+  Altitude (PI velocity loop; integral learns hover throttle) → throttle (us)
   Yaw    : P-on-heading error with deadband → yaw (us)
 
 Desired angles are converted to CRSF us via the FC's Angle-mode stick scaling
@@ -77,20 +77,22 @@ STICK_FULL_DEFLECTION_US = 511.5                  # measured half-range, not 500
 STICK_US_PER_DEG = STICK_FULL_DEFLECTION_US / FC_ANGLE_LIMIT_DEG   # 8.525
 
 # ============ throttle ============
-# HOVER_THROTTLE_US: the no-correction baseline. 2026-05-28 flight stabilised
-# at T≈1340 on a 4.10V pack, but the 2026-05-29 v2 flight started at 3.70V
-# (sagging to 3.60V) — at that voltage 1340 is below hover and the drone never
-# leaves the ground. Bumped to 1380 as a starting point for ~3.7V packs.
-# Refine after each flight by watching v_up at steady throttle.
-HOVER_THROTTLE_US = 1340
-MAX_THROTTLE_US = 1700
-# Throttle authority relaxed: the controller now has wide room to climb/descend
-# (was ±60/±80 around hover, which capped the band at 1300–1440us and starved
-# altitude authority). Widened so altitude isn't the bottleneck. MAX_THROTTLE_US
-# is still the hard ceiling; IDLE_THR_US the floor.
-THR_CLIMB_TRIM_US = 100        # max +correction (climbing) — halved: fresh pack
-                               # climbed too fast at full +200 authority
-THR_DESC_TRIM_US = 200         # max -correction (descending)
+# Hover throttle is NOT hardcoded anywhere — the altitude integrator discovers it
+# in flight (see HOVER_BAND below + KI_UP). On the Air75 1S, true hover lives in a
+# narrow physical window (~1300–1400us) that shifts a little each flight and as
+# the pack sags; the loop finds the exact value and tracks it. The band is the
+# ONLY place that range appears, and it's a SAFETY CLAMP on the integrator, not a
+# setpoint — a bad vision estimate can't drive throttle outside it. The loop
+# starts each flight at the band FLOOR and integrates up to find hover, so the
+# floor doubles as the takeoff start point.
+HOVER_BAND_LO_US = 1300        # learned-hover floor (also takeoff start throttle)
+HOVER_BAND_HI_US = 1400        # learned-hover ceiling
+MAX_THROTTLE_US = 1700         # hard rail; band ⊂ [IDLE, MAX] so it's never hit
+# Transient (velocity-P) authority around the learned hover point. Asymmetric:
+# gravity aids descent, so the climb push is capped tighter. These bound ONLY the
+# P term; the integrator is bounded by the HOVER_BAND clamp above.
+THR_CLIMB_TRIM_US = 100        # max +P correction (climbing)
+THR_DESC_TRIM_US = 200         # max -P correction (descending)
 
 # ============ outer position PIDs ============
 # Output: desired body roll/pitch angle (deg), converted to us downstream and
@@ -122,13 +124,31 @@ MAX_Z_INT_DEG = 15.0
 MAX_ROLL_US = 511
 MAX_PITCH_US = 511
 
-# ============ altitude controller (carried over from existing) ============
-# Architecture: position error → target velocity (capped) → velocity error
-# → throttle correction (asymmetric clamp). Same gains as tag_hover_controller.py.
+# ============ altitude controller (PI velocity loop, self-learning hover) ======
+# Architecture: position error → target velocity (capped at VMAX_UP) → velocity
+# error → P (transient) + I. The INTEGRATOR STATE *is* the hover throttle, in us:
+# it starts each flight at HOVER_BAND_LO and integrates velocity error directly
+# into an absolute throttle, clamped to [HOVER_BAND_LO, HOVER_BAND_HI]. No hover
+# constant is hardcoded in the control law — the loop finds hover wherever it
+# physically is and re-finds it as the pack sags. At the hover fixed point
+# (v_up=0, e_pos=0 → e_v=0) the integrator stops, parked at the true hover us.
+# PI-on-velocity also drives steady-state POSITION error to zero — pure PD always
+# left a standing offset (the cause of the 2026-05-31 slow-sink: no integrator).
 VMAX_UP_MPS = 0.30
 KP_UP = 0.7                    # 1/s (position → target velocity); halved from
                                # 1.4 — fresh pack climbed too fast
-KV_UP_US_PER_MPS = 40.0        # throttle us per (m/s) of velocity error
+KV_UP_US_PER_MPS = 40.0        # P: throttle us per (m/s) of velocity error
+KI_UP_US_PER_M = 80.0          # I: us of hover-throttle change per (m) of
+                               # accumulated velocity error. The 2026-05-31 flight
+                               # sank with NO integrator; the prior KI=20 was far
+                               # too slow. 80 (≈ KV_UP / 0.5s integral time)
+                               # converges in a few s. Raise if hover sags below
+                               # target steadily; lower if throttle slow-
+                               # oscillates (vision-velocity lag is the
+                               # instability driver). MUST be tuned in real flight.
+                               # NOTE: also sets takeoff ramp — from the 1300 floor
+                               # the drone lifts once the integral climbs to true
+                               # hover, ≈ (hover-1300)/(KI·e_v) seconds.
 
 # ============ yaw controller (tag-bearing hold) ============
 # The Air75 has no magnetometer, so CRSF yaw is free-running gyro heading that

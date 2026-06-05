@@ -3,7 +3,7 @@
   Outer position PID (lat → roll deg)
   Outer position PID (fwd → pitch deg)            ─┐
                                                    ├─► CRSF channels → FC
-  Altitude (velocity-loop PD, asymmetric throttle)  │
+  Altitude (PI velocity loop, learns hover throttle) │
   Yaw     (P on heading error w/ deadband)        ─┘
 
 Position errors are computed in the CURRENT body frame. Targets are stored
@@ -59,15 +59,30 @@ class CascadedHoverController:
             i_clamp=(config.MAX_Z_INT_DEG / ki_z) if ki_z > 1e-9 else None,
         )
 
+        # Altitude PI velocity loop. hover_us IS the integrator state, carried as
+        # an ABSOLUTE throttle (us): it integrates velocity error directly into a
+        # hover-throttle estimate, clamped to the HOVER_BAND. No fixed hover
+        # constant lives in the control law — the loop discovers hover in flight.
+        # Starts each flight at the band floor (re-floored in reset()).
+        self.hover_us = float(config.HOVER_BAND_LO_US)
+
         # Targets in arm-time body frame. set_targets() updates these on FLY entry.
         self.target_fwd_m = config.TARGET_FWD_FALLBACK_M
         self.target_lat_m = config.TARGET_LAT_M
         self.target_up_m = config.TARGET_UP_M
         self.yaw_at_arm_deg = 0.0
 
-    def reset(self):
+    def reset(self, keep_alt_trim=False):
+        """Zero the integrators. keep_alt_trim=True preserves the learned hover
+        throttle (hover_us) — used on a brief tag loss, where the X/Z position
+        integrals are stale and must clear, but the learned hover is a slow
+        battery-droop estimate that's still valid and whose loss would lurch
+        throttle on recovery. set_targets() (a fresh flight) does a full reset,
+        re-flooring hover_us to the band bottom so it re-learns from scratch."""
         self.pid_x.reset()
         self.pid_z.reset()
+        if not keep_alt_trim:
+            self.hover_us = float(config.HOVER_BAND_LO_US)
 
     def set_targets(self, target_fwd_m, target_lat_m, target_up_m,
                     yaw_at_arm_deg):
@@ -87,22 +102,48 @@ class CascadedHoverController:
         tgt_lat_b = -s * self.target_fwd_m + c * self.target_lat_m
         return tgt_fwd_b, tgt_lat_b
 
-    def _altitude_us(self, est_up, v_up):
-        """Velocity-loop PD with asymmetric throttle clamp — same control law
-        and gains as the existing tag_hover_controller.
+    def _altitude_us(self, est_up, v_up, dt):
+        """PI velocity loop: position error → capped target velocity → velocity
+        error → P (transient) + I. The integrator state (self.hover_us) IS the
+        hover throttle, in us: it accumulates velocity error directly into an
+        absolute throttle, clamped to the HOVER_BAND. There is NO hardcoded hover
+        constant — the loop finds hover in flight and tracks it as the pack sags.
+        At the fixed point (v_up=0, e_pos=0 → e_v=0) hover_us stops moving, parked
+        at the true hover throttle. PI-on-velocity also zeroes steady-state
+        position error, which the old PD could not.
 
-        Tag-frame up: drone climbing → tag's up DECREASES → v_up < 0.
+        SIGN CONVENTION (foot-gun): est_up/v_up track the TAG's position in the
+        body frame, NOT the drone's. The tag is the fixed reference. So the
+        intuitions invert from "drone position":
+          - drone CLIMBS  → tag appears LOWER  → est_up DECREASES → v_up < 0
+          - drone BELOW target → tag appears HIGH → est_up > target → e_pos > 0
+        These two inversions cancel: e_pos>0 (below) → v_des<0 (want to climb,
+        climb is -v_up) → correct. Don't "fix" a sign here by reasoning about
+        the drone's motion directly — reason about the tag's apparent motion.
         """
+        # e_pos > 0 means the drone is BELOW target (tag rides high in frame).
         e_pos = est_up - self.target_up_m
         v_des = _clamp(-config.KP_UP * e_pos,
                        -config.VMAX_UP_MPS, config.VMAX_UP_MPS)
         e_v = v_up - v_des           # >0 → climbing too slow / need more thrust
-        thr_corr = config.KV_UP_US_PER_MPS * e_v
-        thr_corr = _clamp(thr_corr,
-                          -config.THR_DESC_TRIM_US, config.THR_CLIMB_TRIM_US)
-        thr_us = _clamp(config.HOVER_THROTTLE_US + thr_corr,
+
+        # P: transient velocity correction, asymmetric authority clamp.
+        thr_p = _clamp(config.KV_UP_US_PER_MPS * e_v,
+                       -config.THR_DESC_TRIM_US, config.THR_CLIMB_TRIM_US)
+
+        # I: integrate velocity error straight into the hover-throttle estimate.
+        # The HOVER_BAND clamp on hover_us IS the anti-windup limit — it's a narrow
+        # physical window, so the integrator can't run away on a bad estimate, and
+        # because the band ⊂ [IDLE, MAX] the final output clamp never has to fight
+        # it (no back-calculation needed).
+        if dt > 0.0:
+            self.hover_us = _clamp(
+                self.hover_us + config.KI_UP_US_PER_M * e_v * dt,
+                config.HOVER_BAND_LO_US, config.HOVER_BAND_HI_US)
+
+        thr_us = _clamp(self.hover_us + thr_p,
                         config.IDLE_THR_US, config.MAX_THROTTLE_US)
-        return thr_us, e_pos, v_des, e_v
+        return thr_us, e_pos, v_des, e_v, self.hover_us
 
     def _yaw_us(self, est_fwd, est_lat):
         """P-on-tag-bearing with deadband — drift-free yaw hold.
@@ -155,9 +196,9 @@ class CascadedHoverController:
         roll_us = round(config.NEUTRAL_US + config.SIGN_ROLL * roll_us_offset)
         pitch_us = round(config.NEUTRAL_US + config.SIGN_PITCH * pitch_us_offset)
 
-        # 3) Altitude (velocity-loop PD).
-        throttle_us, e_up, v_des_up, e_v_up = self._altitude_us(
-            state["est_up"], state["v_up"])
+        # 3) Altitude (PI velocity loop — learns hover throttle).
+        throttle_us, e_up, v_des_up, e_v_up, hover_us = self._altitude_us(
+            state["est_up"], state["v_up"], dt)
 
         # 4) Yaw (P on tag bearing — drift-free, no compass needed).
         yaw_us, e_yaw_rad = self._yaw_us(state["est_fwd"], state["est_lat"])
@@ -174,6 +215,7 @@ class CascadedHoverController:
             "e_up": e_up,
             "v_des_up": v_des_up,
             "e_v_up": e_v_up,
+            "hover_us": hover_us,
             "e_yaw_rad": e_yaw_rad,
             "tgt_fwd_b": tgt_fwd_b,
             "tgt_lat_b": tgt_lat_b,

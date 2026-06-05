@@ -1,0 +1,45 @@
+{
+  "device": "OpenTX Radiomaster TX12 Joystick",
+  "axes": {
+    "throttle": {
+      "axis": 2,
+      "lo_raw": -32767,
+      "hi_raw": 32767,
+      "lo_us": 1000,
+      "hi_us": 2000
+    },
+    "roll": {
+      "axis": 0,
+      "lo_raw": -32767,
+      "hi_raw": 32767,
+      "lo_us": 1000,
+      "hi_us": 2000
+    },
+    "pitch": {
+      "axis": 1,
+      "lo_raw": -32767,
+      "hi_raw": 32767,
+      "lo_us": 1000,
+      "hi_us": 2000
+    },
+    "yaw": {
+      "axis": 3,
+      "lo_raw": -32767,
+      "hi_raw": 32767,
+      "lo_us": 1000,
+      "hi_us": 2000
+    }
+  },
+  "arm": {
+    "kind": "axis",
+    "index": 6,
+    "disarmed_raw": -32767,
+    "armed_raw": 0
+  },
+  "record": {
+    "kind": "axis",
+    "index": 5,
+    "on_raw": 32767,
+    "off_raw": -32767
+  }
+}

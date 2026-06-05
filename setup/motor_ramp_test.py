@@ -15,10 +15,10 @@ For each step:
     4. Drop throttle, disarm (AUX2 → 1000 us)
     5. Rest 3 s with motors truly off (disarmed)
 
-Channel layout from the AIR75 Betaflight dump:
-    aux 0 0 1 1300 1700  → ARM on AUX2 (CRSF ch 6, array index 5) — arm with ~1500
-    aux 1 1 2 1300 1700  → ANGLE on AUX3 (index 6) — hold 1500
-    aux 6 36 5 1700 2100 → PREARM on AUX6 (index 9) — cycle to 1800
+Channel layout from the AIR75 `diff all` (2026-06):
+    aux 0 0 2 1300 1700  → ARM on AUX3 (array index 6) — arm with ~1500
+    aux 1 1 3 1300 1700  → ANGLE on AUX4 (index 7) — hold 1500
+    (no PREARM mode in this config)
 
 Safety:
     - Requires typed "YES" to start
@@ -53,21 +53,20 @@ from live_telemetry import (
     CRSF_ADDR_FC,
 )
 
-# --- Channel layout (verified against user's Betaflight dump permanent IDs) ---
+# --- Channel layout (verified against user's 2026-06 `diff all`) ---
+# Index = CRSF channel position: roll0 pitch1 thr2 yaw3, then AUX1=4 AUX2=5
+# AUX3=6 AUX4=7. Decoded mode IDs from Betaflight 4.5 rc_modes.h.
 THROTTLE_IDX = 2     # T in AETR
-ARM_IDX = 5          # AUX2 — `aux 0 0 1 1200 2100`     mode 0 (ARM)
-PREARM_IDX = 9       # AUX6 — `aux 7 36 5 1700 2100`    mode 36 (PREARM)
-                     # PREARM must be cycled LOW→HIGH before each ARM attempt;
-                     # without it Betaflight silently refuses to arm.
-MODE_IDX = 6         # AUX3 — `aux 1 1 2 1300 1700`     mode 1 (ANGLE)
+ARM_IDX = 6          # AUX3 — `aux 0 0 2 1300 1700`  mode 0 (ARM)
+MODE_IDX = 7         # AUX4 — `aux 1 1 3 1300 1700`  mode 1 (ANGLE)
+                     # (AUX4 1700-2100 = HORIZON; 1300-1700 = ANGLE)
+# NOTE: this config has NO PREARM mode. The prearm cycle was removed.
 
 # --- Channel values ---
 THROTTLE_MIN_US = 1000   # 0% throttle, also < min_check=1050 (arms allowed)
 NEUTRAL_US = 1500
-ARM_HIGH_US = 1500       # inside AIR75 ARM range 1300-1700 (was 1800 for Meteor75 — out of range!)
+ARM_HIGH_US = 1500       # inside ARM range 1300-1700
 ARM_LOW_US = 1000        # outside ARM range
-PREARM_HIGH_US = 1800    # inside PREARM range 1700-2100
-PREARM_LOW_US = 1000     # outside PREARM range
 MODE_ANGLE_US = 1500     # inside ANGLE range 1300-1700
 
 # --- Test parameters ---
@@ -80,7 +79,10 @@ ARM_TIMEOUT_S = 5.0
 LINK_TIMEOUT_S = 10.0
 PRE_ARM_SETTLE_S = 1.0
 POWER_ON_GRACE_S = 6.0   # covers Betaflight's pwr_on_arm_grace=5
-MIN_VBAT_V = 2.0         # below this we assume no flight battery on BT2.0
+MIN_VBAT_V = 0.0         # 0 = skip battery gate. Set >0 to require a flight
+                         # battery. At 0.7 V (USB-only) the FC WON'T arm — this
+                         # only lets the script keep streaming channels to watch
+                         # in the Betaflight Receiver/Modes tabs.
 
 
 def pct_to_us(pct: float) -> int:
@@ -99,11 +101,10 @@ def log(msg: str = ""):
 class State:
     def __init__(self):
         self._lock = threading.Lock()
-        # Neutral starting channels: throttle min, AUX2 disarm, AUX3 angle, rest neutral
+        # Neutral starting channels: throttle min, AUX3 disarm, AUX4 angle, rest neutral
         self._ch = [NEUTRAL_US] * 16
         self._ch[THROTTLE_IDX] = THROTTLE_MIN_US
         self._ch[ARM_IDX] = ARM_LOW_US
-        self._ch[PREARM_IDX] = PREARM_LOW_US
         self._ch[MODE_IDX] = MODE_ANGLE_US
 
         self.flight_mode: Optional[str] = None
@@ -127,10 +128,6 @@ class State:
     def set_arm(self, armed_request: bool):
         with self._lock:
             self._ch[ARM_IDX] = ARM_HIGH_US if armed_request else ARM_LOW_US
-
-    def set_prearm(self, prearm_request: bool):
-        with self._lock:
-            self._ch[PREARM_IDX] = PREARM_HIGH_US if prearm_request else PREARM_LOW_US
 
     def channels(self) -> list[int]:
         with self._lock:
@@ -219,95 +216,74 @@ def link_alive(state: State) -> bool:
 
 
 def disarm_now(state: State):
-    """Idempotent disarm: throttle low + ARM low + PREARM low."""
+    """Idempotent disarm: throttle low + ARM low."""
     state.set_throttle_us(THROTTLE_MIN_US)
     state.set_arm(False)
-    state.set_prearm(False)
 
 
 # --- Main test sequence ---
 
 def run_cycles(state: State):
-    pcts = list(range(START_PCT, END_PCT + 1, STEP_PCT))
-    log(f"\nRunning {len(pcts)} cycles at {pcts}\n")
-    for i, pct in enumerate(pcts, 1):
-        log(f"━━ Cycle {i}/{len(pcts)} @ {pct}% throttle ━━")
+    """Arm once, then hold neutral inputs (throttle min, sticks centered)
+    indefinitely until Ctrl-C. No throttle is ever commanded."""
+    # Pre-arm baseline — hold disarm signal long enough for FC to register
+    disarm_now(state)
+    time.sleep(PRE_ARM_SETTLE_S)
 
-        # Pre-arm baseline — hold disarm signal long enough for FC to register
-        disarm_now(state)
-        time.sleep(PRE_ARM_SETTLE_S)
+    # Sanity: link still up?
+    if not link_alive(state):
+        log(f"  ✗ Link dropped (up={state.uplink_lq}% down={state.downlink_lq}%) — aborting")
+        return False
 
-        # Sanity: link still up?
-        if not link_alive(state):
-            log(f"  ✗ Link dropped (up={state.uplink_lq}% down={state.downlink_lq}%) — aborting")
-            return False
+    # No PREARM in this config — go straight to ARM.
 
-        # PREARM must be cycled HIGH before ARM can engage (user's aux 7 = mode 36)
-        log(f"  prearm → AUX6={PREARM_HIGH_US} us")
-        state.set_prearm(True)
-        time.sleep(0.3)
-
-        # Arm
-        log(f"  arm → AUX2={ARM_HIGH_US} us, waiting for telemetry confirmation...")
-        state.set_arm(True)
-        ok = wait_for(lambda: state.armed or state.error_mode, ARM_TIMEOUT_S)
-        if not ok or state.error_mode or not state.armed:
-            log(f"  ✗ Arm failed within {ARM_TIMEOUT_S}s. Mode: {state.flight_mode!r}")
-            log(f"     vbat={state.voltage_V} V  link up={state.uplink_lq}% "
-                f"down={state.downlink_lq}%")
-            log(f"     Most common causes: no flight battery on BT2.0 (vbat<2 V), "
-                f"FC just booted (pwr_on_arm_grace), or arm switch did not transition.")
-            disarm_now(state)
-            return False
+    # Arm
+    log(f"  arm → AUX3 (idx {ARM_IDX})={ARM_HIGH_US} us, "
+        f"waiting for telemetry confirmation...")
+    state.set_arm(True)
+    ok = wait_for(lambda: state.armed or state.error_mode, ARM_TIMEOUT_S)
+    if not ok or state.error_mode or not state.armed:
+        # Expected at 0.7 V / USB-only: the FC won't arm without a flight
+        # battery. We deliberately do NOT disarm/exit — keep streaming the
+        # arm-high + neutral channels at 50 Hz so they're visible in the
+        # Betaflight Receiver/Modes tabs.
+        log(f"  ⚠ Not armed within {ARM_TIMEOUT_S}s. Mode: {state.flight_mode!r}  "
+            f"vbat={state.voltage_V} V")
+        log(f"    (Expected on USB-only / low vbat — Betaflight blocks arming.)")
+        log(f"    Holding arm-high + neutral so you can watch the channels in "
+            f"Betaflight. Ctrl-C to stop.\n")
+    else:
         log(f"  ✓ armed (mode: {state.flight_mode!r}, vbat={state.voltage_V} V)")
+        log(f"\n  ✓ ARMED — holding neutral inputs (throttle min, sticks centered).")
+        log(f"    Press Ctrl-C to disarm and exit.\n")
 
-        # Throttle pulse — sample telemetry at ~5 Hz so the log captures
-        # what happened during the pulse, not just before/after.
-        thr_us = pct_to_us(pct)
-        log(f"  throttle → {pct}% ({thr_us} us)  for {PULSE_S}s")
-        state.set_throttle_pct(pct)
-        pulse_start = time.time()
-        pulse_end = pulse_start + PULSE_S
-        next_sample = 0.0
-        while time.time() < pulse_end:
-            if not link_alive(state) or state.error_mode:
-                log(f"  ✗ link/mode fault mid-pulse  link up={state.uplink_lq}% "
-                    f"down={state.downlink_lq}%  mode={state.flight_mode!r}")
-                disarm_now(state)
-                return False
-            now = time.time()
-            if now >= next_sample:
-                log(f"    [pulse t={now-pulse_start:.2f}s] "
-                    f"mode={state.flight_mode!r} vbat={state.voltage_V} V "
-                    f"up={state.uplink_lq}% dn={state.downlink_lq}%")
-                next_sample = now + 0.2
-            time.sleep(0.02)
-
-        # Throttle down then disarm
-        state.set_throttle_us(THROTTLE_MIN_US)
-        time.sleep(0.15)
-        log(f"  disarm → AUX2={ARM_LOW_US} us")
-        state.set_arm(False)
-        wait_for(lambda: not state.armed, 1.5)
-        log(f"  ✓ disarmed (mode: {state.flight_mode!r}). Resting {REST_S}s.")
-        time.sleep(REST_S)
-        log()
-    return True
+    # Hold the current channels forever. Throttle stays at min, sticks
+    # centered, arm-high. The TX thread keeps sending these at 50 Hz so the
+    # channels keep updating in Betaflight. We intentionally do NOT bail on
+    # link/mode fault here — we just report it and keep streaming.
+    next_sample = 0.0
+    while True:
+        now = time.time()
+        if now >= next_sample:
+            armed_str = "ARMED" if state.armed else "not-armed"
+            log(f"    [{armed_str}] mode={state.flight_mode!r} vbat={state.voltage_V} V "
+                f"up={state.uplink_lq}% dn={state.downlink_lq}%")
+            next_sample = now + 1.0
+        time.sleep(0.02)
 
 
 def main():
     log("=" * 72)
-    log("  THROTTLE RAMP TEST — AIR75 via Ranger")
+    log("  ARM + HOLD NEUTRAL — AIR75 via Ranger")
     log("=" * 72)
     log("")
-    log("  Pulses throttle stick from 5% up to 40% in 5% steps.")
-    log("  Each pulse: 1.5 s on, 3 s off (drone disarmed between cycles).")
+    log("  Arms the drone once, then sends only neutral inputs (throttle min,")
+    log("  sticks centered) until Ctrl-C. No throttle is ever commanded.")
     log("")
     log("  WARNINGS:")
     log("    • REMOVE ALL PROPS before running.")
-    log("    • Secure the drone — it WILL try to lift at 40% even propless.")
-    log("    • Keep clear of motors; idle current draws are still hot.")
-    log("    • Press Ctrl-C at any time to abort and disarm.")
+    log("    • Motors will idle/spin once armed — keep clear.")
+    log("    • Press Ctrl-C at any time to disarm and exit.")
     log("")
 
     port = (sys.argv[1] if len(sys.argv) > 1 else autodetect_port()) or "/dev/ttyUSB0"
@@ -323,7 +299,6 @@ def main():
             ch = [NEUTRAL_US] * 16
             ch[THROTTLE_IDX] = THROTTLE_MIN_US
             ch[ARM_IDX] = ARM_LOW_US
-            ch[PREARM_IDX] = PREARM_LOW_US
             for _ in range(5):
                 ser.write(build_rc_channels_packed(ch))
                 time.sleep(0.02)
@@ -352,16 +327,22 @@ def main():
                 f"Refusing to run.")
             return
 
-        # Battery check — Betaflight silently blocks arming with no flight battery
-        if state.voltage_V is None:
-            log("  Waiting briefly for first BATTERY frame...")
-            wait_for(lambda: state.voltage_V is not None, 2.0)
-        if state.voltage_V is None or state.voltage_V < MIN_VBAT_V:
-            log(f"  ✗ Vbat = {state.voltage_V} V — no flight battery detected on BT2.0.")
-            log("    Betaflight blocks arming without a flight battery. Plug a 1S")
-            log("    LiPo into the BT2.0 connector on the drone and rerun.")
-            return
-        log(f"  Battery OK: {state.voltage_V:.2f} V")
+        # Battery check — Betaflight silently blocks arming with no flight
+        # battery. Skipped entirely when MIN_VBAT_V <= 0 (USB-only / 0.7 V
+        # bench test where the goal is just to watch channels in Betaflight).
+        if MIN_VBAT_V > 0:
+            if state.voltage_V is None:
+                log("  Waiting briefly for first BATTERY frame...")
+                wait_for(lambda: state.voltage_V is not None, 2.0)
+            if state.voltage_V is None or state.voltage_V < MIN_VBAT_V:
+                log(f"  ✗ Vbat = {state.voltage_V} V — no flight battery detected on BT2.0.")
+                log("    Betaflight blocks arming without a flight battery. Plug a 1S")
+                log("    LiPo into the BT2.0 connector on the drone and rerun.")
+                return
+            log(f"  Battery OK: {state.voltage_V:.2f} V")
+        else:
+            log(f"  Battery gate SKIPPED (MIN_VBAT_V=0). vbat={state.voltage_V} V — "
+                f"won't arm on USB-only; streaming channels for Betaflight view.")
 
         # Honour Betaflight's pwr_on_arm_grace (5 s) — drone may have just booted
         log(f"  Settling for {POWER_ON_GRACE_S}s before first arm attempt "
