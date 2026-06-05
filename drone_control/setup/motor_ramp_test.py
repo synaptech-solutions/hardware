@@ -34,6 +34,7 @@ Usage:
     python3 motor_ramp_test.py /dev/ttyUSB0      # explicit
 """
 
+import os
 import sys
 import time
 import threading
@@ -45,7 +46,7 @@ try:
 except ImportError:
     sys.exit("pyserial not installed. Run: pip install pyserial")
 
-sys.path.insert(0, "/home/andy-li/Desktop/Synetic Labs/hardware")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # live_telemetry is alongside
 from live_telemetry import (
     CrsfParser, build_device_ping, build_rc_channels_packed,
     autodetect_port, decode_link_stats, decode_flight_mode, decode_battery,

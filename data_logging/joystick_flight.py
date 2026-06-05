@@ -12,7 +12,7 @@ hand through the laptop, exactly as if the TX12 were transmitting directly.
 WHY CALIBRATION: EdgeTX's channel→USB-axis assignment is configurable and
 radio-specific, so which HID axis is roll vs pitch vs throttle vs yaw — and
 which control is the arm switch — is NOT safe to hardcode. `--calibrate`
-discovers it empirically and writes setup/tx12_joystick_cal.json.
+discovers it empirically and writes tx12_joystick_cal.json (next to this script).
 
 Channel map and µs levels come from controller_v2.config (the Air75
 Betaflight dump) so this stays in lockstep with the autonomous controller.
@@ -48,9 +48,12 @@ import sys
 import threading
 import time
 
-# CRSF frame builders / parsers / telemetry decoders live in setup/.
+# Shared CRSF builders (live_telemetry) and the channel map (controller_v2)
+# live in the sibling drone_control/ folder.
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "setup"))
+_CONTROL = os.path.join(os.path.dirname(HERE), "drone_control")
+sys.path.insert(0, _CONTROL)                          # for `from controller_v2 import ...`
+sys.path.insert(0, os.path.join(_CONTROL, "setup"))   # for `from live_telemetry import ...`
 import serial  # noqa: E402
 from live_telemetry import (  # noqa: E402
     build_rc_channels_packed, build_device_ping, autodetect_port, CrsfParser,
@@ -70,7 +73,7 @@ except Exception:
     cv2 = None
     CV2_OK = False
 
-CAL_FILE_DEFAULT = os.path.join(HERE, "setup", "tx12_joystick_cal.json")
+CAL_FILE_DEFAULT = os.path.join(HERE, "tx12_joystick_cal.json")
 
 # Betaflight refuses to arm while the throttle channel is above min_check
 # (default 1050µs) — the THROTTLE arming-disable flag. Verified against

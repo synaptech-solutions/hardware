@@ -8,8 +8,8 @@ first blocking arming flag as the flight-mode string. Watch for things like
 '!NOG' / '!CAL' (gyro / calibration), '!RXL' (RX lost), '!CRS' (CRSF link).
 A trailing '*' on a mode (e.g. 'ANGL*') just means disarmed.
 """
-import time, sys
-sys.path.insert(0, "/home/andy-li/Desktop/Synetic Labs/hardware")
+import os, time, sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # live_telemetry is alongside
 import serial
 from live_telemetry import (build_rc_channels_packed, autodetect_port, CrsfParser,
                             decode_link_stats, decode_flight_mode,
