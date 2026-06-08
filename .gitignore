@@ -21,3 +21,6 @@ data_logging/blackbox/*
 pycode_ViCON/blackbox_data/*
 pycode_ViCON/DataExchange/*
 
+!pycode_ViCON/blackbox_data/.gitkeep
+!pycode_ViCON/DataExchange/.gitkeep
+
