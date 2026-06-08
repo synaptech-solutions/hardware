@@ -52,6 +52,7 @@ import time
 # live in the sibling drone_control/ folder.
 HERE = os.path.dirname(os.path.abspath(__file__))
 _CONTROL = os.path.join(os.path.dirname(HERE), "drone_control")
+sys.path.insert(0, HERE)                               # for `from vicon_recorder import ...`
 sys.path.insert(0, _CONTROL)                          # for `from controller_v2 import ...`
 sys.path.insert(0, os.path.join(_CONTROL, "setup"))   # for `from live_telemetry import ...`
 import serial  # noqa: E402
@@ -72,6 +73,37 @@ try:
 except Exception:
     cv2 = None
     CV2_OK = False
+
+# Vicon pose recorder deps (ViconRecorder class is defined below, next to
+# VideoRecorder). Optional like cv2 — if numpy/scipy/the lab parser are missing,
+# vicon recording disables itself (VICON_OK=False) and flight continues. The
+# parser is the lab's, in the sibling pycode_ViCON/ folder.
+_PYCODE_VICON = os.path.join(os.path.dirname(HERE), "pycode_ViCON")
+if _PYCODE_VICON not in sys.path:
+    sys.path.insert(0, _PYCODE_VICON)
+try:
+    import socket  # noqa: E402
+    import numpy as np  # noqa: E402
+    import scipy.io as sio  # noqa: E402
+    # Same primitives UdpReceiver_datacollection.py uses — it is the base template
+    # for ALL Vicon logging in this repo, so this path stays identical to it:
+    # UdpRigidBodiesViCON (threaded receiver + the startup sample-rate
+    # determination), DataProcessorViCON (parser), RealTimeSleeper (100 Hz loop),
+    # Differentiator (b1 velocities).
+    from UdpReceiver_datacollection import (  # noqa: E402
+        DataProcessorViCON, UdpRigidBodiesViCON, RealTimeSleeper, Differentiator,
+    )
+    VICON_OK = True
+    _VICON_ERR = None
+except Exception as _e:  # noqa: BLE001 — missing dep just disables vicon
+    VICON_OK = False
+    _VICON_ERR = _e
+
+VICON_UDP_IP = "0.0.0.0"
+VICON_UDP_PORT = 51001
+_VICON_BLOCK = 1024
+_VICON_PROBE_TIMEOUT_S = 3.0   # no Vicon traffic within this at prepare() → disable, keep flying
+_VICON_SAMPLE_DT = 0.01        # 100 Hz logging loop, same as the UdpReceiver template
 
 CAL_FILE_DEFAULT = os.path.join(HERE, "tx12_joystick_cal.json")
 
@@ -381,24 +413,38 @@ class VideoRecorder:
     loop on switch edges; start() returns immediately (the thread opens the
     camera, ~0.5-1 s, so the first second of footage may be missed)."""
 
-    def __init__(self, device_index, width, height, out_dir):
+    def __init__(self, device_index, width, height):
         self.device_index = device_index
         self.width = width
         self.height = height
-        self.out_dir = out_dir
         self._thread = None
         self._stop = threading.Event()
         self.recording = False
         self.status = "idle" if CV2_OK else "disabled (no cv2)"
         self.path = None
         self.frames = 0
+        self.fps = None
+        # Wall-clock time the first frame was actually captured. The camera takes
+        # ~0.5-1 s to open, so frame 0 lags the session t0 by this much — the
+        # combine uses (first_frame_wall - t0) to align video to the data.
+        self.first_frame_wall = None
+        # Latest captured frame, shared (read-only) with the main loop so it can
+        # show a live preview window. Guarded by a lock; capture stays in _run.
+        self._frame_lock = threading.Lock()
+        self._latest_frame = None
 
-    def start(self):
+    def get_latest_frame(self):
+        with self._frame_lock:
+            return self._latest_frame
+
+    def start(self, out_path):
         if self.recording or not CV2_OK:
             return
         # Make sure any prior recording's thread has fully finalized its file.
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3.0)
+        self.path = out_path
+        self.first_frame_wall = None
         self.recording = True
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -415,10 +461,8 @@ class VideoRecorder:
     def _run(self):
         cap = writer = None
         try:
-            os.makedirs(self.out_dir, exist_ok=True)
-            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            name = f"flight_{stamp}.mp4"
-            path = os.path.join(self.out_dir, name)
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            name = os.path.basename(self.path)
             cap = cv2.VideoCapture(self.device_index, cv2.CAP_V4L2)
             if not cap.isOpened():
                 self.status = f"camera /dev/video{self.device_index} open FAILED"
@@ -428,21 +472,24 @@ class VideoRecorder:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             rep = cap.get(cv2.CAP_PROP_FPS)
-            fps = rep if rep and rep > 1 else 30.0
-            writer = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"),
-                                     fps, (self.width, self.height))
+            self.fps = rep if rep and rep > 1 else 30.0
+            writer = cv2.VideoWriter(self.path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                     self.fps, (self.width, self.height))
             if not writer.isOpened():
                 self.status = "VideoWriter open FAILED"
                 return
-            self.path = path
             self.frames = 0
-            self.status = f"REC {name} @ {fps:.0f}fps"
+            self.status = f"REC {name} @ {self.fps:.0f}fps"
             while not self._stop.is_set():
                 ok, frame = cap.read()
                 if not ok:
                     continue
+                if self.first_frame_wall is None:
+                    self.first_frame_wall = time.time()
                 writer.write(frame)
                 self.frames += 1
+                with self._frame_lock:
+                    self._latest_frame = frame
             self.status = f"saved {name} ({self.frames} frames)"
         except Exception as e:  # never let a recorder fault take down flight
             self.status = f"recorder error: {e}"
@@ -452,6 +499,161 @@ class VideoRecorder:
             if cap is not None:
                 cap.release()
             self.recording = False
+
+
+class ViconRecorder:
+    """Records Vicon pose to a per-session .mat, built on the SAME primitives as
+    UdpReceiver_datacollection.py (the base template for all Vicon logging here):
+    `UdpRigidBodiesViCON` (threaded receiver + the original startup sample-rate
+    determination), `DataProcessorViCON` (parser), a 100 Hz `RealTimeSleeper`
+    loop, and `Differentiator` for b1 velocities. Output matches that template —
+    `exptime`, `Abs_time` (from the shared trigger t0), `b1_x`..`b1_qw` (+ any
+    extra bodies), `b1_x_dot`/`b1_y_dot`/`b1_z_dot`.
+
+    Two adaptations for the flight context (vs the standalone template):
+      - prepare() does the connect + sample-rate measurement ONCE at startup
+        (not per session), behind a fail-soft probe so flight still works if
+        Vicon isn't streaming. The lab `UdpRigidBodiesViCON` blocks with no
+        timeout, so we probe first and only construct it once packets are seen.
+      - The receiver runs continuously after prepare(); start()/stop() just gate
+        recording, so each session begins logging instantly at t0 (no per-flick
+        measurement delay) — which keeps the deterministic sync with video +
+        blackbox intact. Mirrors VideoRecorder's start()/stop()/recording/status."""
+
+    def __init__(self, port=VICON_UDP_PORT, ip=VICON_UDP_IP):
+        self.port = port
+        self.ip = ip
+        self.udp = None          # UdpRigidBodiesViCON — built in prepare()
+        self.dp = None           # DataProcessorViCON
+        self.sample_rate = None  # measured by the startup determination
+        self.num_bodies = None
+        self._thread = None
+        self._stop = threading.Event()
+        self.recording = False
+        self.status = "idle" if VICON_OK else f"disabled ({_VICON_ERR})"
+        self.path = None
+        self.samples = 0
+        self.first_packet_wall = None
+        self.t0_wall = None
+
+    def _stream_present(self):
+        """Fail-soft probe: is anything streaming on the Vicon port right now?
+        Lets us skip the lab receiver's un-timeouted blocking get_sample_rate
+        when Vicon is off, so the flight script never hangs at startup."""
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((self.ip, self.port))
+            s.settimeout(_VICON_PROBE_TIMEOUT_S)
+            s.recvfrom(_VICON_BLOCK)
+            return True
+        except socket.timeout:
+            return False
+        finally:
+            s.close()
+
+    def prepare(self):
+        """Connect + run the original startup sample-rate determination ONCE.
+        Returns True if Vicon is live and ready to record, False (disabled) if
+        not — never raises, never hangs flight. Safe to call again; no-op once
+        prepared."""
+        if not VICON_OK or self.udp is not None:
+            return self.udp is not None
+        if not self._stream_present():
+            self.status = f"no Vicon stream on :{self.port} — disabled"
+            return False
+        try:
+            # UdpRigidBodiesViCON.__init__ runs get_sample_rate() (the original
+            # startup processing: times ~1000 packets to determine the polling
+            # rate); start_thread() then reads num_bodies from the header.
+            self.udp = UdpRigidBodiesViCON(udp_ip=self.ip, udp_port=self.port)
+            self.udp.start_thread()
+            self.sample_rate = self.udp.sample_rate
+            self.num_bodies = self.udp.num_bodies
+            self.dp = DataProcessorViCON(self.num_bodies, self.sample_rate)
+            self.status = (f"ready ({self.num_bodies} bodies, "
+                           f"{self.sample_rate:.0f} Hz)")
+            return True
+        except Exception as e:  # noqa: BLE001 — never let vicon setup reach flight
+            self.status = f"vicon prepare error: {e}"
+            self.udp = None
+            return False
+
+    def start(self, t0_wall, out_path):
+        if self.recording or self.udp is None:   # prepare() must have succeeded
+            return
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3.0)
+        self.t0_wall = t0_wall
+        self.path = out_path
+        self.samples = 0
+        self.first_packet_wall = None
+        self.recording = True
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        if not self.recording:
+            return
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=5.0)
+        self.recording = False
+
+    def _run(self):
+        # Same loop body as the UdpReceiver template: 100 Hz RealTimeSleeper,
+        # get_data() (latest packet from the receiver thread), process, then
+        # Differentiate b1 x/y/z for velocities. Records from the first tick, so
+        # the session starts at t0 (receiver is already running from prepare()).
+        names = list(self.dp.save_list_name) + ["b1_x_dot", "b1_y_dot", "b1_z_dot"]
+        rts = RealTimeSleeper(_VICON_SAMPLE_DT)
+        diff_x = Differentiator(diff_steps=2)
+        diff_y = Differentiator(diff_steps=2)
+        diff_z = Differentiator(diff_steps=2)
+        abs_time = []
+        rows = []
+        try:
+            rts.init()
+            while not self._stop.is_set():
+                data_raw, udp_time = self.udp.get_data()
+                data, save_list_data = self.dp.process_data(data_raw)
+                if self.first_packet_wall is None:
+                    self.first_packet_wall = time.time()
+                    self.status = f"REC vicon ({self.num_bodies} bodies)"
+                diff_x.step(data[1]["x"], udp_time)
+                diff_y.step(data[1]["y"], udp_time)
+                diff_z.step(data[1]["z"], udp_time)
+                abs_time.append(time.time() - self.t0_wall)
+                rows.append(list(save_list_data)
+                            + [diff_x.data_rate, diff_y.data_rate, diff_z.data_rate])
+                self.samples = len(rows)
+                rts.sleep()
+            self._save(abs_time, rows, names)
+        except Exception as e:  # noqa: BLE001 — never let vicon faults reach flight
+            self.status = f"vicon recorder error: {e}"
+        finally:
+            self.recording = False
+
+    def _save(self, abs_time, rows, names):
+        if not rows:
+            self.status = "no Vicon samples recorded"
+            return
+        arr = np.asarray(rows, dtype=float)
+        out = {
+            "exptime": (datetime.datetime.fromtimestamp(self.t0_wall)
+                        .strftime("%Y%m%d_%H%M%S")),
+            "Abs_time": np.asarray(abs_time, dtype=float),
+            "t0_wall": float(self.t0_wall),
+            "first_packet_wall": float(self.first_packet_wall or self.t0_wall),
+            "num_samples": len(rows),
+            "sample_rate_hz": float(self.sample_rate or 0.0),
+        }
+        for i, nm in enumerate(names):
+            out[nm] = arr[:, i]
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        sio.savemat(self.path, out)
+        self.status = f"saved {os.path.basename(self.path)} ({len(rows)} samples)"
 
 
 def build_channels(js, cal, allow_arm):
@@ -483,7 +685,40 @@ def build_channels(js, cal, allow_arm):
 CSI = "\033["
 
 
-def render(ch, armed, allow_arm, raw_armed, record_on, recorder,
+def _write_session_json(session, recorder, vicon):
+    """Write per-session metadata so combine_flight.py + analysis can align all
+    three streams to the shared trigger t0."""
+    meta = {
+        "stamp": session["stamp"],
+        "t0_wall": session["t0"],
+        "t0_human": datetime.datetime.fromtimestamp(session["t0"]).isoformat(),
+        "aux2_on_us": AUX2_HIGH_US,
+        "note": ("All streams begin at the switch flick (t0). vicon Abs_time and "
+                 "blackbox time each zero-base to their first sample for "
+                 "deterministic alignment; video lags t0 by video.start_offset_s. "
+                 "Drop the .bbl in data_logging/blackbox/ then run combine_flight.py."),
+    }
+    if recorder is not None:
+        ff = recorder.first_frame_wall
+        meta["video"] = {
+            "file": "video.mp4", "frames": recorder.frames, "fps": recorder.fps,
+            "first_frame_wall": ff,
+            "start_offset_s": (ff - session["t0"]) if ff else None,
+            "status": recorder.status,
+        }
+    if vicon is not None:
+        fp = vicon.first_packet_wall
+        meta["vicon"] = {
+            "file": "vicon.mat", "samples": vicon.samples,
+            "first_packet_wall": fp,
+            "first_packet_offset_s": (fp - session["t0"]) if fp else None,
+            "status": vicon.status,
+        }
+    with open(os.path.join(session["dir"], "session.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def render(ch, armed, allow_arm, raw_armed, record_on, recorder, vicon,
            flight_mode, pack_v, bytes_rx, dry):
     arm_txt = (f"{CSI}32mARMED{CSI}0m" if armed
                else (f"{CSI}33msafe (switch ARMED — toggle to DISARMED first){CSI}0m"
@@ -497,10 +732,11 @@ def render(ch, armed, allow_arm, raw_armed, record_on, recorder,
     if raw_armed and ch[config.CH_THR] > ARM_THROTTLE_MAX_US:
         thr_hint = (f" {CSI}31m[THROTTLE {ch[config.CH_THR]}us > {ARM_THROTTLE_MAX_US}"
                     f" — lower stick fully to arm]{CSI}0m")
-    if recorder is not None and recorder.recording:
-        rec_txt = f"{CSI}31m●REC{CSI}0m({recorder.frames})"
-    elif record_on:
-        rec_txt = f"{CSI}33mBB-on(arm to record){CSI}0m"
+    if record_on:
+        vid = f"vid{recorder.frames}" if (recorder and recorder.recording) else "vid-"
+        vic = f"vic{vicon.samples}" if (vicon and vicon.recording) else "vic-"
+        rec_txt = f"{CSI}31m●REC{CSI}0m({vid},{vic})" if (armed) else \
+                  f"{CSI}33mBB-on(arm to record){CSI}0m"
     else:
         rec_txt = "rec-off"
     sys.stdout.write(
@@ -523,20 +759,39 @@ def run(args):
           f"yaw=axis[{cal['axes']['yaw']['axis']}] "
           f"arm={cal['arm']['kind']}[{cal['arm']['index']}]")
 
+    # Recording: the blackbox switch starts THREE synchronized streams at the
+    # flick — FC blackbox (AUX2, relayed), laptop video, laptop vicon — and all
+    # stop at disarm. Each flight gets its own session folder.
     rec = cal.get("record")
-    recorder = None
+    recorder = vicon = None
     if rec is None:
         print("Recording: no 'record' switch in calibration — AUX2 held off, "
-              "no video.")
-    elif not CV2_OK:
-        recorder = None
-        print("Recording: AUX2 relay ON, but VIDEO DISABLED (cv2 missing in this "
-              "Python). Run with: .venv/bin/python joystick_flight.py")
+              "no video/vicon.")
     else:
-        recorder = VideoRecorder(config.DEVICE_INDEX, config.WIDTH,
-                                 config.HEIGHT, REC_DIR)
-        print(f"Recording: blackbox switch {rec['kind']}[{rec['index']}] → AUX2; "
-              f"video /dev/video{config.DEVICE_INDEX} → {REC_DIR}/ "
+        if CV2_OK:
+            recorder = VideoRecorder(config.DEVICE_INDEX, config.WIDTH, config.HEIGHT)
+            video_msg = f"video /dev/video{config.DEVICE_INDEX}"
+        else:
+            video_msg = "video OFF (no cv2 — run with .venv/bin/python)"
+        if VICON_OK and not args.dry_run:
+            vicon = ViconRecorder()
+            # Connect + run the original startup sample-rate determination ONCE
+            # now (fail-soft: if Vicon isn't streaming this disables it and we
+            # fly without it). Keeping it here — not per session — means each
+            # recording starts instantly at the switch flick, synced to t0.
+            print(f"Vicon:    probing UDP :{vicon.port} (determining sample rate)…")
+            if not vicon.prepare():
+                vicon_msg = f"vicon OFF ({vicon.status})"
+                vicon = None
+            else:
+                vicon_msg = f"vicon {vicon.status}"
+        elif VICON_OK and args.dry_run:
+            vicon_msg = "vicon OFF (dry-run)"
+        else:
+            vicon_msg = "vicon OFF (deps missing)"
+        print(f"Recording: blackbox switch {rec['kind']}[{rec['index']}] → "
+              f"AUX2 + {video_msg} + {vicon_msg}")
+        print(f"           sessions → {REC_DIR}/<timestamp>/  "
               f"(records while ARMED + switch ON)")
 
     ser = None
@@ -565,6 +820,8 @@ def run(args):
     nxt = time.monotonic()
     last_ping = 0.0
     last_render = 0.0
+    PREVIEW_WIN = "drone feed — recording status"
+    window_open = False
 
     def send_disarm():
         if ser is None:
@@ -577,6 +834,37 @@ def run(args):
         for _ in range(5):
             ser.write(frame)
             time.sleep(0.01)
+
+    # A "session" = one switch-on→disarm window. begin/end start & stop the
+    # laptop recorders together off a single shared wall-clock t0 (the FC
+    # blackbox starts on its own when it sees AUX2 go high, ~one frame later).
+    session = {"dir": None, "t0": None, "stamp": None}
+
+    def begin_session():
+        t0 = time.time()
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        sdir = os.path.join(REC_DIR, stamp)
+        os.makedirs(sdir, exist_ok=True)
+        session.update(dir=sdir, t0=t0, stamp=stamp)
+        if recorder is not None:
+            recorder.start(os.path.join(sdir, "video.mp4"))
+        if vicon is not None:
+            vicon.start(t0, os.path.join(sdir, "vicon.mat"))
+        sys.stdout.write(f"\n{CSI}32m● REC SESSION {stamp}{CSI}0m → {sdir}\n")
+
+    def end_session():
+        if recorder is not None:
+            recorder.stop()
+        if vicon is not None:
+            vicon.stop()
+        if session["dir"]:
+            _write_session_json(session, recorder, vicon)
+            sys.stdout.write(f"\n{CSI}33m■ SESSION SAVED{CSI}0m {session['stamp']}\n")
+            if recorder is not None:
+                sys.stdout.write(f"   video: {recorder.status}\n")
+            if vicon is not None:
+                sys.stdout.write(f"   vicon: {vicon.status}\n")
+        session.update(dir=None, t0=None, stamp=None)
 
     try:
         while True:
@@ -593,16 +881,15 @@ def run(args):
 
             ch, armed, record_on = build_channels(js, cal, allow_arm=seen_disarmed)
 
-            # Video recording mirrors the drone's blackbox: record while ARMED
-            # and the blackbox switch is ON; stop + save when either drops (disarm
-            # or switch off). Edge-triggered on the desired state so a failed
-            # camera open isn't retried every loop.
+            # Recording mirrors the drone's blackbox: capture while ARMED and the
+            # blackbox switch is ON; stop + save when either drops (disarm or
+            # switch off). Edge-triggered on the desired state so a failed start
+            # isn't retried every loop.
             want_record = armed and record_on
-            if recorder is not None:
-                if want_record and not prev_want_record:
-                    recorder.start()
-                elif prev_want_record and not want_record:
-                    recorder.stop()
+            if want_record and not prev_want_record:
+                begin_session()
+            elif prev_want_record and not want_record:
+                end_session()
             prev_want_record = want_record
 
             if ser is not None:
@@ -632,7 +919,29 @@ def run(args):
             now = time.monotonic()
             if now - last_render > 0.066:   # ~15 Hz
                 render(ch, armed, seen_disarmed, raw_armed, record_on, recorder,
-                       flight_mode, pack_v, bytes_rx, args.dry_run)
+                       vicon, flight_mode, pack_v, bytes_rx, args.dry_run)
+                # Live preview window: the feed + recording status while a session
+                # is recording; closed between sessions. cv2 GUI must run on the
+                # main thread (capture stays in the recorder thread), so drive it
+                # here, throttled with the text render so it can't slow the RC loop.
+                if recorder is not None and CV2_OK:
+                    if recorder.recording:
+                        frame = recorder.get_latest_frame()
+                        if frame is not None:
+                            disp = frame.copy()
+                            vic = vicon.samples if (vicon and vicon.recording) else 0
+                            cv2.putText(disp, f"REC  {recorder.frames}f   vicon {vic}",
+                                        (14, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                                        (0, 0, 255), 2)
+                            cv2.putText(disp, "ARMED" if armed else "DISARMED",
+                                        (14, 78), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+                                        (0, 200, 0) if armed else (0, 200, 255), 2)
+                            cv2.imshow(PREVIEW_WIN, disp)
+                            cv2.waitKey(1)
+                            window_open = True
+                    elif window_open:
+                        cv2.destroyAllWindows()
+                        window_open = False
                 last_render = now
 
             nxt += period
@@ -645,9 +954,12 @@ def run(args):
         print("\nCtrl-C — disarming.", flush=True)
         send_disarm()
     finally:
-        if recorder is not None:
-            recorder.stop()
-            print(f"\nRecording: {recorder.status}")
+        # If we exit mid-session (Ctrl-C / disconnect while recording), stop and
+        # save both streams so nothing is lost.
+        if session["dir"]:
+            end_session()
+        if window_open and CV2_OK:
+            cv2.destroyAllWindows()
         js.close()
         if ser is not None:
             send_disarm()

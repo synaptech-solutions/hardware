@@ -1,0 +1,32 @@
+# Single virtualenv for the ENTIRE hardware/ project (.venv, Python 3.12).
+# Everything — drone_control/, data_logging/, pycode_ViCON/ — runs from this one
+# venv; there are no other venvs. Activate it and every script works:
+#
+#   source .venv/bin/activate          # then: python data_logging/joystick_flight.py
+#   # or call it directly:  .venv/bin/python <script>
+#
+# Recreate from scratch (uv lives at the VS Code snap path, not on PATH):
+#   UV=/home/andy-li/snap/code/current/.local/bin/uv
+#   "$UV" venv --python 3.12 .venv
+#   "$UV" pip install --python .venv/bin/python -r requirements.txt
+#
+# What needs what:
+#   opencv-python    video capture/recording (joystick_flight, *video_recorder, camera_setup, tag_hover)
+#   numpy / scipy    .mat I/O, sync math, geometry (everything)
+#   pyserial         CRSF over the Ranger USB serial
+#   pupil-apriltags  tag detection (tag_hover, drone_detect)
+#   tqdm             Vicon sample-rate progress (lab parser)
+#   matplotlib       plot_flight.py / plot_synced.py  (static PNGs)
+#   PyQt6            interactive 3D plot windows (matplotlib --3d)
+#   dash / plotly    interactive browser dashboards (dashboard_flight.py / dashboard_synced.py)
+
+opencv-python==4.13.0.92
+numpy==2.4.6
+scipy==1.17.1
+pyserial==3.5
+pupil-apriltags==1.0.4.post11
+tqdm==4.68.1
+matplotlib==3.10.9
+PyQt6==6.11.0
+dash==4.2.0
+plotly==6.8.0

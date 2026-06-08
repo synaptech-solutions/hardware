@@ -5,6 +5,3 @@ __pycache__/
 # Virtual environment
 .venv/
 
-# joystick_flight.py video captures — keep the folder, ignore the clips
-data_logging/recordings/*
-!data_logging/recordings/.gitkeep
