@@ -5,3 +5,6 @@ __pycache__/
 # Virtual environment
 .venv/
 
+# Don’t track vendored blackbox build/source (large, third-party)
+pycode_ViCON/tools/blackbox-tools/
+
