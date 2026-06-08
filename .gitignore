@@ -8,3 +8,16 @@ __pycache__/
 # Don’t track vendored blackbox build/source (large, third-party)
 pycode_ViCON/tools/blackbox-tools/
 
+# Flight sessions (video.mp4 + vicon.mat + session.json + flight_synced.mat) —
+# keep the folder, ignore the recorded data.
+data_logging/recordings/*
+!data_logging/recordings/.gitkeep
+
+# Downloaded blackbox logs you drop in after each flight (large) — keep the folder.
+data_logging/blackbox/*
+!data_logging/blackbox/.gitkeep
+
+# Large blackbox and session exports
+pycode_ViCON/blackbox_data/*
+pycode_ViCON/DataExchange/*
+
