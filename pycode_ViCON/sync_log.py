@@ -25,6 +25,7 @@
 # eRPM is *electrical* RPM; mechanical RPM = eRPM / (poles / 2).
 
 import os
+import re
 import sys
 import csv
 import glob
@@ -103,47 +104,52 @@ def decode_bbl(bbl_path, decoder, out_dir):
     return csvs[0]
 
 
-def load_blackbox(csv_path):
-    """Parse the decoded blackbox CSV. Returns a dict of float arrays.
+def _sanitize(col_name):
+    """Blackbox header → a clean .mat field name: drop the unit suffix, turn
+    `gyroADC[2] (rad/s)` into `gyroADC_2`, `rcCommand[3]` into `rcCommand_3`."""
+    name = col_name.split('(')[0].strip()
+    name = name.replace('[', '_').replace(']', '')
+    name = re.sub(r'[^0-9A-Za-z_]', '_', name)
+    return name
 
-    Column names carry unit suffixes and a leading space the decoder emits
-    (e.g. ' gyroADC[2] (rad/s)'), so we match on a stripped, prefix basis.
+
+def load_blackbox(csv_path):
+    """Parse the decoded blackbox CSV → (t, cols) with EVERY column kept.
+
+    `t` is the (seconds) time base; `cols` maps a sanitized name (e.g.
+    `gyroADC_2`, `motor_0`, `eRPM_1`, `axisP_0`) to its float array, so the full
+    blackbox is carried into the merged file. `gyroADC_2` is also what the yaw
+    cross-correlation uses for the clock offset.
     """
     with open(csv_path, newline='') as f:
         reader = csv.reader(f)
         header = [h.strip() for h in next(reader)]
-
-        def find(prefix):
-            for i, name in enumerate(header):
-                if name.startswith(prefix):
-                    return i
-            raise KeyError(f'column {prefix!r} not in {csv_path}')
-
-        idx = {
-            't':     find('time'),
-            'gyroz': find('gyroADC[2]'),
-            **{f'erpm{m}': find(f'eRPM[{m}]') for m in range(4)},
-            **{f'motor{m}': find(f'motor[{m}]') for m in range(4)},
-        }
-
-        cols = {k: [] for k in idx}
+        names = [_sanitize(h) for h in header]
+        ti = next((i for i, h in enumerate(header) if h.lower().startswith('time')), None)
+        if ti is None:
+            raise KeyError(f'no time column in {csv_path}')
+        ncol = len(header)
+        data = [[] for _ in range(ncol)]
         for row in reader:
             if not row:
                 continue
-            for k, i in idx.items():
+            for i in range(ncol):
                 cell = row[i].strip() if i < len(row) else ''
-                cols[k].append(float(cell) if cell else np.nan)
+                try:
+                    data[i].append(float(cell))
+                except ValueError:        # text flag columns (e.g. 'IDLE') → NaN
+                    data[i].append(np.nan)
 
-    out = {k: np.asarray(v, float) for k, v in cols.items()}
-
+    t = np.asarray(data[ti], float)
+    cols = {names[i]: np.asarray(data[i], float) for i in range(ncol) if i != ti}
+    cols = {k: v for k, v in cols.items() if not np.isnan(v).all()}  # drop text-only cols
     # Blackbox time is monotonic; guard against any duplicate/!increasing stamps
     # so np.interp (which needs strictly increasing x) stays well-defined.
-    t = out['t']
     keep = np.concatenate(([True], np.diff(t) > 0))
     if not keep.all():
-        for k in out:
-            out[k] = out[k][keep]
-    return out
+        t = t[keep]
+        cols = {k: v[keep] for k, v in cols.items()}
+    return t, cols
 
 
 def load_vicon(mat_path):
@@ -243,17 +249,20 @@ def main():
     print(f'ViCON:    {mat}')
     print(f'Motors:   {args.poles} poles  ->  RPM = eRPM_field x {ERPM_FIELD_SCALE:.0f} / {int(pole_pairs)}\n')
 
-    # 1) Decode + load.
+    # 1) Decode + load (keep every blackbox column).
     with tempfile.TemporaryDirectory() as tmp:
-        bb = load_blackbox(decode_bbl(bbl, args.decoder, tmp))
+        bb_t, bb_cols = load_blackbox(decode_bbl(bbl, args.decoder, tmp))
     vc = load_vicon(mat)
 
+    if 'gyroADC_2' not in bb_cols:
+        sys.exit('blackbox has no gyroADC[2] column — cannot yaw-sync.')
+
     # 2) Yaw rate from each stream (blackbox: direct; ViCON: d(yaw)/dt).
-    bb_yawrate = bb['gyroz']
+    bb_yawrate = bb_cols['gyroADC_2']
     vc_yawrate = np.gradient(vc['yaw'], vc['Abs_time'])
 
     # 3) Recover the clock offset.
-    dt, coeff, sign = find_offset(vc['Abs_time'], vc_yawrate, bb['t'], bb_yawrate)
+    dt, coeff, sign = find_offset(vc['Abs_time'], vc_yawrate, bb_t, bb_yawrate)
     print(f'Clock offset dt = {dt:+.4f} s   (t_vicon = t_blackbox + dt)')
     print(f'Peak correlation = {coeff:.3f}   yaw-axis sign = {sign:+.0f}')
     if coeff < 0.3:
@@ -263,38 +272,24 @@ def main():
     # 4) Map each ViCON timestamp onto the blackbox clock and interpolate.
     #    t_blackbox = t_vicon - dt. Samples outside blackbox coverage -> NaN.
     tb = vc['Abs_time'] - dt
-    in_cov = (tb >= bb['t'][0]) & (tb <= bb['t'][-1])
+    in_cov = (tb >= bb_t[0]) & (tb <= bb_t[-1])
 
     def interp(y):
-        out = np.interp(tb, bb['t'], y)
+        out = np.interp(tb, bb_t, y)
         out[~in_cov] = np.nan
         return out
 
     n = vc['Abs_time'].size
-    motor_rpm = np.column_stack([interp(bb[f'erpm{m}']) * field_to_rpm for m in range(4)])
-    motor_erpm = np.column_stack([interp(bb[f'erpm{m}']) * field_to_erpm for m in range(4)])
-    motor_cmd = np.column_stack([interp(bb[f'motor{m}']) for m in range(4)])
     bb_yaw_on_vicon = sign * interp(bb_yawrate)   # sign-corrected, for verification
 
-    cov = int(in_cov.sum())
-    print(f'\nMerged {n} ViCON samples; {cov} ({100*cov/n:.1f}%) overlap the blackbox log.')
-    if cov:
-        rpm_valid = motor_rpm[in_cov]
-        print(f'Motor RPM over overlap: min {np.nanmin(rpm_valid):.0f}  '
-              f'max {np.nanmax(rpm_valid):.0f}  mean {np.nanmean(rpm_valid):.0f}')
-
-    # 5) Save one merged file: all original ViCON fields + motor data + metadata.
+    # 5) Save one merged file: ViCON pose + EVERY blackbox channel (bb_<name>) +
+    #    derived mechanical RPM + sync provenance.
     merged = {
         'exptime': vc['exptime'],
         'Abs_time': vc['Abs_time'],
         'b1_x': vc['b1_x'], 'b1_y': vc['b1_y'], 'b1_z': vc['b1_z'],
         'b1_qx': vc['b1_qx'], 'b1_qy': vc['b1_qy'],
         'b1_qz': vc['b1_qz'], 'b1_qw': vc['b1_qw'],
-        # motor arrays are (N, 4): columns are motors 0..3
-        'motor_rpm': motor_rpm,
-        'motor_erpm': motor_erpm,
-        'motor_cmd': motor_cmd,
-        # sync provenance / verification
         'vicon_yaw_rate': vc_yawrate,
         'blackbox_yaw_rate': bb_yaw_on_vicon,
         'sync_time_offset': dt,
@@ -304,9 +299,29 @@ def main():
         'blackbox_file': os.path.basename(bbl),
         'vicon_file': os.path.basename(mat),
     }
+    for name, y in bb_cols.items():
+        merged['bb_' + name] = interp(y)
+    # Derived (N,4) motor arrays (kept so plot_synced.py's PNG panels still work).
+    if all(f'eRPM_{m}' in bb_cols for m in range(4)):
+        merged['motor_rpm'] = np.column_stack(
+            [interp(bb_cols[f'eRPM_{m}']) * field_to_rpm for m in range(4)])
+        merged['motor_erpm'] = np.column_stack(
+            [interp(bb_cols[f'eRPM_{m}']) * field_to_erpm for m in range(4)])
+    if all(f'motor_{m}' in bb_cols for m in range(4)):
+        merged['motor_cmd'] = np.column_stack(
+            [interp(bb_cols[f'motor_{m}']) for m in range(4)])
     for k in ('b1_x_dot', 'b1_y_dot', 'b1_z_dot'):
         if k in vc:
             merged[k] = vc[k]
+
+    cov = int(in_cov.sum())
+    print(f'\nMerged {n} ViCON samples; {cov} ({100*cov/n:.1f}%) overlap the blackbox log.'
+          f'  {len(bb_cols)} blackbox channels carried.')
+    if cov and 'motor_rpm' in merged:
+        rpm_valid = merged['motor_rpm'][in_cov]
+        print(f'Motor RPM over overlap: min {np.nanmin(rpm_valid):.0f}  '
+              f'max {np.nanmax(rpm_valid):.0f}  mean {np.nanmean(rpm_valid):.0f}')
+
     sio.savemat(out, merged)
     print(f'\nSaved merged log: {out}')
 

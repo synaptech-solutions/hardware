@@ -22,6 +22,7 @@ Usage:
   combine_flight.py --poles 12 --offset 0.015   # motor poles; latency nudge (s)
 """
 import os
+import re
 import sys
 import csv
 import glob
@@ -83,37 +84,50 @@ def decode_bbl(bbl_path, decoder, out_dir):
     return csvs[0]
 
 
+def _sanitize(col_name):
+    """Blackbox header → a clean .mat field name: drop the unit suffix, turn
+    `gyroADC[0] (rad/s)` into `gyroADC_0`, `rcCommand[3]` into `rcCommand_3`."""
+    name = col_name.split("(")[0].strip()          # drop " (rad/s)" etc.
+    name = name.replace("[", "_").replace("]", "")
+    name = re.sub(r"[^0-9A-Za-z_]", "_", name)
+    return name
+
+
 def load_blackbox(csv_path):
-    """Parse decoded CSV → dict of float arrays: t, erpm0..3, motor0..3."""
+    """Parse the decoded CSV → (t, cols) with EVERY column kept.
+
+    `t` is the (seconds) time base; `cols` maps a sanitized name (e.g.
+    `gyroADC_0`, `motor_2`, `eRPM_1`, `axisP_0`) to its float array. This is how
+    the full blackbox makes it into the merged file — angular rate, accel, PID
+    terms, setpoints, debug, battery, flags, etc., not just the motors."""
     with open(csv_path, newline="") as f:
         reader = csv.reader(f)
         header = [h.strip() for h in next(reader)]
-
-        def find(prefix):
-            for i, name in enumerate(header):
-                if name.startswith(prefix):
-                    return i
-            raise KeyError(f"column {prefix!r} not in {csv_path}")
-
-        idx = {"t": find("time"),
-               **{f"erpm{m}": find(f"eRPM[{m}]") for m in range(4)},
-               **{f"motor{m}": find(f"motor[{m}]") for m in range(4)}}
-        cols = {k: [] for k in idx}
+        names = [_sanitize(h) for h in header]
+        ti = next((i for i, h in enumerate(header) if h.lower().startswith("time")), None)
+        if ti is None:
+            raise KeyError(f"no time column in {csv_path}")
+        ncol = len(header)
+        data = [[] for _ in range(ncol)]
         for row in reader:
             if not row:
                 continue
-            for k, i in idx.items():
+            for i in range(ncol):
                 cell = row[i].strip() if i < len(row) else ""
-                cols[k].append(float(cell) if cell else np.nan)
+                try:
+                    data[i].append(float(cell))
+                except ValueError:        # text flag columns (e.g. 'IDLE') → NaN
+                    data[i].append(np.nan)
 
-    out = {k: np.asarray(v, float) for k, v in cols.items()}
+    t = np.asarray(data[ti], float)
+    cols = {names[i]: np.asarray(data[i], float) for i in range(ncol) if i != ti}
+    cols = {k: v for k, v in cols.items() if not np.isnan(v).all()}  # drop text-only cols
     # np.interp needs strictly increasing x.
-    t = out["t"]
     keep = np.concatenate(([True], np.diff(t) > 0))
     if not keep.all():
-        for k in out:
-            out[k] = out[k][keep]
-    return out
+        t = t[keep]
+        cols = {k: v[keep] for k, v in cols.items()}
+    return t, cols
 
 
 def load_vicon(mat_path):
@@ -162,12 +176,12 @@ def main():
           f" / {int(pole_pairs)}   |   offset {args.offset:+.3f}s\n")
 
     with tempfile.TemporaryDirectory() as tmp:
-        bb = load_blackbox(decode_bbl(bbl, args.decoder, tmp))
+        bb_t, bb_cols = load_blackbox(decode_bbl(bbl, args.decoder, tmp))
     vc = load_vicon(vicon_mat)
 
     # Deterministic alignment: zero-base blackbox to its first sample (= trigger),
     # query at vicon Abs_time − offset. Outside blackbox coverage → NaN.
-    bb_rel = bb["t"] - bb["t"][0]
+    bb_rel = bb_t - bb_t[0]
     tq = vc["Abs_time"] - args.offset
     in_cov = (tq >= bb_rel[0]) & (tq <= bb_rel[-1])
 
@@ -177,34 +191,35 @@ def main():
         return o
 
     n = vc["Abs_time"].size
-    motor_erpm = np.column_stack([interp(bb[f"erpm{m}"]) * ERPM_FIELD_SCALE for m in range(4)])
-    motor_rpm = np.column_stack([interp(bb[f"erpm{m}"]) * field_to_rpm for m in range(4)])
-    motor_cmd = np.column_stack([interp(bb[f"motor{m}"]) for m in range(4)])
 
     # Velocity from pose (convenience), central differences on the vicon clock.
     def vel(p):
         return np.gradient(p, vc["Abs_time"]) if p.size > 1 else np.zeros_like(p)
-
-    cov = int(in_cov.sum())
-    print(f"Merged {n} Vicon samples; {cov} ({100*cov/max(n,1):.1f}%) overlap the "
-          f"blackbox log ({bb_rel[-1]:.1f}s).")
-    if cov:
-        rv = motor_rpm[in_cov]
-        print(f"Motor RPM over overlap: min {np.nanmin(rv):.0f}  max {np.nanmax(rv):.0f}"
-              f"  mean {np.nanmean(rv):.0f}")
-    if cov < n:
-        print("  note: samples outside blackbox coverage are NaN (Vicon ran longer "
-              "than the FC log — expected near the very start/end).")
 
     merged = {
         "Abs_time": vc["Abs_time"],
         "b1_x": vc["b1_x"], "b1_y": vc["b1_y"], "b1_z": vc["b1_z"],
         "b1_qx": vc["b1_qx"], "b1_qy": vc["b1_qy"], "b1_qz": vc["b1_qz"], "b1_qw": vc["b1_qw"],
         "b1_vx": vel(vc["b1_x"]), "b1_vy": vel(vc["b1_y"]), "b1_vz": vel(vc["b1_z"]),
-        "motor_rpm": motor_rpm,      # (N,4) mechanical RPM, motors 0..3
-        "motor_erpm": motor_erpm,    # (N,4) electrical RPM
-        "motor_cmd": motor_cmd,      # (N,4) commanded throttle
-        # provenance
+    }
+
+    # EVERY blackbox column, interpolated onto the vicon clock as bb_<name>.
+    for name, y in bb_cols.items():
+        merged["bb_" + name] = interp(y)
+
+    # Derived (N,4) motor arrays on top of the raw bb_eRPM_*/bb_motor_* columns:
+    # mechanical RPM (eRPM field × 100 / pole_pairs), electrical RPM, and the
+    # commanded output. Kept so plot_flight.py's PNG panels still work.
+    if all(f"eRPM_{m}" in bb_cols for m in range(4)):
+        merged["motor_rpm"] = np.column_stack(
+            [interp(bb_cols[f"eRPM_{m}"]) * field_to_rpm for m in range(4)])
+        merged["motor_erpm"] = np.column_stack(
+            [interp(bb_cols[f"eRPM_{m}"]) * ERPM_FIELD_SCALE for m in range(4)])
+    if all(f"motor_{m}" in bb_cols for m in range(4)):
+        merged["motor_cmd"] = np.column_stack(
+            [interp(bb_cols[f"motor_{m}"]) for m in range(4)])
+
+    merged.update({
         "sync_method": "deterministic-shared-trigger",
         "sync_offset_s": args.offset,
         "motor_poles": args.poles,
@@ -214,7 +229,19 @@ def main():
         "video_file": meta.get("video", {}).get("file", ""),
         "video_start_offset_s": meta.get("video", {}).get("start_offset_s", 0.0) or 0.0,
         "t0_human": meta.get("t0_human", ""),
-    }
+    })
+
+    cov = int(in_cov.sum())
+    print(f"Merged {n} Vicon samples; {cov} ({100*cov/max(n,1):.1f}%) overlap the "
+          f"blackbox log ({bb_rel[-1]:.1f}s).  {len(bb_cols)} blackbox channels carried.")
+    if cov and "motor_rpm" in merged:
+        rv = merged["motor_rpm"][in_cov]
+        print(f"Motor RPM over overlap: min {np.nanmin(rv):.0f}  max {np.nanmax(rv):.0f}"
+              f"  mean {np.nanmean(rv):.0f}")
+    if cov < n:
+        print("  note: samples outside blackbox coverage are NaN (Vicon ran longer "
+              "than the FC log — expected near the very start/end).")
+
     sio.savemat(out, merged)
     print(f"\nSaved merged flight log: {out}")
     vid = meta.get("video", {}).get("file")
