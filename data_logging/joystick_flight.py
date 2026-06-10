@@ -116,7 +116,7 @@ except Exception as _e:  # noqa: BLE001 — missing dep just disables vicon
 VICON_UDP_IP = "0.0.0.0"
 VICON_UDP_PORT = 51001
 _VICON_BLOCK = 1024
-_VICON_PROBE_TIMEOUT_S = 3.0   # no Vicon traffic within this at prepare() → disable, keep flying
+_VICON_PROBE_TIMEOUT_S = 5.0   # no Vicon traffic within this at prepare() → disable, keep flying
 _VICON_SAMPLE_DT = 0.01        # 100 Hz logging loop, same as the UdpReceiver template
 
 CAL_FILE_DEFAULT = os.path.join(HERE, "tx12_joystick_cal.json")
@@ -921,7 +921,8 @@ def build_channels(js, cal, allow_arm):
 CSI = "\033["
 
 
-def _write_session_json(session, recorder, vicon, cmd_log, telem, cal, port, baud):
+def _write_session_json(session, recorder, vicon, cmd_log, telem, cal, port, baud,
+                        vicon_off_reason=None):
     """Write per-session metadata so combine_flight.py + analysis can align all
     streams to the shared trigger t0, and so the dataset is self-describing — the
     config/calibration snapshot records what each channel/axis meant at capture."""
@@ -934,8 +935,8 @@ def _write_session_json(session, recorder, vicon, cmd_log, telem, cal, port, bau
                  "telemetry.csv and vicon Abs_time are stamped t_rel = t_wall - t0. "
                  "Blackbox time zero-bases to its first sample (≈ same flick); video "
                  "lags t0 by video.start_offset_s (use video_frames.csv for exact "
-                 "per-frame times). Drop the .bbl in data_logging/blackbox/ then run "
-                 "combine_flight.py."),
+                 "per-frame times). Drop this flight's .bbl into this session's "
+                 "blackbox/ subfolder, then run combine_flight.py."),
         "config": {
             "channel_map": {"roll": config.CH_ROLL, "pitch": config.CH_PITCH,
                             "throttle": config.CH_THR, "yaw": config.CH_YAW,
@@ -972,13 +973,31 @@ def _write_session_json(session, recorder, vicon, cmd_log, telem, cal, port, bau
     if vicon is not None:
         fp = vicon.first_packet_wall
         meta["vicon"] = {
-            "file": "vicon.mat", "samples": vicon.samples,
+            "file": "vicon.mat", "recorded": True, "samples": vicon.samples,
             "first_packet_wall": fp,
             "first_packet_offset_s": (fp - session["t0"]) if fp else None,
             "status": vicon.status,
         }
+    else:
+        # Record WHY pose is missing, so a no-Vicon flight explains itself later.
+        meta["vicon"] = {"recorded": False,
+                         "reason": vicon_off_reason or "vicon disabled"}
     with open(os.path.join(session["dir"], "session.json"), "w") as f:
         json.dump(meta, f, indent=2)
+
+
+def _warn_vicon_off(reason):
+    """Print a big, unmissable red banner when Vicon won't record — so a missing
+    Vicon stream is obvious at launch instead of a one-liner that scrolls past."""
+    bar = "!" * 70
+    sys.stdout.write(
+        f"\n{CSI}1;37;41m {bar} {CSI}0m\n"
+        f"{CSI}1;31m  ⚠  VICON IS OFF — NO POSE / TRAJECTORY WILL BE RECORDED  ⚠{CSI}0m\n"
+        f"{CSI}31m     reason: {reason or 'unknown'}{CSI}0m\n"
+        f"{CSI}31m     is Vicon Tracker streaming to THIS laptop on UDP :{VICON_UDP_PORT}? "
+        f"start it, then restart this script.{CSI}0m\n"
+        f"{CSI}1;37;41m {bar} {CSI}0m\n\n")
+    sys.stdout.flush()
 
 
 def render(ch, armed, allow_arm, raw_armed, record_on, recorder, vicon,
@@ -1005,12 +1024,20 @@ def render(ch, armed, allow_arm, raw_armed, record_on, recorder, vicon,
     # Flight mode the AUX4 value selects (acro/angle/horizon).
     mu = ch[MODE_CH]
     fmode = "HORIZON" if mu >= 1700 else ("ANGLE" if 1400 <= mu <= 1600 else "ACRO")
+    # Persistent Vicon status — ALWAYS visible so a dead Vicon is obvious live.
+    #   OFF (red, disabled) · ready (yellow) · ●N (green, recording N samples).
+    if vicon is None:
+        vic_txt = f"{CSI}1;31mVICON:OFF{CSI}0m"
+    elif vicon.recording:
+        vic_txt = f"{CSI}32mVICON:●{vicon.samples}{CSI}0m"
+    else:
+        vic_txt = f"{CSI}33mVICON:ready{CSI}0m"
     sys.stdout.write(
         f"\r{CSI}K[{mode_lbl}] "
         f"R{ch[config.CH_ROLL]:4d} P{ch[config.CH_PITCH]:4d} "
         f"T{ch[config.CH_THR]:4d} Y{ch[config.CH_YAW]:4d} | {arm_txt} "
         f"AUX3={ch[ARM_CH]:4d} AUX2={ch[AUX2_CH]:4d} AUX4={mu:4d}({fmode}) {rec_txt} | "
-        f"FC:{fm} {v} rx={bytes_rx}{thr_hint}"
+        f"{vic_txt} FC:{fm} {v} rx={bytes_rx}{thr_hint}"
     )
     sys.stdout.flush()
 
@@ -1030,6 +1057,7 @@ def run(args):
     # stop at disarm. Each flight gets its own session folder.
     rec = cal.get("record")
     recorder = vicon = cmd_log = telem = None
+    vicon_off_reason = None
     if rec is None:
         print("Recording: no 'record' switch in calibration — AUX2 held off, "
               "no video/vicon.")
@@ -1049,21 +1077,27 @@ def run(args):
             # now (fail-soft: if Vicon isn't streaming this disables it and we
             # fly without it). Keeping it here — not per session — means each
             # recording starts instantly at the switch flick, synced to t0.
-            print(f"Vicon:    probing UDP :{vicon.port} (determining sample rate)…")
+            print(f"Vicon:    probing UDP :{vicon.port} for a stream "
+                  f"(up to {_VICON_PROBE_TIMEOUT_S:.0f}s)…")
             if not vicon.prepare():
-                vicon_msg = f"vicon OFF ({vicon.status})"
+                vicon_off_reason = vicon.status
+                vicon_msg = f"{CSI}1;31mvicon OFF ({vicon.status}){CSI}0m"
                 vicon = None
             else:
-                vicon_msg = f"vicon {vicon.status}"
+                vicon_msg = f"{CSI}32mvicon {vicon.status}{CSI}0m"
         elif VICON_OK and args.dry_run:
             vicon_msg = "vicon OFF (dry-run)"
         else:
+            vicon_off_reason = f"deps missing ({_VICON_ERR})"
             vicon_msg = "vicon OFF (deps missing)"
         print(f"Recording: blackbox switch {rec['kind']}[{rec['index']}] → "
               f"AUX2 + {video_msg} + {vicon_msg}")
         print(f"           + commands.csv / telemetry.csv (+ raw) every session")
         print(f"           sessions → {REC_DIR}/<timestamp>/  "
               f"(records while ARMED + switch ON)")
+        # Loud, unmissable warning if Vicon won't record this flight (not dry-run).
+        if vicon is None and not args.dry_run:
+            _warn_vicon_off(vicon_off_reason)
 
     ser = None
     ranger_port = None
@@ -1124,6 +1158,9 @@ def run(args):
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         sdir = os.path.join(REC_DIR, stamp)
         os.makedirs(sdir, exist_ok=True)
+        # Per-session blackbox/ subfolder — drop this flight's downloaded .bbl
+        # here after landing; combine_flight.py looks here first.
+        os.makedirs(os.path.join(sdir, "blackbox"), exist_ok=True)
         session.update(dir=sdir, t0=t0, stamp=stamp)
         if recorder is not None:
             recorder.start(t0, os.path.join(sdir, "video.mp4"))
@@ -1148,7 +1185,7 @@ def run(args):
             telem.save()
         if session["dir"]:
             _write_session_json(session, recorder, vicon, cmd_log, telem,
-                                cal, ranger_port, args.baud)
+                                cal, ranger_port, args.baud, vicon_off_reason)
             sys.stdout.write(f"\n{CSI}33m■ SESSION SAVED{CSI}0m {session['stamp']}\n")
             if cmd_log is not None:
                 sys.stdout.write(f"   commands: {len(cmd_log.rows)} frames\n")
@@ -1159,6 +1196,8 @@ def run(args):
                 sys.stdout.write(f"   video: {recorder.status}\n")
             if vicon is not None:
                 sys.stdout.write(f"   vicon: {vicon.status}\n")
+            sys.stdout.write(f"   → drop the FC .bbl into {session['dir']}/blackbox/ "
+                             f"then run combine_flight.py\n")
         session.update(dir=None, t0=None, stamp=None)
 
     try:

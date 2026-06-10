@@ -1,11 +1,14 @@
 """Deterministically merge one flight's laptop logs + Vicon pose + FC blackbox
 into a single wide CSV on the Vicon clock.
 
-Sources (one session folder + the separately-downloaded FC blackbox):
+Everything lives in the one session folder (recordings/<stamp>/):
   - vicon.mat      Vicon pose @100 Hz; Abs_time is already t_rel from trigger t0
   - commands.csv   outgoing RC frames (all 16 ch + joystick), stamped t_rel
   - telemetry.csv  incoming CRSF telemetry, stamped t_rel (laptop receive time)
-  - <log>.bbl      FC blackbox, dropped into data_logging/blackbox/
+  - blackbox/<log>.bbl   FC blackbox — drop the flight's .bbl into the session's
+                   own blackbox/ subfolder (auto-created each session; kept with the
+                   flight). The session root and the legacy shared data_logging/
+                   blackbox/ are checked as fallbacks.
 
 No cross-correlation. The blackbox switch starts every stream at the same flick,
 so they share the trigger t0:
@@ -26,9 +29,9 @@ and the column list). The session's video.mp4 + video_frames.csv sit alongside;
 the video's t0 offset is in session.json / the meta file.
 
 Usage:
-  combine_flight.py                       # newest session + newest .bbl
-  combine_flight.py SESSION_DIR           # that session + newest .bbl
-  combine_flight.py SESSION_DIR LOG.bbl   # explicit
+  combine_flight.py                       # newest session + its own .bbl
+  combine_flight.py SESSION_DIR           # that session + the .bbl in it
+  combine_flight.py SESSION_DIR LOG.bbl   # explicit .bbl
   combine_flight.py --poles 12 --offset 0.015   # motor poles; latency nudge (s)
 """
 import os
@@ -76,11 +79,40 @@ def _newest(folder, pattern):
 
 
 def newest_session():
+    # A session is any recordings/* dir with a session.json (vicon.mat may be
+    # absent if that flight was flown without Vicon).
     dirs = [d for d in glob.glob(os.path.join(RECORDINGS, "*")) if os.path.isdir(d)
-            and os.path.exists(os.path.join(d, "vicon.mat"))]
+            and os.path.exists(os.path.join(d, "session.json"))]
     if not dirs:
-        raise FileNotFoundError(f"no session with vicon.mat in {RECORDINGS}/")
+        raise FileNotFoundError(f"no session with session.json in {RECORDINGS}/")
     return max(dirs, key=os.path.getmtime)
+
+
+def find_session_bbl(session):
+    """Find this flight's blackbox .bbl kept WITH the flight: in its own
+    blackbox/ subfolder (the layout the session creates), then the session root,
+    then the legacy shared data_logging/blackbox/ as a last resort. Picks the
+    largest .bbl when several were dropped in (e.g. btfl_all + btfl_001)."""
+    for folder, label in ((os.path.join(session, "blackbox"), "blackbox/ subfolder"),
+                          (session, "session folder")):
+        hits = sorted(glob.glob(os.path.join(folder, "*.bbl")),
+                      key=os.path.getsize, reverse=True)
+        if hits:
+            if len(hits) > 1:
+                print(f"  note: {len(hits)} .bbl in the {label}; using the largest "
+                      f"({os.path.basename(hits[0])}). One flight per .bbl keeps the "
+                      "pairing unambiguous.")
+            return hits[0]
+    legacy = glob.glob(os.path.join(BLACKBOX_DIR, "*.bbl"))
+    if legacy:
+        b = max(legacy, key=os.path.getmtime)
+        print(f"  note: no .bbl in {os.path.basename(session)}/blackbox/ — falling back "
+              f"to the legacy shared blackbox/ ({os.path.basename(b)}). New workflow: "
+              "drop the flight's .bbl into its session's blackbox/ subfolder.")
+        return b
+    raise FileNotFoundError(
+        f"no .bbl found in {session}/blackbox/ (or {BLACKBOX_DIR}/). Copy the flight's "
+        "blackbox .bbl into its session's blackbox/ subfolder, then re-run.")
 
 
 def decode_bbl(bbl_path, decoder, out_dir):
@@ -271,9 +303,14 @@ def main():
 
     session = args.session or newest_session()
     vicon_mat = os.path.join(session, "vicon.mat")
-    if not os.path.isfile(vicon_mat):
-        sys.exit(f"no vicon.mat in {session}")
-    bbl = args.bbl or _newest(BLACKBOX_DIR, "*.bbl")
+    cmd_path = os.path.join(session, "commands.csv")
+    # Vicon is preferred (it's the ground-truth pose + master clock), but optional:
+    # if a flight was flown without Vicon, fall back to the commands.csv clock so
+    # the rest of the streams still merge (no pose/trajectory in that case).
+    if not os.path.isfile(vicon_mat) and not os.path.isfile(cmd_path):
+        sys.exit(f"{session} has neither vicon.mat nor commands.csv — nothing to "
+                 "build a timeline from.")
+    bbl = args.bbl or find_session_bbl(session)
     out = args.out or os.path.join(session, "flight_synced.csv")
     meta_out = os.path.splitext(out)[0] + ".meta.json"
 
@@ -287,21 +324,33 @@ def main():
             meta = json.load(f)
 
     print(f"Session:  {session}")
-    print(f"Vicon:    {vicon_mat}")
+    print(f"Vicon:    {vicon_mat if os.path.isfile(vicon_mat) else '(none — no pose)'}")
     print(f"Blackbox: {bbl}")
     print(f"Motors:   {args.poles} poles  ->  RPM = eRPM_field x {ERPM_FIELD_SCALE:.0f}"
           f" / {int(pole_pairs)}   |   offset {args.offset:+.3f}s\n")
 
     with tempfile.TemporaryDirectory() as tmp:
         bb_t, bb_cols = load_blackbox(decode_bbl(bbl, args.decoder, tmp))
-    vc = load_vicon(vicon_mat)
+    vc = load_vicon(vicon_mat) if os.path.isfile(vicon_mat) else None
+    cmd = load_commands(cmd_path) if os.path.isfile(cmd_path) else None  # (ct, cser) | None
 
-    tq = vc["Abs_time"]                 # the master clock everything lands on
+    # Master clock everything lands on: Vicon Abs_time if recorded, else the
+    # commands.csv t_rel grid (same t0 clock). Both are zero-based at the trigger.
+    if vc is not None:
+        tq = vc["Abs_time"]
+        master = "vicon"
+    else:
+        if cmd is None or cmd[0].size == 0:
+            sys.exit("no vicon.mat and no usable commands.csv — cannot build a timeline.")
+        tq = cmd[0]
+        master = "commands"
+        print("  note: no vicon.mat for this flight — using commands.csv as the master "
+              "clock. This merge has NO pose/trajectory (Vicon wasn't recorded).")
     n = tq.size
 
     # Blackbox is on the FC clock: zero-base to its first sample (= the flick) and
-    # query at Abs_time - offset (the laptop->FC link latency). Laptop streams
-    # (commands/telemetry) share Abs_time directly, so they use offset 0.
+    # query at master - offset (the laptop->FC link latency). Laptop streams
+    # (commands/telemetry) share the master clock directly, so they use offset 0.
     bb_rel = bb_t - bb_t[0]
     bb_q = tq - args.offset
     bb_lo, bb_hi = bb_rel[0], bb_rel[-1]
@@ -309,14 +358,15 @@ def main():
 
     cols = {"Abs_time": tq}
 
-    # Pose + velocity (central differences on the Vicon clock).
-    for k in ("b1_x", "b1_y", "b1_z", "b1_qx", "b1_qy", "b1_qz", "b1_qw"):
-        if k in vc:
-            cols[k] = vc[k]
-    for a in ("x", "y", "z"):
-        if f"b1_{a}" in vc:
-            p = vc[f"b1_{a}"]
-            cols[f"b1_v{a}"] = np.gradient(p, tq) if p.size > 1 else np.zeros_like(p)
+    # Pose + velocity (only when Vicon was recorded; central differences on tq).
+    if vc is not None:
+        for k in ("b1_x", "b1_y", "b1_z", "b1_qx", "b1_qy", "b1_qz", "b1_qw"):
+            if k in vc:
+                cols[k] = vc[k]
+        for a in ("x", "y", "z"):
+            if f"b1_{a}" in vc:
+                p = vc[f"b1_{a}"]
+                cols[f"b1_v{a}"] = np.gradient(p, tq) if p.size > 1 else np.zeros_like(p)
 
     # EVERY blackbox column -> bb_<name> (linear).
     for name, y in bb_cols.items():
@@ -333,16 +383,20 @@ def main():
             cols[f"motor_cmd_{m}"] = _interp_lin(
                 bb_q, bb_rel, bb_cols[f"motor_{m}"], bb_lo, bb_hi)
 
-    # Outgoing commands -> cmd_<name> (zero-order hold; same laptop clock as Vicon).
+    # Outgoing commands -> cmd_<name>. If commands IS the master clock, the values
+    # are already on tq (use as-is); otherwise zero-order-hold onto tq.
     n_cmd = 0
-    cmd_path = os.path.join(session, "commands.csv")
-    if os.path.isfile(cmd_path):
-        ct, cser = load_commands(cmd_path)
+    if cmd is not None:
+        ct, cser = cmd
         n_cmd = int(ct.size)
         if n_cmd:
-            clo, chi = ct[0], ct[-1]
-            for c, y in cser.items():
-                cols["cmd_" + c] = _interp_hold(tq, ct, y, clo, chi)
+            if master == "commands":
+                for c, y in cser.items():
+                    cols["cmd_" + c] = y
+            else:
+                clo, chi = ct[0], ct[-1]
+                for c, y in cser.items():
+                    cols["cmd_" + c] = _interp_hold(tq, ct, y, clo, chi)
 
     # Incoming telemetry -> tlm_<name> (linear measurements, hold for categorical).
     n_tlm_ch = 0
@@ -357,25 +411,27 @@ def main():
             cols["tlm_" + c] = fn(tq, tt, yy, tt[0], tt[-1])
 
     cov = int(in_cov.sum())
-    print(f"Merged {n} Vicon samples; {cov} ({100*cov/max(n,1):.1f}%) overlap the "
-          f"blackbox log ({bb_rel[-1]:.1f}s).  {len(bb_cols)} blackbox channels, "
-          f"{n_cmd} command frames, {n_tlm_ch} telemetry channels.")
+    print(f"Merged {n} samples on the {master} clock; {cov} ({100*cov/max(n,1):.1f}%) "
+          f"overlap the blackbox log ({bb_rel[-1]:.1f}s).  {len(bb_cols)} blackbox "
+          f"channels, {n_cmd} command frames, {n_tlm_ch} telemetry channels.")
     if cov and "motor_rpm_0" in cols:
         rv = np.column_stack([cols[f"motor_rpm_{m}"] for m in range(4)])[in_cov]
         print(f"Motor RPM over overlap: min {np.nanmin(rv):.0f}  max {np.nanmax(rv):.0f}"
               f"  mean {np.nanmean(rv):.0f}")
     if cov < n:
-        print("  note: samples outside blackbox coverage are blank (Vicon ran longer "
-              "than the FC log — expected near the very start/end).")
+        print("  note: samples outside blackbox coverage are blank (the laptop streams "
+              "ran longer than the FC log — expected near the very start/end).")
 
     _write_csv(out, cols)
 
     meta_out_data = {
         "sync_method": "deterministic-shared-trigger",
+        "master_clock": master,
+        "has_pose": vc is not None,
         "sync_offset_s": args.offset,
         "motor_poles": args.poles,
         "blackbox_file": os.path.basename(bbl),
-        "vicon_file": "vicon.mat",
+        "vicon_file": "vicon.mat" if vc is not None else "",
         "commands_file": "commands.csv" if os.path.isfile(cmd_path) else "",
         "telemetry_file": "telemetry.csv" if os.path.isfile(tlm_path) else "",
         "telemetry_raw_file": "telemetry_raw.csv",
