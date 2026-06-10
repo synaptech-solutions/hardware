@@ -277,6 +277,83 @@ def _interp_hold(tq, t, y, lo, hi):
     return o
 
 
+# laptop stick channel -> Betaflight rcCommand index (AETR vs RPYT). Yaw is omitted
+# from drift estimation: it is logged sign-inverted vs the FC on this airframe, and
+# its tiny amplitude makes it a poor reference anyway.
+_DRIFT_PAIRS = [("ch00_us", "rcCommand_0"), ("ch01_us", "rcCommand_1"),
+                ("ch02_us", "rcCommand_3")]
+
+
+def estimate_bb_clock_map(cmd, bb_rel, bb_cols, fs=500.0, win_s=15.0, step_s=7.5):
+    """Estimate the FC-clock -> laptop-clock map from the command echo.
+
+    The laptop logs each RC frame it SENT (commands.csv, laptop clock); the FC logs
+    what it RECEIVED (rcCommand, FC clock). They are the same signal, so the lag
+    between them at any moment is the clock offset. The shared-trigger sync only
+    pins t=0 -- the two crystals then drift (seen as a lag that grows linearly over
+    the flight). We cross-correlate cmd vs rcCommand edges in sliding windows, fit a
+    line offset(t)=slope*t+intercept, and return the correction so that
+
+        laptop_time(bb_rel) = bb_rel*(1 - slope) - intercept
+
+    Returns (slope_s_per_s, intercept_s, n_points, rmse_ms) or None if it can't get
+    a confident fit (caller then falls back to a constant offset)."""
+    if cmd is None:
+        return None
+    ct, cser = cmd
+    if ct.size < 50:
+        return None
+    g = np.arange(max(ct[0], bb_rel[0]), min(ct[-1], bb_rel[-1]), 1.0 / fs)
+    if g.size < int(2 * win_s * fs):
+        return None
+
+    def _xcorr_lag(a, b, max_lag_s=0.35):
+        da, db = np.diff(a), np.diff(b)          # derivatives -> edge sensitive
+        if da.std() < 1e-9 or db.std() < 1e-9:
+            return None
+        da = (da - da.mean()) / da.std(); db = (db - db.mean()) / db.std()
+        full = np.correlate(db, da, "full")
+        lags = np.arange(-(len(da) - 1), len(db))
+        sel = np.abs(lags) <= int(max_lag_s * fs)
+        full, lags = full[sel], lags[sel]
+        k = int(np.argmax(full)); lag = float(lags[k]); q = full[k] / len(da)
+        if 0 < k < len(full) - 1:                # parabolic refine
+            y0, y1, y2 = full[k - 1], full[k], full[k + 1]; d = y0 - 2 * y1 + y2
+            if abs(d) > 1e-12:
+                lag += 0.5 * (y0 - y2) / d
+        return lag / fs, q
+
+    centers, offsets, weights = [], [], []
+    for ch, rc in _DRIFT_PAIRS:
+        if ch not in cser or rc not in bb_cols:
+            continue
+        c_g = _interp_hold(g, ct, cser[ch], ct[0], ct[-1])          # cmd: zero-order hold
+        r_g = np.interp(g, bb_rel, bb_cols[rc])                     # rcCommand: linear
+        x = g[0]
+        while x + win_s <= g[-1]:
+            w = (g >= x) & (g < x + win_s)
+            res = _xcorr_lag(c_g[w], r_g[w])
+            if res is not None and res[1] > 0.30:
+                centers.append(x + win_s / 2.0)
+                offsets.append(res[0] * 1000.0)                     # ms; +ve => rc lags cmd
+                weights.append(res[1])
+            x += step_s
+    if len(centers) < 5:
+        return None
+    centers = np.asarray(centers); offsets = np.asarray(offsets); weights = np.asarray(weights)
+    # weighted linear fit, one round of outlier rejection at 3*rmse
+    for _ in range(2):
+        A = np.polyfit(centers, offsets, 1, w=weights)
+        resid = offsets - np.polyval(A, centers)
+        rmse = float(np.sqrt(np.average(resid**2, weights=weights)))
+        keep = np.abs(resid) <= max(3 * rmse, 15.0)
+        if keep.all() or keep.sum() < 5:
+            break
+        centers, offsets, weights = centers[keep], offsets[keep], weights[keep]
+    slope_ms, intercept_ms = float(A[0]), float(A[1])
+    return slope_ms / 1000.0, intercept_ms / 1000.0, len(centers), rmse
+
+
 def _write_csv(path, cols):
     """Write an ordered {name: 1-D array} dict as a wide CSV; NaN -> empty cell."""
     names = list(cols.keys())
@@ -296,8 +373,11 @@ def main():
     ap.add_argument("--out", help="output file (default: <session>/flight_synced.csv)")
     ap.add_argument("--poles", type=int, default=12, help="motor pole count (default 12)")
     ap.add_argument("--offset", type=float, default=0.0,
-                    help="seconds the FC log lags the laptop trigger (laptop->FC "
-                         "latency); blackbox query time = vicon Abs_time - offset")
+                    help="extra constant seconds the FC log lags the laptop trigger, "
+                         "applied ON TOP of the auto drift correction")
+    ap.add_argument("--no-drift-correct", action="store_true",
+                    help="disable the cmd<->rcCommand clock-drift correction (revert to "
+                         "the old constant-offset shared-trigger alignment)")
     ap.add_argument("--decoder", default=DEFAULT_DECODER, help="path to blackbox_decode")
     args = ap.parse_args()
 
@@ -348,10 +428,25 @@ def main():
               "clock. This merge has NO pose/trajectory (Vicon wasn't recorded).")
     n = tq.size
 
-    # Blackbox is on the FC clock: zero-base to its first sample (= the flick) and
-    # query at master - offset (the laptop->FC link latency). Laptop streams
-    # (commands/telemetry) share the master clock directly, so they use offset 0.
+    # Blackbox is on the FC clock: zero-base to its first sample (≈ the flick). The
+    # FC and laptop crystals drift, so a single constant offset only aligns t≈0; we
+    # map the FC clock onto the laptop clock via the cmd<->rcCommand echo (see
+    # estimate_bb_clock_map). After mapping, bb_rel is in laptop-clock seconds and we
+    # query it directly on the master grid. --offset is an extra constant nudge.
     bb_rel = bb_t - bb_t[0]
+    drift = None if args.no_drift_correct else \
+        estimate_bb_clock_map(cmd, bb_rel, bb_cols)
+    if drift is not None:
+        slope, intercept, npts, rmse = drift
+        bb_rel = bb_rel * (1.0 - slope) - intercept
+        print(f"Clock drift: FC vs laptop = {slope*1000:+.3f} ms/s ({slope*100:+.3f}%), "
+              f"offset@t0 {intercept*1000:+.1f} ms  (fit over {npts} windows, rmse {rmse:.1f} ms)")
+        print("  -> remapped blackbox onto the laptop clock (cmd<->rcCommand echo). "
+              "rcCommand should now land just AFTER its command.")
+    else:
+        print("Clock drift: not estimated (no command echo / low confidence) — using "
+              "constant shared-trigger alignment." + (
+                  "" if args.no_drift_correct else " Pass --offset to nudge."))
     bb_q = tq - args.offset
     bb_lo, bb_hi = bb_rel[0], bb_rel[-1]
     in_cov = (bb_q >= bb_lo) & (bb_q <= bb_hi)
@@ -425,10 +520,15 @@ def main():
     _write_csv(out, cols)
 
     meta_out_data = {
-        "sync_method": "deterministic-shared-trigger",
+        "sync_method": ("shared-trigger + cmd-rcCommand drift-correction"
+                        if drift is not None else "deterministic-shared-trigger"),
         "master_clock": master,
         "has_pose": vc is not None,
         "sync_offset_s": args.offset,
+        "clock_drift_slope_s_per_s": drift[0] if drift else 0.0,
+        "clock_drift_intercept_s": drift[1] if drift else 0.0,
+        "clock_drift_fit_windows": drift[2] if drift else 0,
+        "clock_drift_rmse_ms": drift[3] if drift else None,
         "motor_poles": args.poles,
         "blackbox_file": os.path.basename(bbl),
         "vicon_file": "vicon.mat" if vc is not None else "",

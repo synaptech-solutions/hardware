@@ -7,7 +7,10 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-REC = sys.argv[1] if len(sys.argv) > 1 else "recordings/20260609_135349"
+import os
+_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # data_logging/
+_arg = sys.argv[1] if len(sys.argv) > 1 else "recordings/20260609_135349"
+REC = _arg if os.path.isabs(_arg) else os.path.join(_BASE, _arg)
 CSV = f"{REC}/flight_synced.csv"
 want = ["Abs_time","cmd_ch00_us","cmd_ch02_us","cmd_ch03_us",
         "bb_rcCommand_0","bb_rcCommand_2","bb_rcCommand_3",
@@ -64,5 +67,8 @@ ax.set_xlabel("time relative to command step (ms)"); ax.set_ylabel("normalized")
 ax.legend(loc="best"); ax.grid(alpha=0.3)
 
 plt.tight_layout()
-out = f"{REC}/latency_overlay.png"; plt.savefig(out, dpi=110)
+_OUTDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "plots")
+os.makedirs(_OUTDIR, exist_ok=True)
+out = os.path.join(_OUTDIR, f"latency_overlay_{os.path.basename(REC.rstrip('/'))}.png")
+plt.savefig(out, dpi=110)
 print("saved", out)

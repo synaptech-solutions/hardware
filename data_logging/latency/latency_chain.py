@@ -7,7 +7,10 @@ Chain:  laptop cmd --[transport+RC smoothing]--> rcCommand --[PID]--> motor
 """
 import csv, sys
 import numpy as np
-REC = sys.argv[1] if len(sys.argv) > 1 else "recordings/20260609_135349"
+import os
+_BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # data_logging/
+_arg = sys.argv[1] if len(sys.argv) > 1 else "recordings/20260609_135349"
+REC = _arg if os.path.isabs(_arg) else os.path.join(_BASE, _arg)
 CSV = f"{REC}/flight_synced.csv"
 want = ["Abs_time","cmd_ch00_us","cmd_ch01_us","cmd_ch02_us","cmd_ch03_us",
         "bb_rcCommand_0","bb_rcCommand_1","bb_rcCommand_2","bb_rcCommand_3",

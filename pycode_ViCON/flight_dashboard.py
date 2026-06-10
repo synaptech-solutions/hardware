@@ -28,6 +28,7 @@ import webbrowser
 
 import numpy as np
 import scipy.io as sio
+from scipy import signal as sp_signal
 from scipy.spatial.transform import Rotation
 import dash
 from dash import dcc, html, Input, Output
@@ -62,7 +63,8 @@ BB_ORDER = ["gyroADC", "accSmooth", "motor", "eRPM", "rcCommand", "setpoint",
             "vbatLatest", "amperageLatest", "rssi"]
 
 DEFAULT_ON = ["pos", "vel", "orient", "motor_rpm", "cmd_sticks",
-              "bb_gyroADC", "bb_accSmooth", "altrpm", "yawsync"]
+              "bb_gyroADC", "bb_accSmooth", "altrpm", "yawsync",
+              "lat_timeline", "lat_throttle", "lat_roll"]
 
 
 def _euler_deg(qx, qy, qz, qw):
@@ -71,6 +73,101 @@ def _euler_deg(qx, qy, qz, qw):
     quat[norms < 1e-6] = [0.0, 0.0, 0.0, 1.0]
     quat /= np.linalg.norm(quat, axis=1, keepdims=True)
     return Rotation.from_quat(quat).as_euler("zyx", degrees=True)   # yaw,pitch,roll
+
+
+def _latency_timeline(m, t, win_s=10.0, step_s=2.5, fs=500.0, corr_floor=0.25):
+    """Latency (ms) of each control-path link as a function of flight time.
+
+    Slides a window over the flight; in each window cross-correlates one link to
+    get its lag, then interpolates the per-window lags back onto the full time
+    base t (so it plots as a normal panel). Returns {label: array(len(t))} or {}
+    if the needed channels are absent. Links:
+        transport   laptop cmd  -> FC rcCommand   (throttle, edge xcorr)
+        FC response FC rcCommand -> gyro           (roll+pitch, signal xcorr)
+        end-to-end  laptop cmd  -> gyro            (roll+pitch)
+    """
+    def has(k):
+        return k in m and np.asarray(m[k]).ravel().size == t.size
+    if not (has("cmd_ch02_us") and has("bb_rcCommand_3")):
+        return {}
+    tg = np.arange(float(t[0]), float(t[-1]), 1.0 / fs)
+    def rs(k):
+        y = np.asarray(m[k]).ravel().astype(float)
+        ok = np.isfinite(y) & np.isfinite(t)
+        return np.interp(tg, t[ok], y[ok]) if ok.sum() > 10 else None
+    bp = sp_signal.butter(2, [0.3 / (fs / 2), 15 / (fs / 2)], "band")
+
+    def win_lag(a, b, t0, t1, deriv, max_lag_s=0.15):
+        w = (tg >= t0) & (tg < t1)
+        x, y = a[w].copy(), b[w].copy()
+        if deriv:
+            x, y = np.diff(x), np.diff(y)
+        else:
+            x = sp_signal.filtfilt(*bp, x); y = sp_signal.filtfilt(*bp, y)
+        if x.std() < 1e-6 or y.std() < 1e-6:
+            return None
+        x = (x - x.mean()) / x.std(); y = (y - y.mean()) / y.std()
+        f = sp_signal.correlate(y, x, "full")
+        lags = sp_signal.correlation_lags(len(y), len(x), "full")
+        sel = np.abs(lags) <= int(max_lag_s * fs); f, lags = f[sel], lags[sel]
+        k = int(np.argmax(f)); lag = float(lags[k]); q = f[k] / len(x)
+        if 0 < k < len(f) - 1:
+            y0, y1, y2 = f[k - 1], f[k], f[k + 1]; dd = y0 - 2 * y1 + y2
+            if abs(dd) > 1e-12: lag += 0.5 * (y0 - y2) / dd
+        return lag / fs * 1000.0, q
+
+    cache = {}
+    def get(k):
+        if k not in cache: cache[k] = rs(k)
+        return cache[k]
+
+    def sweep(pairs, deriv, floor0=False):
+        """Per-window lag (ms) -> smoothed, optionally floored at 0 (latency can't be
+        negative), interpolated onto the full time base. Transport (~10 ms) sits at
+        the ~10 ms blackbox-sample resolution, so the raw per-window estimate hops by
+        ±one sample; a rolling median suppresses that quantization jitter."""
+        centers, vals = [], []
+        x = float(t[0])
+        while x + win_s <= float(t[-1]):
+            ms, ws = [], []
+            for an, bn in pairs:
+                A, B = get(an), get(bn)
+                if A is None or B is None:
+                    continue
+                r = win_lag(A, B, x, x + win_s, deriv)
+                if r and abs(r[1]) > corr_floor:
+                    ms.append(r[0]); ws.append(abs(r[1]))
+            if ms:
+                centers.append(x + win_s / 2.0); vals.append(np.average(ms, weights=ws))
+            x += step_s
+        if len(centers) < 5:
+            return None
+        vals = np.asarray(vals, float)
+        vals = sp_signal.medfilt(vals, kernel_size=5)        # kill ±1-sample hopping
+        if floor0:
+            vals = np.maximum(vals, 0.0)                     # transport >= 0 (physical)
+        return np.interp(t, centers, vals, left=np.nan, right=np.nan)
+
+    # Two independently-measured links, then end-to-end = their SUM (so it is
+    # consistent by construction: a sub-link can never exceed the whole). The two
+    # links are measured on the axes where each has the best signal -- transport
+    # on throttle (large, clean; the comms+smoothing lag is axis-independent),
+    # response on roll/pitch (that is where rotation actually happens).
+    links = {}
+    tr = sweep([("cmd_ch02_us", "bb_rcCommand_3")], True, floor0=True)   # transport (>=0)
+    rr = None
+    if has("bb_rcCommand_0") and has("bb_gyroADC_0"):
+        rp = [("bb_rcCommand_0", "bb_gyroADC_0")]
+        if has("bb_rcCommand_1") and has("bb_gyroADC_1"):
+            rp.append(("bb_rcCommand_1", "bb_gyroADC_1"))
+        rr = sweep(rp, False)                                     # FC+airframe response
+    if tr is not None:
+        links["cmd → received (transport, ~10 ms res. floor)"] = tr
+    if rr is not None:
+        links["received → rotating (response)"] = rr
+    if tr is not None and rr is not None:
+        links["cmd → rotating (end-to-end = sum)"] = tr + rr      # consistent: >= each part
+    return links
 
 
 def _load_synced_csv(path):
@@ -249,6 +346,67 @@ def load_channels(path):
     if imu_g:
         mk("tlm_imu_gyro", "Telemetry — IMU gyro (live, MSP)", "deg/s",
            [(k.split("imu_")[1].replace("_dps", ""), col(k)) for k in imu_g])
+
+    # --- latency overlays: command vs reception vs response --------------- #
+    # Traces are scaled to a FIXED full-deflection reference (NOT each min-max'd),
+    # so a tiny stick input stays tiny on screen instead of being stretched to
+    # fill the axis (which makes RC-smoothing/quantization noise on a near-neutral
+    # axis look like a huge -- even negative -- "latency"). Read the lag between
+    # links straight off the x-axis on a step where the command actually MOVED:
+    #   laptop cmd -> FC rcCommand (received) -> setpoint -> gyro / motor
+    # Caveat: only meaningful where the command moved a real amount. A per-axis
+    # "Δ" in the title flags how far the stick actually travelled; axes that
+    # barely moved are noise-dominated and not a real latency reading.
+    def _scale(y, center, full):
+        return (np.asarray(y, float) - center) / full
+
+    def _ptp_us(k):
+        if k not in m:
+            return 0.0
+        y = col(k); return float(np.nanmax(y) - np.nanmin(y))
+
+    # throttle: command -> received -> motor (the cleanest, largest-amplitude chain).
+    # Throttle is a big clean signal, so each trace is min-max'd over its own span
+    # -> they overlay at matched amplitude (cmd µs, rcCommand units and motor RPM
+    # all have different native scales). Only TIMING matters here, and a large
+    # signal won't stretch noise the way a near-neutral attitude axis would.
+    def _mm(y):
+        y = np.asarray(y, float); lo, hi = np.nanmin(y), np.nanmax(y)
+        return (y - lo) / (hi - lo) if hi - lo > 1e-9 else np.zeros_like(y)
+    if "cmd_ch02_us" in m and "bb_rcCommand_3" in m:
+        series = [("laptop cmd", _mm(col("cmd_ch02_us"))),
+                  ("FC rcCommand", _mm(col("bb_rcCommand_3")))]
+        if mean_rpm is not None:
+            series.append(("motor (mean RPM)", _mm(mean_rpm)))
+        mk("lat_throttle", f"Latency — Throttle: cmd → received → motor  (Δcmd {_ptp_us('cmd_ch02_us'):.0f}µs)",
+           "norm 0–1", series)
+
+    # attitude axes: cmd µs about neutral 1500 (±500 full); rcCommand/setpoint/gyro
+    # scaled to comparable references. Yaw rcCommand logs inverted vs the FC, so we
+    # flip the laptop cmd sign for the overlay (timing is unaffected by the flip).
+    for nm, c_ch, rc, sp, gy, csign in [
+            ("Roll", "cmd_ch00_us", "bb_rcCommand_0", "bb_setpoint_0", "bb_gyroADC_0", +1),
+            ("Pitch", "cmd_ch01_us", "bb_rcCommand_1", "bb_setpoint_1", "bb_gyroADC_1", +1),
+            ("Yaw", "cmd_ch03_us", "bb_rcCommand_2", "bb_setpoint_2", "bb_gyroADC_2", -1)]:
+        if c_ch not in m or rc not in m:
+            continue
+        series = [("laptop cmd", csign * _scale(col(c_ch), 1500, 500)),
+                  ("FC rcCommand", _scale(col(rc), 0, 500))]
+        if sp in m:
+            series.append(("setpoint", _scale(col(sp), 0, 500)))
+        if gy in m:
+            series.append(("gyro (actual rate)", _scale(col(gy), 0, 500)))
+        flip = "  [cmd sign-flipped to match FC]" if csign < 0 else ""
+        mk(f"lat_{nm.lower()}",
+           f"Latency — {nm}: cmd → received → setpoint → gyro  (Δcmd {_ptp_us(c_ch):.0f}µs){flip}",
+           "fraction of full deflection", series)
+
+    # latency of each link AS A FUNCTION OF TIME (windowed cross-correlation):
+    # how big the lag is and whether it drifts over the flight.
+    tl = _latency_timeline(m, t)
+    if tl:
+        mk("lat_timeline", "Latency over time — per link (windowed, ms)", "ms",
+           list(tl.items()))
 
     # --- 3D pose + color-by options --------------------------------------- #
     x = col("b1_x") if "b1_x" in m else np.zeros(N)
@@ -463,6 +621,8 @@ PANEL_SECTIONS = [
      lambda pid: pid in ("pos", "vel", "orient", "quat")),
     ("Commands sent — laptop → drone",
      lambda pid: pid.startswith("cmd_")),
+    ("Latency — command vs reception vs response (normalized)",
+     lambda pid: pid.startswith("lat_")),
     ("Telemetry — live from drone",
      lambda pid: pid.startswith("tlm_")),
     ("Blackbox — flight controller (FC)",
