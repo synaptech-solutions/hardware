@@ -19,12 +19,22 @@ Betaflight dump) so this stays in lockstep with the autonomous controller.
 This FC has no prearm — a single arm switch gates arming (CH_ARM only).
 
 RECORDING: the blackbox switch (relayed to AUX2 so the FC's blackbox starts)
-also triggers laptop video capture of the drone feed. Video records while the
-drone is ARMED and the switch is ON, and is saved when either drops (disarm or
-switch off). Needs cv2 — run with the repo venv: .venv/bin/python.
+also triggers laptop capture of EVERYTHING flowing through the laptop, all
+stamped on one clock (t_rel = wall - t0) so they merge deterministically:
+  - commands.csv      every outgoing RC frame: all 16 channels + full joystick
+  - telemetry.csv     typed decode of incoming CRSF telemetry (attitude, battery,
+                      link stats, flight mode, device info) + live IMU accel/gyro
+                      (MSP_RAW_IMU, actively polled at 10 Hz)
+  - telemetry_raw.csv every incoming frame as hex (lossless safety net)
+  - video.mp4 + video_frames.csv   drone feed + per-frame capture timestamps
+  - vicon.mat         Vicon pose @ 100 Hz
+Recording runs while the drone is ARMED and the switch is ON; everything is saved
+when either drops (disarm or switch off). Video/vicon need cv2/scipy — run with
+the repo venv: .venv/bin/python. The CSV logs and FC blackbox have no such deps.
 
 Usage:
     .venv/bin/python joystick_flight.py --calibrate  # one-time, per radio config
+    .venv/bin/python joystick_flight.py --calibrate-mode  # add the flight-mode switch (AUX4) to an existing cal
     .venv/bin/python joystick_flight.py --dry-run    # read joystick, print sticks, never send
     .venv/bin/python joystick_flight.py              # fly: autodetect Ranger port
     .venv/bin/python joystick_flight.py /dev/ttyACM0 420000  # explicit Ranger port + baud
@@ -39,6 +49,7 @@ SAFETY
 """
 import argparse
 import array
+import csv
 import datetime
 import fcntl
 import json
@@ -58,7 +69,10 @@ sys.path.insert(0, os.path.join(_CONTROL, "setup"))   # for `from live_telemetry
 import serial  # noqa: E402
 from live_telemetry import (  # noqa: E402
     build_rc_channels_packed, build_device_ping, autodetect_port, CrsfParser,
-    decode_flight_mode, decode_battery, T_FLIGHT_MODE, T_BATTERY,
+    decode_flight_mode, decode_battery, decode_attitude, decode_link_stats,
+    T_FLIGHT_MODE, T_BATTERY, T_ATTITUDE, T_LINK_STATS, T_DEVICE_INFO,
+    build_crsf_msp_v2_request, CrsfMspParser, decode_msp_raw_imu,
+    convert_msp_raw_imu_units, MSP_RAW_IMU_CMD, T_MSP_RESP,
 )
 
 # Channel map + µs levels + arm choreography — single source of truth.
@@ -139,6 +153,22 @@ AUX2_HIGH_US = 2000
 AUX2_MID_US = 1500
 AUX2_LOW_US = 1000
 REC_DIR = os.path.join(HERE, "recordings")
+
+# --- Flight-mode switch (user-configured 2026-06-09) ---
+# A 3-position TX12 switch → AUX4 (CRSF array index 7), where Betaflight has:
+#   ANGLE   active when AUX4 ≈ 1500 (the Configurator range is centered at 1500)
+#   HORIZON active when AUX4 in 1700–2100
+# So LOW → ACRO (1000, below the angle band, no self-level mode), MID → ANGLE
+# (1500), HIGH → HORIZON (1900, safely inside 1700–2100). When no mode switch is
+# calibrated this defaults to ACRO (1000) per user request — NOTE this means an
+# uncalibrated/unreadable mode switch leaves the drone in ACRO (no self-level), so
+# calibrate the switch before relying on angle/horizon. This is a different
+# channel from config.CH_MODE (=6, the Meteor75 value that clobbers AUX3/arm);
+# modes live on AUX4 here per the Air75 Betaflight config.
+MODE_CH = 7
+MODE_ACRO_US = 1000
+MODE_ANGLE_US = 1500
+MODE_HORIZON_US = 1900
 
 # --- Linux joystick API (dependency-free; /dev/input/js0) ---
 # js_event is 8 bytes: __u32 time, __s16 value, __u8 type, __u8 number.
@@ -323,9 +353,49 @@ def calibrate(js, cal_path):
     else:
         print("     (no record switch detected — recording disabled)\n")
 
+    mode_spec = _capture_mode_switch(js)
+    if mode_spec:
+        cal["mode"] = mode_spec
+
     with open(cal_path, "w") as f:
         json.dump(cal, f, indent=2)
     print(f"Saved calibration → {cal_path}")
+    return cal
+
+
+def _capture_mode_switch(js):
+    """Capture the 3-position flight-mode switch (an axis). Returns a spec
+    {kind, index, low_raw, high_raw} or None if no clear movement was seen. The
+    switch drives AUX4: low → acro, mid → angle, high → horizon."""
+    print("FLIGHT-MODE SWITCH (optional 3-position → AUX4: low=ACRO, mid=ANGLE, "
+          "high=HORIZON — leave still + Enter twice to skip):")
+    lo_ax, _ = _capture(js, "set the MODE switch to LOW (acro / nothing)")
+    hi_ax, _ = _capture(js, "set the MODE switch to HIGH (horizon)")
+    deltas = {n: abs(hi_ax.get(n, 0) - lo_ax.get(n, 0))
+              for n in set(lo_ax) | set(hi_ax)}
+    best = max(deltas, key=deltas.get) if deltas else None
+    if best is None or deltas[best] < 8000:
+        print("     (no mode switch detected — AUX4 will default to ANGLE)\n")
+        return None
+    print(f"     mode → axis[{best}]  low_raw={lo_ax[best]:+6d} "
+          f"high_raw={hi_ax[best]:+6d}\n")
+    return {"kind": "axis", "index": best,
+            "low_raw": lo_ax[best], "high_raw": hi_ax[best]}
+
+
+def calibrate_mode_only(js, cal_path):
+    """Capture ONLY the flight-mode switch and merge it into the existing
+    calibration (keeps gimbals/arm/record), for adding the mode switch to an
+    already-calibrated setup without redoing everything."""
+    cal = load_cal(cal_path)            # requires an existing valid calibration
+    spec = _capture_mode_switch(js)
+    if not spec:
+        print("No mode switch captured — calibration unchanged.")
+        return None
+    cal["mode"] = spec
+    with open(cal_path, "w") as f:
+        json.dump(cal, f, indent=2)
+    print(f"Saved (mode switch merged) → {cal_path}")
     return cal
 
 
@@ -405,6 +475,28 @@ def aux2_us_for_switch(js, spec):
     return AUX2_MID_US           # middle → no blackbox mode
 
 
+def mode_us_for_switch(js, spec):
+    """Map the 3-position flight-mode switch to AUX4 µs: LOW→acro, MID→angle,
+    HIGH→horizon. Uses the calibrated low/high endpoints to place the reading on
+    a 0→1 fraction, so it's correct even if the switch axis is inverted. Defaults
+    to ACRO when no mode switch is calibrated / unreadable (per user: AUX4
+    defaults to acro)."""
+    if spec is None:
+        return MODE_ACRO_US
+    raw = js.axes.get(spec["index"])
+    if raw is None:
+        return MODE_ACRO_US
+    lo, hi = spec["low_raw"], spec["high_raw"]
+    if hi == lo:
+        return MODE_ACRO_US
+    frac = (raw - lo) / (hi - lo)    # ~0 at the low detent, ~1 at the high detent
+    if frac >= 0.66:
+        return MODE_HORIZON_US
+    if frac <= 0.33:
+        return MODE_ACRO_US
+    return MODE_ANGLE_US
+
+
 class VideoRecorder:
     """Records the drone's video feed to a file in a background thread.
 
@@ -424,6 +516,11 @@ class VideoRecorder:
         self.path = None
         self.frames = 0
         self.fps = None
+        self.t0 = None
+        # Per-frame capture wall-clock times (frame_idx, t_wall), written to
+        # video_frames.csv on stop. Real capture times beat assuming a constant
+        # fps: they expose drops/jitter and let the merge align the video exactly.
+        self.frame_times = []
         # Wall-clock time the first frame was actually captured. The camera takes
         # ~0.5-1 s to open, so frame 0 lags the session t0 by this much — the
         # combine uses (first_frame_wall - t0) to align video to the data.
@@ -437,14 +534,16 @@ class VideoRecorder:
         with self._frame_lock:
             return self._latest_frame
 
-    def start(self, out_path):
+    def start(self, t0, out_path):
         if self.recording or not CV2_OK:
             return
         # Make sure any prior recording's thread has fully finalized its file.
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3.0)
+        self.t0 = t0
         self.path = out_path
         self.first_frame_wall = None
+        self.frame_times = []
         self.recording = True
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -484,9 +583,11 @@ class VideoRecorder:
                 ok, frame = cap.read()
                 if not ok:
                     continue
+                cap_t = time.time()
                 if self.first_frame_wall is None:
-                    self.first_frame_wall = time.time()
+                    self.first_frame_wall = cap_t
                 writer.write(frame)
+                self.frame_times.append((self.frames, cap_t))
                 self.frames += 1
                 with self._frame_lock:
                     self._latest_frame = frame
@@ -498,7 +599,23 @@ class VideoRecorder:
                 writer.release()
             if cap is not None:
                 cap.release()
+            self._save_frame_times()
             self.recording = False
+
+    def _save_frame_times(self):
+        """Write video_frames.csv (frame_idx, t_rel, t_wall) alongside the mp4."""
+        if not self.frame_times or not self.path:
+            return
+        t0 = self.t0 or self.first_frame_wall or 0.0
+        out = os.path.join(os.path.dirname(self.path) or ".", "video_frames.csv")
+        try:
+            with open(out, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["frame_idx", "t_rel", "t_wall"])
+                for idx, tw in self.frame_times:
+                    w.writerow([idx, tw - t0, tw])
+        except Exception:  # never let a logging fault take down flight
+            pass
 
 
 class ViconRecorder:
@@ -656,14 +773,129 @@ class ViconRecorder:
         self.status = f"saved {os.path.basename(self.path)} ({len(rows)} samples)"
 
 
+class CommandLogger:
+    """Buffers every outgoing RC frame in RAM during a session, writes
+    commands.csv on stop. Captures ALL 16 CRSF channels (not just the mapped
+    gimbals) plus the FULL joystick snapshot (every axis + button), so nothing
+    we sent — or that the operator touched — is ever lost. No file I/O on the
+    50 Hz hot path: accumulate now, save at end (same approach as ViconRecorder).
+
+    Each row is stamped t_rel = t_wall - t0, the SAME clock as Vicon Abs_time, so
+    the merge is a direct join. t0 is the session trigger (begin_session)."""
+
+    def __init__(self):
+        self.rows = []
+        self.n_axes = 0
+        self.n_buttons = 0
+        self.t0 = None
+        self.path = None
+
+    def start(self, t0, path, n_axes, n_buttons):
+        self.rows = []
+        self.t0 = t0
+        self.path = path
+        self.n_axes = n_axes
+        self.n_buttons = n_buttons
+
+    def log(self, t_wall, ch, armed, record_on, axes, buttons):
+        """One row: timestamps, all 16 channel µs, arm/record flags, then the
+        raw joystick axes and buttons (blank where the device didn't report)."""
+        row = [t_wall - self.t0, t_wall]
+        row.extend(int(c) for c in ch)
+        row.append(1 if armed else 0)
+        row.append(1 if record_on else 0)
+        row.extend(axes.get(i, "") for i in range(self.n_axes))
+        row.extend(buttons.get(i, "") for i in range(self.n_buttons))
+        self.rows.append(row)
+
+    def save(self):
+        if not self.rows or self.path is None:
+            return
+        header = (["t_rel", "t_wall"]
+                  + [f"ch{i:02d}_us" for i in range(16)]
+                  + ["armed", "record_on"]
+                  + [f"ax{i}" for i in range(self.n_axes)]
+                  + [f"btn{i}" for i in range(self.n_buttons)])
+        os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+        with open(self.path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            w.writerows(self.rows)
+
+
+# Typed-telemetry column order. Each decoded frame fills only its own columns;
+# the rest stay blank (one row per incoming frame, tagged by `type`).
+TELEM_COLS = [
+    "t_rel", "t_wall", "type",
+    "att_pitch_deg", "att_roll_deg", "att_yaw_deg",
+    "bat_v", "bat_a", "bat_mah", "bat_pct",
+    "up_lq", "dn_lq", "up_rssi_dbm", "dn_rssi_dbm",
+    "up_snr_db", "dn_snr_db", "rf_mode", "active_ant", "up_tx_pwr_idx",
+    "imu_ax_g", "imu_ay_g", "imu_az_g",
+    "imu_gx_dps", "imu_gy_dps", "imu_gz_dps", "imu_mag",
+    "flight_mode", "device_addr", "device_name",
+]
+
+
+class TelemetryLogger:
+    """Buffers incoming drone telemetry in RAM during a session, writes two CSVs
+    on stop (no hot-path I/O):
+      - telemetry.csv:     typed decode of the known CRSF frames (attitude,
+                           battery, link stats, flight mode, device info), one
+                           row per frame, stamped at laptop receive time.
+      - telemetry_raw.csv: EVERY incoming frame as (type, len, payload_hex) — the
+                           lossless safety net, so unknown/undecoded frame types
+                           are never lost and can be re-decoded offline.
+
+    Both stamped t_rel = t_wall - t0 (same clock as Vicon Abs_time / commands)."""
+
+    def __init__(self):
+        self.typed = []
+        self.raw = []
+        self.t0 = None
+        self.path = None
+        self.raw_path = None
+
+    def start(self, t0, path, raw_path):
+        self.typed = []
+        self.raw = []
+        self.t0 = t0
+        self.path = path
+        self.raw_path = raw_path
+
+    def log_typed(self, t_wall, type_str, fields):
+        row = {"t_rel": t_wall - self.t0, "t_wall": t_wall, "type": type_str}
+        row.update(fields)
+        self.typed.append(row)
+
+    def log_raw(self, t_wall, ftype, payload):
+        self.raw.append([t_wall - self.t0, t_wall,
+                         f"0x{ftype:02X}", len(payload), payload.hex()])
+
+    def save(self):
+        if self.path and self.typed:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            with open(self.path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=TELEM_COLS, extrasaction="ignore")
+                w.writeheader()
+                w.writerows(self.typed)
+        if self.raw_path and self.raw:
+            os.makedirs(os.path.dirname(self.raw_path) or ".", exist_ok=True)
+            with open(self.raw_path, "w", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["t_rel", "t_wall", "frame_type", "length", "payload_hex"])
+                w.writerows(self.raw)
+
+
 def build_channels(js, cal, allow_arm):
     """Read joystick state → (16-channel µs list, armed flag, record_on flag).
 
     This FC has NO prearm — a single arm switch on AUX3 (ARM_CH) gates arming.
     Gimbals are the standard AETR layout on indices 0-3. The blackbox switch is
-    relayed to AUX2 (AUX2_CH) so the FC's blackbox starts when it's high. No mode
-    channel is driven (config.CH_MODE is the Meteor75 value and would clobber
-    AUX3 — see ARM_CH note above)."""
+    relayed to AUX2 (AUX2_CH) so the FC's blackbox starts when it's high. The
+    3-position flight-mode switch drives AUX4 (MODE_CH) → acro/angle/horizon.
+    config.CH_MODE (=6) is NOT used — it's the Meteor75 value that would clobber
+    AUX3 (see ARM_CH note above); modes live on AUX4 per the Air75 config."""
     ch = [config.NEUTRAL_US] * 16
     ax = cal["axes"]
     ch[config.CH_ROLL] = map_axis(js.axes.get(ax["roll"]["axis"], 0), ax["roll"])
@@ -677,6 +909,10 @@ def build_channels(js, cal, allow_arm):
 
     record_on = record_switch_on(js, cal.get("record"))
     ch[AUX2_CH] = aux2_us_for_switch(js, cal.get("record"))
+
+    # AUX4 flight mode: acro / angle / horizon from the 3-position mode switch
+    # (defaults to ACRO when uncalibrated — per user request).
+    ch[MODE_CH] = mode_us_for_switch(js, cal.get("mode"))
     return ch, armed, record_on
 
 
@@ -685,19 +921,46 @@ def build_channels(js, cal, allow_arm):
 CSI = "\033["
 
 
-def _write_session_json(session, recorder, vicon):
+def _write_session_json(session, recorder, vicon, cmd_log, telem, cal, port, baud):
     """Write per-session metadata so combine_flight.py + analysis can align all
-    three streams to the shared trigger t0."""
+    streams to the shared trigger t0, and so the dataset is self-describing — the
+    config/calibration snapshot records what each channel/axis meant at capture."""
     meta = {
         "stamp": session["stamp"],
         "t0_wall": session["t0"],
         "t0_human": datetime.datetime.fromtimestamp(session["t0"]).isoformat(),
         "aux2_on_us": AUX2_HIGH_US,
-        "note": ("All streams begin at the switch flick (t0). vicon Abs_time and "
-                 "blackbox time each zero-base to their first sample for "
-                 "deterministic alignment; video lags t0 by video.start_offset_s. "
-                 "Drop the .bbl in data_logging/blackbox/ then run combine_flight.py."),
+        "note": ("All laptop streams begin at the switch flick (t0); commands.csv, "
+                 "telemetry.csv and vicon Abs_time are stamped t_rel = t_wall - t0. "
+                 "Blackbox time zero-bases to its first sample (≈ same flick); video "
+                 "lags t0 by video.start_offset_s (use video_frames.csv for exact "
+                 "per-frame times). Drop the .bbl in data_logging/blackbox/ then run "
+                 "combine_flight.py."),
+        "config": {
+            "channel_map": {"roll": config.CH_ROLL, "pitch": config.CH_PITCH,
+                            "throttle": config.CH_THR, "yaw": config.CH_YAW,
+                            "arm": ARM_CH, "aux2_blackbox": AUX2_CH},
+            "arm_us": {"armed": ARM_ARMED_US, "disarmed": ARM_DISARMED_US},
+            "aux2_us": {"high": AUX2_HIGH_US, "mid": AUX2_MID_US, "low": AUX2_LOW_US},
+            "joystick_axis_map": {k: cal["axes"][k]["axis"]
+                                  for k in ("roll", "pitch", "throttle", "yaw")},
+            "neutral_us": config.NEUTRAL_US, "idle_thr_us": config.IDLE_THR_US,
+            "tx_hz": config.TX_HZ,
+            "ranger_port": port, "ranger_baud": baud,
+            "camera": {"device_index": config.DEVICE_INDEX,
+                       "width": config.WIDTH, "height": config.HEIGHT},
+        },
+        "streams": {
+            "commands": "commands.csv", "telemetry": "telemetry.csv",
+            "telemetry_raw": "telemetry_raw.csv", "video": "video.mp4",
+            "video_frames": "video_frames.csv", "vicon": "vicon.mat",
+        },
     }
+    if cmd_log is not None:
+        meta["commands"] = {"file": "commands.csv", "rows": len(cmd_log.rows)}
+    if telem is not None:
+        meta["telemetry"] = {"file": "telemetry.csv", "rows": len(telem.typed),
+                             "raw_file": "telemetry_raw.csv", "raw_rows": len(telem.raw)}
     if recorder is not None:
         ff = recorder.first_frame_wall
         meta["video"] = {
@@ -739,11 +1002,14 @@ def render(ch, armed, allow_arm, raw_armed, record_on, recorder, vicon,
                   f"{CSI}33mBB-on(arm to record){CSI}0m"
     else:
         rec_txt = "rec-off"
+    # Flight mode the AUX4 value selects (acro/angle/horizon).
+    mu = ch[MODE_CH]
+    fmode = "HORIZON" if mu >= 1700 else ("ANGLE" if 1400 <= mu <= 1600 else "ACRO")
     sys.stdout.write(
         f"\r{CSI}K[{mode_lbl}] "
         f"R{ch[config.CH_ROLL]:4d} P{ch[config.CH_PITCH]:4d} "
         f"T{ch[config.CH_THR]:4d} Y{ch[config.CH_YAW]:4d} | {arm_txt} "
-        f"AUX3={ch[ARM_CH]:4d} AUX2={ch[AUX2_CH]:4d} {rec_txt} | "
+        f"AUX3={ch[ARM_CH]:4d} AUX2={ch[AUX2_CH]:4d} AUX4={mu:4d}({fmode}) {rec_txt} | "
         f"FC:{fm} {v} rx={bytes_rx}{thr_hint}"
     )
     sys.stdout.flush()
@@ -763,11 +1029,15 @@ def run(args):
     # flick — FC blackbox (AUX2, relayed), laptop video, laptop vicon — and all
     # stop at disarm. Each flight gets its own session folder.
     rec = cal.get("record")
-    recorder = vicon = None
+    recorder = vicon = cmd_log = telem = None
     if rec is None:
         print("Recording: no 'record' switch in calibration — AUX2 held off, "
               "no video/vicon.")
     else:
+        # Command + telemetry loggers run whenever there's a session (no thread,
+        # no hot-path I/O — they buffer in RAM and flush at end_session).
+        cmd_log = CommandLogger()
+        telem = TelemetryLogger()
         if CV2_OK:
             recorder = VideoRecorder(config.DEVICE_INDEX, config.WIDTH, config.HEIGHT)
             video_msg = f"video /dev/video{config.DEVICE_INDEX}"
@@ -791,18 +1061,20 @@ def run(args):
             vicon_msg = "vicon OFF (deps missing)"
         print(f"Recording: blackbox switch {rec['kind']}[{rec['index']}] → "
               f"AUX2 + {video_msg} + {vicon_msg}")
+        print(f"           + commands.csv / telemetry.csv (+ raw) every session")
         print(f"           sessions → {REC_DIR}/<timestamp>/  "
               f"(records while ARMED + switch ON)")
 
     ser = None
+    ranger_port = None
     if not args.dry_run:
-        port = args.port or autodetect_port()
-        if not port:
+        ranger_port = args.port or autodetect_port()
+        if not ranger_port:
             js.close()
             sys.exit("No Ranger serial port found. Plug in the Ranger USB-C, or "
                      "pass the port explicitly: joystick_flight.py /dev/ttyACM0")
-        ser = open_ranger(port, args.baud)
-        print(f"Ranger:   {port} @ {args.baud} baud")
+        ser = open_ranger(ranger_port, args.baud)
+        print(f"Ranger:   {ranger_port} @ {args.baud} baud")
     else:
         print("Ranger:   (dry-run — no serial opened, nothing transmitted)")
 
@@ -810,6 +1082,12 @@ def run(args):
           "arming.\nCtrl-C to stop (sends disarm).\n")
 
     parser = CrsfParser()
+    # MSP_RAW_IMU (accel+gyro) is NOT a passive CRSF telemetry frame — we must
+    # actively poll the FC for it (MSP-over-CRSF) and reassemble the chunked
+    # response. Same proven path as setup/live_telemetry.py. Polled at 10 Hz; the
+    # request rides the uplink after the RC frame so it never delays the sticks.
+    crsf_msp_parser = CrsfMspParser()
+    msp_imu_req = build_crsf_msp_v2_request(MSP_RAW_IMU_CMD)
     flight_mode = None
     pack_v = None
     bytes_rx = 0
@@ -819,6 +1097,7 @@ def run(args):
     period = 1.0 / config.TX_HZ
     nxt = time.monotonic()
     last_ping = 0.0
+    last_msp = 0.0
     last_render = 0.0
     PREVIEW_WIN = "drone feed — recording status"
     window_open = False
@@ -847,9 +1126,15 @@ def run(args):
         os.makedirs(sdir, exist_ok=True)
         session.update(dir=sdir, t0=t0, stamp=stamp)
         if recorder is not None:
-            recorder.start(os.path.join(sdir, "video.mp4"))
+            recorder.start(t0, os.path.join(sdir, "video.mp4"))
         if vicon is not None:
             vicon.start(t0, os.path.join(sdir, "vicon.mat"))
+        if cmd_log is not None:
+            cmd_log.start(t0, os.path.join(sdir, "commands.csv"),
+                          js.n_axes, js.n_buttons)
+        if telem is not None:
+            telem.start(t0, os.path.join(sdir, "telemetry.csv"),
+                        os.path.join(sdir, "telemetry_raw.csv"))
         sys.stdout.write(f"\n{CSI}32m● REC SESSION {stamp}{CSI}0m → {sdir}\n")
 
     def end_session():
@@ -857,9 +1142,19 @@ def run(args):
             recorder.stop()
         if vicon is not None:
             vicon.stop()
+        if cmd_log is not None:
+            cmd_log.save()
+        if telem is not None:
+            telem.save()
         if session["dir"]:
-            _write_session_json(session, recorder, vicon)
+            _write_session_json(session, recorder, vicon, cmd_log, telem,
+                                cal, ranger_port, args.baud)
             sys.stdout.write(f"\n{CSI}33m■ SESSION SAVED{CSI}0m {session['stamp']}\n")
+            if cmd_log is not None:
+                sys.stdout.write(f"   commands: {len(cmd_log.rows)} frames\n")
+            if telem is not None:
+                sys.stdout.write(f"   telemetry: {len(telem.typed)} frames "
+                                 f"({len(telem.raw)} raw)\n")
             if recorder is not None:
                 sys.stdout.write(f"   video: {recorder.status}\n")
             if vicon is not None:
@@ -892,19 +1187,79 @@ def run(args):
                 end_session()
             prev_want_record = want_record
 
+            # Log every outgoing frame (all 16 channels + the full joystick
+            # snapshot) while a session is active. RAM buffer only — no I/O here.
+            if cmd_log is not None and session["dir"] is not None:
+                cmd_log.log(time.time(), ch, armed, record_on, js.axes, js.buttons)
+
             if ser is not None:
-                # Drain telemetry (non-blocking).
+                # Drain telemetry (non-blocking). Decode the known frames AND log
+                # every frame raw (lossless), each stamped at laptop receive time.
                 waiting = ser.in_waiting
                 if waiting:
                     chunk = ser.read(waiting)
                     bytes_rx += len(chunk)
+                    sess_active = telem is not None and session["dir"] is not None
                     for ftype, payload in parser.feed(chunk):
+                        t_wall = time.time()
+                        if sess_active:
+                            telem.log_raw(t_wall, ftype, payload)
                         if ftype == T_FLIGHT_MODE:
                             flight_mode = decode_flight_mode(payload)
+                            if sess_active:
+                                telem.log_typed(t_wall, "flight_mode",
+                                                {"flight_mode": flight_mode})
                         elif ftype == T_BATTERY:
                             b = decode_battery(payload)
                             if b:
                                 pack_v = b["voltage_V"]
+                                if sess_active:
+                                    telem.log_typed(t_wall, "battery", {
+                                        "bat_v": b["voltage_V"], "bat_a": b["current_A"],
+                                        "bat_mah": b["capacity_mAh"],
+                                        "bat_pct": b["remaining_pct"]})
+                        elif ftype == T_ATTITUDE:
+                            a = decode_attitude(payload)
+                            if a and sess_active:
+                                telem.log_typed(t_wall, "attitude", {
+                                    "att_pitch_deg": a["pitch_deg"],
+                                    "att_roll_deg": a["roll_deg"],
+                                    "att_yaw_deg": a["yaw_deg"]})
+                        elif ftype == T_LINK_STATS:
+                            lk = decode_link_stats(payload)
+                            if lk and sess_active:
+                                telem.log_typed(t_wall, "link", {
+                                    "up_lq": lk["up_lq"], "dn_lq": lk["dn_lq"],
+                                    "up_rssi_dbm": lk["up_rssi1_dBm"],
+                                    "dn_rssi_dbm": lk["dn_rssi_dBm"],
+                                    "up_snr_db": lk["up_snr_dB"],
+                                    "dn_snr_db": lk["dn_snr_dB"],
+                                    "rf_mode": lk["rf_mode"],
+                                    "active_ant": lk["active_ant"],
+                                    "up_tx_pwr_idx": lk["up_tx_pwr_idx"]})
+                        elif ftype == T_DEVICE_INFO and sess_active:
+                            if len(payload) >= 2:
+                                src = payload[1]
+                                name = payload[2:].split(b"\x00", 1)[0].decode(
+                                    "ascii", errors="replace")
+                                if name:
+                                    telem.log_typed(t_wall, "device_info", {
+                                        "device_addr": f"0x{src:02X}",
+                                        "device_name": name})
+                        elif ftype == T_MSP_RESP:
+                            # Reassemble chunked MSP-over-CRSF; log accel+gyro
+                            # (converted to g / deg-per-s) when a full frame lands.
+                            for mcmd, mpl in crsf_msp_parser.feed_chunk(payload):
+                                if mcmd != MSP_RAW_IMU_CMD:
+                                    continue
+                                raw = decode_msp_raw_imu(mpl)
+                                if raw and sess_active:
+                                    c = convert_msp_raw_imu_units(raw)
+                                    telem.log_typed(t_wall, "imu", {
+                                        "imu_ax_g": c["ax_g"], "imu_ay_g": c["ay_g"],
+                                        "imu_az_g": c["az_g"], "imu_gx_dps": c["gx_dps"],
+                                        "imu_gy_dps": c["gy_dps"], "imu_gz_dps": c["gz_dps"],
+                                        "imu_mag": c["mag_norm"]})
                 # Send RC frame.
                 try:
                     ser.write(build_rc_channels_packed(ch))
@@ -915,6 +1270,9 @@ def run(args):
                 if now - last_ping > 2.0:
                     ser.write(build_device_ping())
                     last_ping = now
+                if now - last_msp > 0.1:        # poll MSP_RAW_IMU at 10 Hz
+                    ser.write(msp_imu_req)
+                    last_msp = now
 
             now = time.monotonic()
             if now - last_render > 0.066:   # ~15 Hz
@@ -978,15 +1336,22 @@ def main():
     ap.add_argument("--cal-file", default=CAL_FILE_DEFAULT,
                     help="calibration JSON path")
     ap.add_argument("--calibrate", action="store_true",
-                    help="run interactive calibration and exit")
+                    help="run full interactive calibration and exit")
+    ap.add_argument("--calibrate-mode", action="store_true",
+                    help="capture ONLY the 3-position flight-mode switch (AUX4: "
+                         "low=acro/mid=angle/high=horizon) and merge into the "
+                         "existing calibration; exit")
     ap.add_argument("--dry-run", action="store_true",
                     help="read joystick + print sticks; never open Ranger / never send")
     args = ap.parse_args()
 
-    if args.calibrate:
+    if args.calibrate or args.calibrate_mode:
         js = Joystick(args.js)
         try:
-            calibrate(js, args.cal_file)
+            if args.calibrate:
+                calibrate(js, args.cal_file)
+            else:
+                calibrate_mode_only(js, args.cal_file)
         finally:
             js.close()
         return

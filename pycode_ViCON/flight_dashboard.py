@@ -18,6 +18,9 @@ Features:
     color-by dropdown (time / speed / altitude / vertical speed / mean RPM /
     angular rate / …).
 """
+import csv
+import json
+import os
 import re
 import threading
 import warnings
@@ -37,9 +40,9 @@ SECONDARY_COLOR = "#d62728"
 
 # Nice labels/units/series-names for known blackbox bases (bb_<base>_<i>).
 BB_LABELS = {
-    "gyroADC":    ("Angular velocity (gyro)", "rad/s", ["roll rate", "pitch rate", "yaw rate"]),
-    "gyroUnfilt": ("Angular velocity (unfiltered)", "rad/s", ["roll", "pitch", "yaw"]),
-    "accSmooth":  ("Acceleration", "blackbox units", ["ax", "ay", "az"]),
+    "gyroADC":    ("IMU — angular rate (gyro)", "rad/s", ["roll rate", "pitch rate", "yaw rate"]),
+    "gyroUnfilt": ("IMU — angular rate (gyro, unfiltered)", "rad/s", ["roll", "pitch", "yaw"]),
+    "accSmooth":  ("IMU — acceleration (accel)", "g", ["ax", "ay", "az"]),
     "motor":      ("Motor command (raw)", "cmd", ["m0", "m1", "m2", "m3"]),
     "eRPM":       ("Motor eRPM (electrical field)", "field", ["m0", "m1", "m2", "m3"]),
     "rcCommand":  ("RC command", "us", ["roll", "pitch", "yaw", "throttle"]),
@@ -58,7 +61,8 @@ BB_ORDER = ["gyroADC", "accSmooth", "motor", "eRPM", "rcCommand", "setpoint",
             "axisP", "axisI", "axisD", "axisF", "gyroUnfilt", "debug",
             "vbatLatest", "amperageLatest", "rssi"]
 
-DEFAULT_ON = ["pos", "vel", "orient", "motor_rpm", "bb_gyroADC", "altrpm", "yawsync"]
+DEFAULT_ON = ["pos", "vel", "orient", "motor_rpm", "cmd_sticks",
+              "bb_gyroADC", "bb_accSmooth", "altrpm", "yawsync"]
 
 
 def _euler_deg(qx, qy, qz, qw):
@@ -69,10 +73,50 @@ def _euler_deg(qx, qy, qz, qw):
     return Rotation.from_quat(quat).as_euler("zyx", degrees=True)   # yaw,pitch,roll
 
 
+def _load_synced_csv(path):
+    """Read combine_flight.py's flight_synced.csv (+ .meta.json sidecar) into a
+    loadmat-style field dict: each column -> 1-D float array, the motor_*_<i>
+    columns folded back into the (N,4) arrays the panels expect, and the scalar
+    metadata merged in. So the dashboard treats CSV and .mat identically."""
+    with open(path, newline="") as f:
+        r = csv.reader(f)
+        header = next(r)
+        data = [[] for _ in header]
+        for row in r:
+            if not row:
+                continue
+            for i in range(len(header)):
+                cell = row[i] if i < len(row) else ""
+                try:
+                    data[i].append(float(cell))
+                except ValueError:
+                    data[i].append(np.nan)
+    m = {h: np.asarray(d, float) for h, d in zip(header, data)}
+    for base in ("motor_rpm", "motor_erpm", "motor_cmd"):
+        keys = [f"{base}_{i}" for i in range(4)]
+        if all(k in m for k in keys):
+            m[base] = np.column_stack([m.pop(k) for k in keys])
+    meta_path = os.path.splitext(path)[0] + ".meta.json"
+    if os.path.isfile(meta_path):
+        with open(meta_path) as f:
+            for k, v in json.load(f).items():
+                if isinstance(v, (str, int, float)):   # skip lists (e.g. columns)
+                    m[k] = v
+    return m
+
+
+def load_synced_fields(path):
+    """Field dict for a synced file, reading EITHER combine_flight's CSV or a
+    legacy/standalone .mat (sync_log). Lets one dashboard serve both pipelines."""
+    if path.lower().endswith(".csv"):
+        return _load_synced_csv(path)
+    return sio.loadmat(path)
+
+
 def load_channels(path):
-    """Parse a synced .mat into a dashboard data dict: time base, panel list
-    (each with colored series), 3D pose + color-by options, and metadata."""
-    m = sio.loadmat(path)
+    """Parse a synced file (.csv or .mat) into a dashboard data dict: time base,
+    panel list (each with colored series), 3D pose + color-by options, metadata."""
+    m = load_synced_fields(path)
     t = np.asarray(m["Abs_time"]).ravel().astype(float)
     N = t.size
     col = lambda k: np.asarray(m[k]).ravel().astype(float)
@@ -153,6 +197,59 @@ def load_channels(path):
             pairs.append((nm, y))
         mk("bb_" + base, label, unit, pairs)
 
+    # --- outgoing commands (cmd_*) + incoming telemetry (tlm_*) ----------- #
+    # The captured-everything streams. Compare against the FC blackbox: e.g.
+    # cmd_sticks (what the laptop SENT) vs bb_rcCommand (what the FC RECEIVED).
+    def present(*ks):
+        return [k for k in ks if k in m and np.asarray(m[k]).ravel().size == N]
+
+    # Stick commands SENT from the laptop, in µs. AETR channel order + the Air75
+    # arm/blackbox switch channels (config.CH_ROLL.. / ARM_CH=6 / AUX2_CH=5).
+    CMD_NAMES = {0: "roll", 1: "pitch", 2: "throttle", 3: "yaw",
+                 5: "blackbox sw", 6: "arm sw"}
+    trpy = [(CMD_NAMES[i], col(f"cmd_ch{i:02d}_us"))
+            for i in (0, 1, 2, 3) if f"cmd_ch{i:02d}_us" in m]
+    if trpy:
+        mk("cmd_sticks", "Sticks sent — TRPY (laptop→drone)", "us", trpy)
+    # Switches/aux: arm + blackbox always shown; other aux only if they moved.
+    aux = []
+    for i in range(4, 16):
+        k = f"cmd_ch{i:02d}_us"
+        if k not in m:
+            continue
+        y = col(k)
+        if i in (5, 6) or (np.nanmax(y) - np.nanmin(y) > 1.0):
+            aux.append((CMD_NAMES.get(i, f"ch{i:02d}"), y))
+    if aux:
+        mk("cmd_aux", "Command switches / aux (laptop→drone)", "us", aux)
+    flags = present("cmd_armed", "cmd_record_on")
+    if flags:
+        mk("cmd_flags", "Command flags (armed / recording)", "",
+           [(k[4:], col(k)) for k in flags])
+
+    # Incoming CRSF telemetry (drone→laptop, downsampled back-channel).
+    att = present("tlm_att_roll_deg", "tlm_att_pitch_deg", "tlm_att_yaw_deg")
+    if att:
+        mk("tlm_att", "Telemetry — attitude (FC estimate)", "deg",
+           [(k.split("att_")[1].replace("_deg", ""), col(k)) for k in att])
+    link = present("tlm_up_lq", "tlm_dn_lq", "tlm_up_rssi_dbm", "tlm_dn_rssi_dbm",
+                   "tlm_up_snr_db", "tlm_dn_snr_db")
+    if link:
+        mk("tlm_link", "Telemetry — link stats (LQ/RSSI/SNR)", "",
+           [(k[4:], col(k)) for k in link])
+    bat = present("tlm_bat_v", "tlm_bat_a", "tlm_bat_pct")
+    if bat:
+        mk("tlm_bat", "Telemetry — battery", "", [(k[4:], col(k)) for k in bat])
+    # Live IMU over telemetry (MSP_RAW_IMU) — only present if MSP polling was on.
+    imu_a = present("tlm_imu_ax_g", "tlm_imu_ay_g", "tlm_imu_az_g")
+    if imu_a:
+        mk("tlm_imu_acc", "Telemetry — IMU accel (live, MSP)", "g",
+           [(k.split("imu_")[1].replace("_g", ""), col(k)) for k in imu_a])
+    imu_g = present("tlm_imu_gx_dps", "tlm_imu_gy_dps", "tlm_imu_gz_dps")
+    if imu_g:
+        mk("tlm_imu_gyro", "Telemetry — IMU gyro (live, MSP)", "deg/s",
+           [(k.split("imu_")[1].replace("_dps", ""), col(k)) for k in imu_g])
+
     # --- 3D pose + color-by options --------------------------------------- #
     x = col("b1_x") if "b1_x" in m else np.zeros(N)
     y = col("b1_y") if "b1_y" in m else np.zeros(N)
@@ -167,6 +264,8 @@ def load_channels(path):
     if has("bb_gyroADC_0", "bb_gyroADC_1", "bb_gyroADC_2"):
         color_opts["angular rate"] = np.sqrt(
             col("bb_gyroADC_0")**2 + col("bb_gyroADC_1")**2 + col("bb_gyroADC_2")**2)
+    if "cmd_ch02_us" in m:
+        color_opts["throttle cmd"] = col("cmd_ch02_us")
 
     meta = {}
     for k in ("session", "exptime", "sync_method", "blackbox_file", "vicon_file", "video_file"):
@@ -187,21 +286,27 @@ def single_panel_fig(panel, window):
     """One panel → its own standalone figure (each 2D graph is separate).
 
     Per-graph legend at the top, x-axis labelled in seconds, autosizing height
-    (the wrapper Div sets the box, so fullscreen fills the screen)."""
+    (the wrapper Div sets the box, so fullscreen fills the screen).
+
+    Uses go.Scatter (SVG), NOT Scattergl: every Scattergl trace grabs its own
+    WebGL context, and N panels + the 3D scene quickly exceed the browser/GPU
+    context cap (low under software/XWayland GL). The browser then evicts the
+    oldest context — the 3D trajectory — so it renders then blanks. Keeping 2D on
+    SVG leaves the 3D scene as the ONLY WebGL context, so it can't be evicted."""
     if panel["secondary"]:
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         for name, color, yv in panel["series"]:
-            fig.add_trace(go.Scattergl(x=None, y=yv, name=name, mode="lines",
+            fig.add_trace(go.Scatter(x=None, y=yv, name=name, mode="lines",
                                        line=dict(color=color)), secondary_y=False)
         for name, color, yv, u in panel["secondary"]:
-            fig.add_trace(go.Scattergl(x=None, y=yv, name=name, mode="lines",
+            fig.add_trace(go.Scatter(x=None, y=yv, name=name, mode="lines",
                                        line=dict(color=color)), secondary_y=True)
         fig.update_yaxes(title_text=panel["unit"], secondary_y=False)
         fig.update_yaxes(title_text=panel["secondary"][0][3], secondary_y=True)
     else:
         fig = go.Figure()
         for name, color, yv in panel["series"]:
-            fig.add_trace(go.Scattergl(x=None, y=yv, name=name, mode="lines",
+            fig.add_trace(go.Scatter(x=None, y=yv, name=name, mode="lines",
                                        line=dict(color=color)))
         fig.update_yaxes(title_text=panel["unit"])
     # x supplied once (all traces share the time base)
@@ -229,13 +334,15 @@ def _orientation_traces(data, mask):
     if n == 0:
         return None
     P = np.column_stack([X, Y, Z])
-    # Point-sized: one inter-point spacing for the long arm.
+    # Long arm = 2× the median inter-point spacing (was 1×); short arm stays at
+    # half the long arm, preserving the 2:1 length:height proportion.
+    ARM_SCALE = 2.0
     if n > 1:
         d = np.linalg.norm(np.diff(P, axis=0), axis=1)
         d = d[d > 0]
-        l_long = float(np.median(d)) if d.size else 1e-3
+        l_long = ARM_SCALE * (float(np.median(d)) if d.size else 1e-3)
     else:
-        l_long = 1e-3
+        l_long = ARM_SCALE * 1e-3
     l_short = l_long / 2.0
     quats = np.column_stack([q["qx"][mask], q["qy"][mask],
                              q["qz"][mask], q["qw"][mask]])
@@ -347,6 +454,47 @@ def _section_head(text):
                                 "borderTop": "2px solid #ccc"})
 
 
+# 2D panels grouped by DATA SOURCE — drives both the sidebar checklist sections
+# and the section headers above the rendered plots. Order = priority; the first
+# matching predicate claims a panel, and a trailing "Other" catches the rest so
+# nothing is ever hidden.
+PANEL_SECTIONS = [
+    ("Vicon — motion capture (ground truth)",
+     lambda pid: pid in ("pos", "vel", "orient", "quat")),
+    ("Commands sent — laptop → drone",
+     lambda pid: pid.startswith("cmd_")),
+    ("Telemetry — live from drone",
+     lambda pid: pid.startswith("tlm_")),
+    ("Blackbox — flight controller (FC)",
+     lambda pid: pid.startswith("bb_") or pid.startswith("motor_")),
+    ("Derived — cross-source",
+     lambda pid: pid in ("altrpm", "yawsync")),
+]
+
+
+def _grouped_panels(avail):
+    """Return [(section_header, [panel_id, ...]), ...] in display order, each
+    panel assigned to exactly one section (first matching predicate wins)."""
+    out, claimed = [], set()
+    for header, pred in PANEL_SECTIONS:
+        ids = [k for k in avail if k not in claimed and pred(k)]
+        if ids:
+            out.append((header, ids))
+            claimed.update(ids)
+    rest = [k for k in avail if k not in claimed]
+    if rest:
+        out.append(("Other", rest))
+    return out
+
+
+_PLOT_SEC_HDR = {"margin": "18px 0 8px", "padding": "5px 10px",
+                 "background": "#eef3f8", "borderLeft": "4px solid #1f77b4",
+                 "fontSize": "15px", "borderRadius": "3px"}
+_SEL_SEC_HDR = {"fontWeight": "600", "fontSize": "12px", "color": "#1f77b4",
+                "margin": "8px 0 2px", "borderBottom": "1px solid #ddd",
+                "paddingBottom": "2px"}
+
+
 def make_app(data, title):
     t = data["t"]
     t0, t1 = float(t[0]), float(t[-1])
@@ -357,6 +505,20 @@ def make_app(data, title):
     panel_by_id = {p["id"]: p for p in data["panels"]}
     default = [k for k in DEFAULT_ON if k in avail] or avail[:4]
     color_choices = list(data["color_opts"].keys())
+
+    # Group panels by data source for the sidebar (each section = one checklist,
+    # pattern-matching id so one callback gathers them all).
+    sections = _grouped_panels(avail)
+    selector_blocks = []
+    for idx, (header, ids) in enumerate(sections):
+        selector_blocks.append(html.Div(children=[
+            html.Div(header, style=_SEL_SEC_HDR),
+            dcc.Checklist(
+                id={"type": "psel", "section": idx},
+                options=[{"label": " " + labels[k], "value": k} for k in ids],
+                value=[k for k in ids if k in default],
+                labelStyle={"display": "block", "fontSize": "13px"}),
+        ]))
 
     app = dash.Dash(title, suppress_callback_exceptions=True)
     app.title = title
@@ -377,12 +539,12 @@ def make_app(data, title):
         # ---------- 2D SECTION ----------
         _section_head("2D plots"),
         html.Div(style={"display": "flex", "gap": "18px", "alignItems": "flex-start"}, children=[
-            html.Div(style={"flex": "0 0 220px"}, children=[
-                html.Label("Panels", style={"fontWeight": "600"}),
-                dcc.Checklist(id="panels",
-                    options=[{"label": " " + labels[k], "value": k} for k in avail],
-                    value=default, labelStyle={"display": "block"},
-                    style={"maxHeight": "360px", "overflowY": "auto"})]),
+            html.Div(style={"flex": "0 0 250px"}, children=[
+                html.Label("Panels — by data source", style={"fontWeight": "600"}),
+                html.Div(selector_blocks,
+                         style={"maxHeight": "560px", "overflowY": "auto",
+                                "border": "1px solid #eee", "borderRadius": "4px",
+                                "padding": "2px 8px"})]),
             html.Div(style={"flex": "1 1 auto"}, children=[
                 html.Label("Time window — 2D graphs (s)",
                            style={"fontWeight": "600", "fontSize": "13px"}),
@@ -410,37 +572,51 @@ def make_app(data, title):
                     "height": "660px", "display": "flex", "flexDirection": "column",
                     "marginTop": "10px", "background": "#fff"}, children=[
                     _fs_button("td-fs"),
+                    # Initial figure at build time (like the 2D panels) so the 3D
+                    # renders on load — a callback-only Graph can come up 0-height
+                    # inside a flex box and appear "not loading".
                     dcc.Graph(id="traj3d", config=GCFG,
+                              figure=build_3d(data, "time", (t0, t1)),
                               style={"flexGrow": 1, "minHeight": 0})]),
                 html.Div(id="_fs3", style={"display": "none"})]),
         ]),
         html.Br(), html.Br(), html.Br(), html.Br(),
     ])
 
-    # Build one separate graph per selected panel (rebuilt only when the
-    # selection changes; the time window keeps its value via State).
+    # Build one separate graph per selected panel, GROUPED under its data-source
+    # header (Vicon / Commands / Telemetry / Blackbox / Derived). Rebuilt only when
+    # the selection changes; the time window keeps its value via State. The section
+    # checklists are pattern-matched, so this one callback gathers all of them.
+    def _graph_block(p, window):
+        return html.Div(
+            id={"type": "pgwrap", "index": p["id"]},
+            style={"height": "480px", "display": "flex", "flexDirection": "column",
+                   "marginBottom": "14px", "background": "#fff",
+                   "border": "1px solid #eee"},
+            children=[
+                _fs_button({"type": "pgfs", "index": p["id"]}),
+                dcc.Graph(id={"type": "pg2d", "index": p["id"]},
+                          figure=single_panel_fig(p, window),
+                          style={"flexGrow": 1, "minHeight": 0}, config=GCFG),
+                html.Div(id={"type": "pgfsout", "index": p["id"]},
+                         style={"display": "none"}),
+            ])
+
     @app.callback(Output("graphs2d", "children"),
-                  Input("panels", "value"), dash.State("win2d", "value"))
-    def _build2d(selected, window):
-        sel = [panel_by_id[k] for k in (selected or []) if k in panel_by_id]
-        if not sel:
+                  Input({"type": "psel", "section": dash.ALL}, "value"),
+                  dash.State("win2d", "value"))
+    def _build2d(selected_lists, window):
+        chosen = {k for lst in (selected_lists or []) for k in (lst or [])}
+        if not chosen:
             return html.Div("No panels selected — pick some on the left.",
                             style={"color": "#888", "padding": "20px"})
         out = []
-        for p in sel:
-            out.append(html.Div(
-                id={"type": "pgwrap", "index": p["id"]},
-                style={"height": "480px", "display": "flex", "flexDirection": "column",
-                       "marginBottom": "14px", "background": "#fff",
-                       "border": "1px solid #eee"},
-                children=[
-                    _fs_button({"type": "pgfs", "index": p["id"]}),
-                    dcc.Graph(id={"type": "pg2d", "index": p["id"]},
-                              figure=single_panel_fig(p, window),
-                              style={"flexGrow": 1, "minHeight": 0}, config=GCFG),
-                    html.Div(id={"type": "pgfsout", "index": p["id"]},
-                             style={"display": "none"}),
-                ]))
+        for header, ids in sections:          # render grouped, in source order
+            sel_ids = [k for k in ids if k in chosen and k in panel_by_id]
+            if not sel_ids:
+                continue
+            out.append(html.H4(header, style=_PLOT_SEC_HDR))
+            out.extend(_graph_block(panel_by_id[k], window) for k in sel_ids)
         return out
 
     # Move the time window on all 2D graphs at once — lightweight (range only).

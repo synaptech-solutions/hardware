@@ -1,20 +1,22 @@
 """Visualize a synced flight log produced by combine_flight.py.
 
 combine_flight.py deterministically merges one flight's Vicon pose + Betaflight
-blackbox into <session>/flight_synced.mat (pose + b1 velocity + per-motor
-RPM/eRPM/command on the shared Vicon clock). This plots all of it on one time
-axis — position, velocity, orientation, motor RPM (mechanical + electrical),
-commanded output, the altitude<->thrust relationship, and a 3D trajectory — so
-pose and motor behavior can be read off at the same instant. The session's
-video.mp4 sits alongside the file this reads.
+blackbox (+ the laptop command/telemetry logs) into <session>/flight_synced.csv
+(pose + b1 velocity + per-motor RPM/eRPM/command on the shared Vicon clock). This
+plots the curated subset on one time axis — position, velocity, orientation,
+motor RPM (mechanical + electrical), commanded output, the altitude<->thrust
+relationship, and a 3D trajectory — so pose and motor behavior can be read off at
+the same instant. The session's video.mp4 sits alongside the file this reads.
+(For the full per-channel view incl. commands/telemetry, use the dashboard.)
 
 This is the data_logging counterpart to pycode_ViCON/plot_synced.py, adapted to
 combine_flight's fields (deterministic sync — no yaw-rate cross-check panel).
+Reads combine_flight's .csv; legacy .mat sessions still open.
 
 Usage:
-  plot_flight.py                                  # newest recordings/*/flight_synced.mat
+  plot_flight.py                                  # newest recordings/*/flight_synced.csv
   plot_flight.py --pick                           # list synced flights and choose
-  plot_flight.py recordings/20260608_x/flight_synced.mat   # a specific file
+  plot_flight.py recordings/20260608_x/flight_synced.csv   # a specific file
   plot_flight.py --3d                             # also open an interactive 3D window
 """
 import os
@@ -41,12 +43,14 @@ RECORDINGS = os.path.join(HERE, 'recordings')
 
 
 def list_synced(folder=RECORDINGS):
-    """Return flight_synced.mat files under recordings/*/, newest first."""
-    mats = glob.glob(os.path.join(folder, '*', 'flight_synced.mat'))
-    if not mats:
+    """Return flight_synced files under recordings/*/, newest first. combine_flight
+    now writes .csv; legacy .mat is still picked up so old sessions keep opening."""
+    hits = (glob.glob(os.path.join(folder, '*', 'flight_synced.csv'))
+            + glob.glob(os.path.join(folder, '*', 'flight_synced.mat')))
+    if not hits:
         raise FileNotFoundError(
-            f'No */flight_synced.mat in {folder}/ — run combine_flight.py first.')
-    return sorted(mats, key=os.path.getmtime, reverse=True)
+            f'No */flight_synced.csv in {folder}/ — run combine_flight.py first.')
+    return sorted(hits, key=os.path.getmtime, reverse=True)
 
 
 def select_synced(folder=RECORDINGS):
@@ -67,7 +71,58 @@ def select_synced(folder=RECORDINGS):
         print('  invalid selection, try again')
 
 
+def _load_synced_csv(path):
+    """Read combine_flight's flight_synced.csv (+ .meta.json) into the same `d`
+    dict the .mat path builds: time/pose/quaternion/velocity 1-D arrays, the
+    motor_*_<i> columns folded into (N,4), and the scalar metadata."""
+    import csv
+    import json
+    with open(path, newline='') as f:
+        r = csv.reader(f)
+        header = next(r)
+        data = [[] for _ in header]
+        for row in r:
+            if not row:
+                continue
+            for i in range(len(header)):
+                cell = row[i] if i < len(row) else ''
+                try:
+                    data[i].append(float(cell))
+                except ValueError:
+                    data[i].append(np.nan)
+    cols = {h: np.asarray(c, float) for h, c in zip(header, data)}
+    meta = {}
+    mp = os.path.splitext(path)[0] + '.meta.json'
+    if os.path.isfile(mp):
+        with open(mp) as f:
+            meta = json.load(f)
+
+    d = {'t': cols['Abs_time']}
+    # name fields x,y,z,qx,qy,qz,qw,vx,vy,vz to match the .mat path
+    for src, dst in (('b1_x', 'x'), ('b1_y', 'y'), ('b1_z', 'z'),
+                     ('b1_qx', 'qx'), ('b1_qy', 'qy'), ('b1_qz', 'qz'), ('b1_qw', 'qw'),
+                     ('b1_vx', 'vx'), ('b1_vy', 'vy'), ('b1_vz', 'vz')):
+        if src in cols:
+            d[dst] = cols[src]
+    for base, dst in (('motor_rpm', 'rpm'), ('motor_erpm', 'erpm'), ('motor_cmd', 'cmd')):
+        keys = [f'{base}_{i}' for i in range(4)]
+        if all(k in cols for k in keys):
+            d[dst] = np.column_stack([cols[k] for k in keys])
+
+    d['exptime'] = meta.get('t0_human') or os.path.basename(os.path.dirname(path))
+    d['session'] = meta.get('session') or os.path.basename(os.path.dirname(path))
+    d['vicon_file'] = meta.get('vicon_file', '')
+    d['blackbox_file'] = meta.get('blackbox_file', '')
+    d['video_file'] = meta.get('video_file', '')
+    d['sync_method'] = meta.get('sync_method', '')
+    d['offset'] = meta.get('sync_offset_s')
+    d['poles'] = meta.get('motor_poles')
+    return d
+
+
 def load_synced(path):
+    if path.lower().endswith('.csv'):
+        return _load_synced_csv(path)
     m = sio.loadmat(path)
     vec = lambda k: np.asarray(m[k]).ravel().astype(float)
     mat = lambda k: np.asarray(m[k]).astype(float)              # (N, 4) motor arrays

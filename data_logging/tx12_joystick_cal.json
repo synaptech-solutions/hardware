@@ -41,5 +41,11 @@
     "index": 5,
     "on_raw": 32767,
     "off_raw": -32767
+  },
+  "mode": {
+    "kind": "axis",
+    "index": 4,
+    "low_raw": -32767,
+    "high_raw": 32767
   }
 }
