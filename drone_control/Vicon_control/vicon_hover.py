@@ -15,15 +15,20 @@ manual triggers only:
 The controller owns roll/pitch/throttle/yaw while flying and forces AUX4 = ANGLE
 (it commands angle setpoints). The TX12 gimbals are ignored.
 
-State machine:
+State machine (SINGLE FLIGHT — it arms, flies once, lands, and the program EXITS):
   DISARMED   — arm switch low. Idle + disarm. (Edge-gated: must see DISARMED once.)
   ARMED_IDLE — armed, motors idle (throttle ≤ arm threshold so the FC can arm).
                Waiting for the FC to confirm armed + the record switch to launch.
   FLYING     — climb to CLIMB_M and hold takeoff x/y + heading on Vicon.
-  LANDING    — record-off / timeout: gentle Vicon-held descent to the takeoff
-               altitude, then back to ARMED_IDLE.
-Disarm (arm low) at ANY time → immediate kill. Vicon loss → blind gentle descent,
-then disarm if it persists. Low battery → disarm.
+  LANDING    — Vicon-held descent to LAND_CUT_M above launch, then CUT throttle +
+               disarm + save the session + EXIT.
+The flight ENDS (descend→cut→disarm→save→exit) on any of:
+  - SPACEBAR on the laptop  → controlled landing.
+  - Low battery             → controlled landing.
+  - Disarm (TX12 arm low)   → instant kill.
+  - Vicon loss              → blind sink if brief, else cut.
+There is NO return to idle and NO time cap, so the controller can never
+auto-relaunch (the 2026-06-11 land→takeoff loop is impossible by construction).
 
 Dry-run (no Ranger, never arms) if EITHER --dry-run is passed OR config.DRY_RUN is
 True (the default). Going LIVE requires config.DRY_RUN=False AND no --dry-run flag.
@@ -35,8 +40,11 @@ Calibrate the TX12 once with the data logger (shared cal file):
 import argparse
 import datetime
 import os
+import select
 import sys
+import termios
 import time
+import tty
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 _DRONE_CONTROL = os.path.dirname(HERE)
@@ -168,6 +176,7 @@ def run(args):
 
     state = "DISARMED"
     seen_disarmed = False
+    land_requested = False         # set by SPACEBAR (or low batt) → controlled land + exit
     launch = None                  # (x0, y0, z0, yaw0) captured at takeoff
     fly_t0 = None
     land_t0 = None
@@ -233,6 +242,24 @@ def run(args):
             ser.write(frame)
             time.sleep(0.01)
 
+    # SPACEBAR = land. Read the laptop keyboard non-blocking in cbreak mode
+    # (single keypress, no Enter; Ctrl-C still works since ISIG stays on).
+    stdin_fd = sys.stdin.fileno() if sys.stdin.isatty() else None
+    stdin_old = termios.tcgetattr(stdin_fd) if stdin_fd is not None else None
+    if stdin_fd is not None:
+        tty.setcbreak(stdin_fd)
+        print(f"{CSI}36mSPACEBAR = land (descend to {config.LAND_CUT_M:.2f} m, "
+              f"cut, disarm, save, exit).{CSI}0m")
+
+    def space_pressed():
+        if stdin_fd is None:
+            return False
+        hit = False
+        while select.select([sys.stdin], [], [], 0)[0]:
+            if sys.stdin.read(1) == " ":
+                hit = True
+        return hit
+
     try:
         while True:
             now_mono = time.monotonic()
@@ -250,6 +277,11 @@ def run(args):
                 seen_disarmed = True
             tx_armed = raw_armed and seen_disarmed
             record_on = record_switch_on(js, cal.get("record"))
+
+            # SPACEBAR while flying → request a controlled landing (ignored on the
+            # ground so a stray press before takeoff can't immediately land it).
+            if space_pressed() and state == "FLYING":
+                land_requested = True
 
             # --- drain telemetry (decode for control gating + log every frame) ---
             sess_active = session["dir"] is not None
@@ -317,17 +349,34 @@ def run(args):
                         and config.BATT_PRESENT_V < pack_v < config.MIN_CELL_V * config.CELLS)
 
             # ===================== state transitions =====================
-            if not tx_armed or batt_low:
+            # Single flight: any ending event descends/cuts, disarms, saves, EXITS.
+            # Low battery in the air → request the same controlled landing as SPACEBAR.
+            if batt_low and state in ("FLYING", "LANDING"):
+                if not land_requested:
+                    sys.stdout.write(f"\n{CSI}1;31mBATTERY LOW ({pack_v:.2f}V) — landing.{CSI}0m\n")
+                land_requested = True
+
+            if not tx_armed:
+                # Manual disarm: in the air = instant kill + EXIT; on the ground =
+                # stay disarmed, wait to be armed (edge-gated, never launches itself).
+                if state in ("FLYING", "LANDING"):
+                    sys.stdout.write(f"\n{CSI}1;31m✖ DISARM (TX12) — kill + exit.{CSI}0m\n")
+                    if sess_active:
+                        end_session()
+                    send_disarm()
+                    break
                 if sess_active:
                     end_session()
-                if state != "DISARMED" and batt_low:
-                    sys.stdout.write(f"\n{CSI}1;31mBATTERY LOW ({pack_v:.2f}V) — disarm.{CSI}0m\n")
                 state, launch, fly_t0, land_t0 = "DISARMED", None, None, None
                 controller.reset()
             elif state == "DISARMED":
                 state = "ARMED_IDLE"
                 controller.reset()
             elif state == "ARMED_IDLE":
+                if batt_low:
+                    sys.stdout.write(f"\n{CSI}1;31mBATTERY LOW ({pack_v:.2f}V) on the ground — exit.{CSI}0m\n")
+                    send_disarm()
+                    break
                 if fc_armed and record_on and pose_fresh:
                     launch = (pose["x"], pose["y"], pose["z"], pose["yaw"])
                     controller.set_target(launch[0], launch[1],
@@ -336,33 +385,38 @@ def run(args):
                     fly_t0, state = now_mono, "FLYING"
                     sys.stdout.write(
                         f"\n{CSI}32m▶ LAUNCH{CSI}0m from ({launch[0]:+.2f},{launch[1]:+.2f},"
-                        f"{launch[2]:+.2f}) → climb to {launch[2] + config.CLIMB_M:+.2f} m\n")
+                        f"{launch[2]:+.2f}) → climb to {launch[2] + config.CLIMB_M:+.2f} m  "
+                        f"(SPACEBAR to land)\n")
             elif state == "FLYING":
                 if pose is None or pose_age > config.VICON_KILL_S:
-                    sys.stdout.write(f"\n{CSI}1;31mVICON LOST {pose_age:.2f}s — disarm.{CSI}0m\n")
+                    sys.stdout.write(f"\n{CSI}1;31mVICON LOST {pose_age:.2f}s — cut + exit.{CSI}0m\n")
                     if sess_active:
                         end_session()
-                    state, launch, fly_t0 = "DISARMED", None, None
-                    controller.reset()
-                    seen_disarmed = False     # require a re-arm cycle after a kill
-                elif not record_on or (now_mono - fly_t0) > config.MAX_FLIGHT_S:
+                    send_disarm()
+                    break
+                elif land_requested:
                     state, land_t0 = "LANDING", now_mono
-                    sys.stdout.write(f"\n{CSI}36m▼ LANDING (gentle descent){CSI}0m\n")
+                    sys.stdout.write(
+                        f"\n{CSI}36m▼ LANDING — descend to {config.LAND_CUT_M:.2f} m, "
+                        f"then cut + exit.{CSI}0m\n")
             elif state == "LANDING":
                 z0 = launch[2] if launch else 0.0
-                landed = pose is not None and pose["z"] <= z0 + config.LAND_DONE_M
                 if pose is None or pose_age > config.VICON_KILL_S:
+                    sys.stdout.write(f"\n{CSI}1;31mVICON LOST during land — cut + exit.{CSI}0m\n")
                     if sess_active:
                         end_session()
-                    state, launch = "DISARMED", None
-                    controller.reset()
-                    seen_disarmed = False
-                elif landed or (now_mono - land_t0) > LAND_TIMEOUT_S:
+                    send_disarm()
+                    break
+                at_cut = pose["z"] <= z0 + config.LAND_CUT_M
+                if at_cut or (now_mono - land_t0) > LAND_TIMEOUT_S:
+                    why = "reached cut height" if at_cut else "land timeout"
+                    sys.stdout.write(
+                        f"\n{CSI}33m■ {why} (z={pose['z']:.2f} m) — cut throttle, "
+                        f"disarm, save, exit.{CSI}0m\n")
                     if sess_active:
                         end_session()
-                    state, launch = "ARMED_IDLE", None
-                    controller.reset()
-                    sys.stdout.write(f"\n{CSI}33m■ landed — idle (disarm on the TX12).{CSI}0m\n")
+                    send_disarm()
+                    break
 
             # ===================== build output frame =====================
             ch = [channels.NEUTRAL_US] * 16
@@ -440,6 +494,8 @@ def run(args):
     except KeyboardInterrupt:
         print("\nCtrl-C — disarming.", flush=True)
     finally:
+        if stdin_old is not None:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, stdin_old)   # restore the terminal
         if session["dir"]:
             end_session()
         if window_open and CV2_OK:

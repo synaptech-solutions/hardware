@@ -104,8 +104,11 @@ KV_UP_US_PER_MPS = 40.0        # P: throttle us per (m/s) of velocity error
 KI_UP_US_PER_M = 80.0          # I: hover-throttle us per (m) of accumulated v-error
 THR_CLIMB_TRIM_US = 100        # max +P correction (climbing) — asymmetric:
 THR_DESC_TRIM_US = 200         # max -P correction (gravity aids descent)
-LAND_SPEED_MPS = 0.25          # commanded descent rate when landing (record-off)
-LAND_DONE_M = 0.10             # treat as landed when within this of takeoff alt
+LAND_SPEED_MPS = 0.25          # commanded descent rate when landing (SPACEBAR / low batt)
+LAND_CUT_M = 0.30              # descend to this height above launch, then CUT throttle +
+                               # disarm + close the session + EXIT the program. Cutting
+                               # at 0.3 m (not all the way down) avoids ground-effect
+                               # wobble; the Air75 is light enough to drop the last 0.3 m.
 # Clean takeoff: until the drone is this far above its takeoff altitude, hold LEVEL
 # (no roll/pitch) and freeze the horizontal integrators so it lifts STRAIGHT UP
 # instead of scooting on the ground; engage horizontal hold once above it.
@@ -119,13 +122,15 @@ MAX_YAW_US = 120
 YAW_DEADBAND_RAD = math.radians(2.0)
 
 # ============ safety ============
-VICON_STALE_S = 0.15           # pose older than this in flight → land then disarm
-VICON_KILL_S = 0.60            # pose lost this long → immediate disarm
-LOW_BATT_CUTOFF = True         # disarm on a sagging 1S pack
+# The flight ends ONLY on: SPACEBAR (laptop), low battery, manual disarm (TX12),
+# or Vicon loss — each descends/cuts and EXITS the program (no time cap, no
+# auto-relaunch). The TX12 arm switch is always the instant kill.
+VICON_STALE_S = 0.15           # pose older than this in flight → blind gentle sink
+VICON_KILL_S = 0.60            # pose lost this long → cut + exit
+LOW_BATT_CUTOFF = True         # auto-LAND on a sagging 1S pack (then cut + exit)
 BATT_PRESENT_V = 2.5           # below this = no/!valid pack reading, ignore
 MIN_CELL_V = 3.3
 CELLS = 1
-MAX_FLIGHT_S = 60.0            # hard cap on a single FLYING session (then land)
 
 # ============ loop rate (shared) ============
 TX_HZ = channels.TX_HZ         # 50 Hz, same as the data logger
