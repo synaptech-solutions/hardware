@@ -32,6 +32,14 @@ CLIMB_M = 1.0
 # ============ FC angle-mode stick → angle scaling (from the Air75 measurement) ===
 # Measured 2026-05-29: full deflection ≈ ±511.5us reaches angle_limit (60°), so
 # 511.5/60 = 8.525 us/deg. (TODO: confirm via Air75 CLI `get angle_limit`.)
+# CONFIRMED via Betaflight CLI (2026-06-11): angle_limit = 60, so full ±511us stick
+# = ±60° → 8.525 us/deg. (My earlier "13°" guess from a flight regression was wrong —
+# the FC config is authoritative.) NOTE the measured FACT: in flight 20260611_142905
+# the drone tilted ~4.6x LESS than commanded near center (commanded ~5° → ~1° actual).
+# With angle_limit=60 confirmed, that softness is RC expo and/or the response lag near
+# center — NOT a low angle limit. We don't need this conversion exact: the integral
+# auto-winds-up to whatever us actually moves the drone. We compensate the soft
+# near-center response purely by RAISING THE GAINS below (more aggressive corrections).
 FC_ANGLE_LIMIT_DEG = 60.0
 STICK_FULL_DEFLECTION_US = 511.5
 STICK_US_PER_DEG = STICK_FULL_DEFLECTION_US / FC_ANGLE_LIMIT_DEG   # 8.525
@@ -66,12 +74,18 @@ VICON_YAW_OFFSET_DEG = 90.0
 # Tuning after flight 20260611_135158: stable hover but ~1m steady-state offset
 # (P-only settled where KP*err balanced a ~8°-worth bias). Enabled integral to
 # zero the offset + modest KP bump for a firmer return (your "harder corrections").
-KP_POS_DEG_PER_M = 11.0        # was 8 — firmer proportional return (1m err -> 11°)
-KD_POS_DEG_PER_MPS = 14.0      # damping unchanged (it wasn't oscillating)
-KI_POS_DEG_PER_M_S = 2.5       # was 0 — THE fix for the 1m steady-state offset;
-                               # accumulates standing error, adds trim until err->0
-MAX_POS_INT_DEG = 12.0         # was 8 — room for the integrator to hold the ~8° trim
-MAX_TILT_DEG = 18.0            # output clamp on commanded roll/pitch angle
+# Gains are in commanded-degrees at 8.525 us/deg (angle_limit=60). The numbers look
+# large because the FC's near-center response is soft (~4.6x, expo/lag) — so we send
+# more us to get real authority. Behavior is set by the us output (gain × 8.525);
+# the integral auto-trims steady-state regardless of the exact conversion. vs the
+# last flight (KP=11/KD=14/KI=2.5) this is ~1.7x more P + damping authority, with a
+# gentler integral (KI=2.5 wound up and slow-oscillated). WATCH for fast oscillation
+# now — if it shakes quickly the response lag is the limit; lower KP.
+KP_POS_DEG_PER_M = 19.0        # ~162 us per m of error (was 93us) — firmer return
+KD_POS_DEG_PER_MPS = 25.0      # ~213 us per m/s — strong damping (lag + faster P)
+KI_POS_DEG_PER_M_S = 1.0       # ~8.5 us per m·s — gentle; auto-trims residual drift
+MAX_POS_INT_DEG = 20.0         # integral authority cap (~170 us)
+MAX_TILT_DEG = 25.0            # output clamp (~213 us ≈ 5.4° real tilt near center)
 
 # ============ altitude loop (PI velocity loop, self-learning hover) =============
 # The integrator state (hover_us) IS the hover throttle, in us: it SEEDS at
