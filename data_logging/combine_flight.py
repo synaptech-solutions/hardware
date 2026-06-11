@@ -390,7 +390,14 @@ def main():
     if not os.path.isfile(vicon_mat) and not os.path.isfile(cmd_path):
         sys.exit(f"{session} has neither vicon.mat nor commands.csv — nothing to "
                  "build a timeline from.")
-    bbl = args.bbl or find_session_bbl(session)
+    # Blackbox is OPTIONAL: vicon + commands + telemetry all share the laptop t0
+    # clock and merge without it (only the FC blackbox is on a separate clock). A
+    # missing .bbl just omits the bb_* channels, so a flight still renders before
+    # you've downloaded the log off the FC.
+    try:
+        bbl = args.bbl or find_session_bbl(session)
+    except FileNotFoundError:
+        bbl = None
     out = args.out or os.path.join(session, "flight_synced.csv")
     meta_out = os.path.splitext(out)[0] + ".meta.json"
 
@@ -405,12 +412,15 @@ def main():
 
     print(f"Session:  {session}")
     print(f"Vicon:    {vicon_mat if os.path.isfile(vicon_mat) else '(none — no pose)'}")
-    print(f"Blackbox: {bbl}")
+    print(f"Blackbox: {bbl if bbl else '(none — Vicon + commands + telemetry only)'}")
     print(f"Motors:   {args.poles} poles  ->  RPM = eRPM_field x {ERPM_FIELD_SCALE:.0f}"
           f" / {int(pole_pairs)}   |   offset {args.offset:+.3f}s\n")
 
-    with tempfile.TemporaryDirectory() as tmp:
-        bb_t, bb_cols = load_blackbox(decode_bbl(bbl, args.decoder, tmp))
+    if bbl:
+        with tempfile.TemporaryDirectory() as tmp:
+            bb_t, bb_cols = load_blackbox(decode_bbl(bbl, args.decoder, tmp))
+    else:
+        bb_t, bb_cols = None, {}
     vc = load_vicon(vicon_mat) if os.path.isfile(vicon_mat) else None
     cmd = load_commands(cmd_path) if os.path.isfile(cmd_path) else None  # (ct, cser) | None
 
@@ -433,23 +443,29 @@ def main():
     # map the FC clock onto the laptop clock via the cmd<->rcCommand echo (see
     # estimate_bb_clock_map). After mapping, bb_rel is in laptop-clock seconds and we
     # query it directly on the master grid. --offset is an extra constant nudge.
-    bb_rel = bb_t - bb_t[0]
-    drift = None if args.no_drift_correct else \
-        estimate_bb_clock_map(cmd, bb_rel, bb_cols)
-    if drift is not None:
-        slope, intercept, npts, rmse = drift
-        bb_rel = bb_rel * (1.0 - slope) - intercept
-        print(f"Clock drift: FC vs laptop = {slope*1000:+.3f} ms/s ({slope*100:+.3f}%), "
-              f"offset@t0 {intercept*1000:+.1f} ms  (fit over {npts} windows, rmse {rmse:.1f} ms)")
-        print("  -> remapped blackbox onto the laptop clock (cmd<->rcCommand echo). "
-              "rcCommand should now land just AFTER its command.")
+    if bb_t is not None:
+        bb_rel = bb_t - bb_t[0]
+        drift = None if args.no_drift_correct else \
+            estimate_bb_clock_map(cmd, bb_rel, bb_cols)
+        if drift is not None:
+            slope, intercept, npts, rmse = drift
+            bb_rel = bb_rel * (1.0 - slope) - intercept
+            print(f"Clock drift: FC vs laptop = {slope*1000:+.3f} ms/s ({slope*100:+.3f}%), "
+                  f"offset@t0 {intercept*1000:+.1f} ms  (fit over {npts} windows, rmse {rmse:.1f} ms)")
+            print("  -> remapped blackbox onto the laptop clock (cmd<->rcCommand echo). "
+                  "rcCommand should now land just AFTER its command.")
+        else:
+            print("Clock drift: not estimated (no command echo / low confidence) — using "
+                  "constant shared-trigger alignment." + (
+                      "" if args.no_drift_correct else " Pass --offset to nudge."))
+        bb_q = tq - args.offset
+        bb_lo, bb_hi = bb_rel[0], bb_rel[-1]
+        in_cov = (bb_q >= bb_lo) & (bb_q <= bb_hi)
     else:
-        print("Clock drift: not estimated (no command echo / low confidence) — using "
-              "constant shared-trigger alignment." + (
-                  "" if args.no_drift_correct else " Pass --offset to nudge."))
-    bb_q = tq - args.offset
-    bb_lo, bb_hi = bb_rel[0], bb_rel[-1]
-    in_cov = (bb_q >= bb_lo) & (bb_q <= bb_hi)
+        bb_rel = None
+        drift = None
+        bb_q, bb_lo, bb_hi = tq, 0.0, 0.0
+        in_cov = np.zeros(tq.shape, dtype=bool)
 
     cols = {"Abs_time": tq}
 
@@ -506,14 +522,15 @@ def main():
             cols["tlm_" + c] = fn(tq, tt, yy, tt[0], tt[-1])
 
     cov = int(in_cov.sum())
+    span = bb_rel[-1] if bb_rel is not None else 0.0
     print(f"Merged {n} samples on the {master} clock; {cov} ({100*cov/max(n,1):.1f}%) "
-          f"overlap the blackbox log ({bb_rel[-1]:.1f}s).  {len(bb_cols)} blackbox "
+          f"overlap the blackbox log ({span:.1f}s).  {len(bb_cols)} blackbox "
           f"channels, {n_cmd} command frames, {n_tlm_ch} telemetry channels.")
     if cov and "motor_rpm_0" in cols:
         rv = np.column_stack([cols[f"motor_rpm_{m}"] for m in range(4)])[in_cov]
         print(f"Motor RPM over overlap: min {np.nanmin(rv):.0f}  max {np.nanmax(rv):.0f}"
               f"  mean {np.nanmean(rv):.0f}")
-    if cov < n:
+    if bb_rel is not None and cov < n:
         print("  note: samples outside blackbox coverage are blank (the laptop streams "
               "ran longer than the FC log — expected near the very start/end).")
 
@@ -530,7 +547,7 @@ def main():
         "clock_drift_fit_windows": drift[2] if drift else 0,
         "clock_drift_rmse_ms": drift[3] if drift else None,
         "motor_poles": args.poles,
-        "blackbox_file": os.path.basename(bbl),
+        "blackbox_file": os.path.basename(bbl) if bbl else "",
         "vicon_file": "vicon.mat" if vc is not None else "",
         "commands_file": "commands.csv" if os.path.isfile(cmd_path) else "",
         "telemetry_file": "telemetry.csv" if os.path.isfile(tlm_path) else "",
@@ -541,7 +558,7 @@ def main():
         "video_start_offset_s": meta.get("video", {}).get("start_offset_s", 0.0) or 0.0,
         "t0_human": meta.get("t0_human", ""),
         "n_samples": int(n),
-        "blackbox_span_s": float(bb_rel[-1]),
+        "blackbox_span_s": float(bb_rel[-1]) if bb_rel is not None else 0.0,
         "blackbox_coverage_samples": cov,
         "blackbox_coverage_frac": cov / max(n, 1),
         "n_command_frames": n_cmd,

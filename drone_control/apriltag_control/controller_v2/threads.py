@@ -19,14 +19,10 @@ from pupil_apriltags import Detector
 from . import config
 
 
-# live_telemetry lives in <repo>/setup/live_telemetry.py. Add it to sys.path
-# so this module can be imported standalone.
-HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.dirname(HERE)
-if os.path.join(REPO, "setup") not in sys.path:
-    sys.path.insert(0, os.path.join(REPO, "setup"))
+# CRSF builders/parsers moved to drone_control/common/ (controller_v2/__init__.py
+# already put drone_control on sys.path).
 import serial  # noqa: E402
-from live_telemetry import (  # noqa: E402
+from common.live_telemetry import (  # noqa: E402
     build_rc_channels_packed, build_device_ping, autodetect_port, CrsfParser,
     decode_flight_mode, decode_battery, decode_attitude,
     T_FLIGHT_MODE, T_BATTERY, T_ATTITUDE,

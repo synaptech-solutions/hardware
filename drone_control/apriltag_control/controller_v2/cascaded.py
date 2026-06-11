@@ -18,8 +18,8 @@ convert our desired-angle (deg) outputs to us via config.STICK_US_PER_DEG.
 """
 import math
 
-from . import config
-from .pid import PID, _clamp
+from . import config            # __init__ puts drone_control on sys.path
+from common.pid import PID, _clamp
 
 
 def _wrap_pi(rad):

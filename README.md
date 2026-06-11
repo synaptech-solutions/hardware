@@ -11,7 +11,7 @@ There are **two data-collection pipelines** and a separate autonomous controller
 |---|---|---|---|
 | **A — TX12 synced collection** | [`data_logging/`](data_logging/) | blackbox switch on the radio | You fly by hand through the laptop (TX12 → Ranger → drone) and want commands + telemetry + video + Vicon + FC blackbox, deterministically aligned. **This is the main pipeline.** |
 | **B — Standalone Vicon+video recorder** | [`pycode_ViCON/`](pycode_ViCON/) | SPACE key | Any drone (no TX12 relay) — record Vicon pose + video, then post-sync with the blackbox via yaw cross-correlation. |
-| Autonomous hover controller | [`drone_control/`](drone_control/) | — | Closed-loop AprilTag hover (flight control, not data logging). |
+| Autonomous hover controllers | [`drone_control/`](drone_control/) | TX12 arm + record | Closed-loop hover (flight control). **`Vicon_control/`** — live-Vicon hover (current); **`apriltag_control/`** — AprilTag hover (archived). Records via the same pipeline as A. |
 
 ---
 
@@ -224,13 +224,53 @@ Opens a Plotly Dash app at `http://127.0.0.1:8050`. Features:
 
 ---
 
-## 6. Autonomous controller (`drone_control/`)
+## 6. Autonomous controllers (`drone_control/`)
 
-Not part of data logging, but shares the hardware/config. Closed-loop **AprilTag hover**:
-- [`tag_hover_v2.py`](drone_control/tag_hover_v2.py) — current: cascaded position PID → desired roll/pitch angles (FC in **Angle** mode), altitude PI velocity loop that *learns* the hover throttle. Run `.venv/bin/python drone_control/tag_hover_v2.py` (toggle `DRY_RUN` in `controller_v2/config.py` first).
-- [`tag_hover_controller.py`](drone_control/tag_hover_controller.py) — older velocity-loop variant.
-- `controller_v2/config.py` — single source of truth for channel map, camera, rates, gains (also imported by the data-logging scripts).
-- `setup/` — `live_telemetry.py` (CRSF/MSP builders + decoders, shared) and Ranger/stick test utilities. `camera_setup/` — calibration.
+`drone_control/` is split into a shared layer + two controllers:
+
+```
+drone_control/
+├── common/            shared hardware/IO layer (base dep for everything below + data_logging)
+│   ├── channels.py     Air75 CRSF channel map + µs levels + camera (SINGLE SOURCE OF TRUTH)
+│   ├── live_telemetry.py / ranger.py   CRSF/MSP build+parse, custom-baud Ranger open
+│   ├── tx12.py / recorders.py          TX12 input + the synced recorders (extracted from joystick_flight)
+│   └── pid.py
+├── Vicon_control/     live-Vicon hover (current)
+└── apriltag_control/  AprilTag hover (archived: tag_hover_v2.py, controller_v2/, camera_setup/, setup/)
+```
+
+### `Vicon_control/` — live-Vicon hover (current)
+
+Closed-loop hover on **live Vicon pose** (100 Hz, absolute position + drift-free
+yaw) — much easier than AprilTags (no dropouts, no dead-reckoning, no compass
+hacks). The **TX12 stays in the loop for arm / disarm / record only**, and the
+controller **records via the same pipeline as Pipeline A**, so its flights merge +
+render identically.
+
+- [`vicon_hover.py`](drone_control/Vicon_control/vicon_hover.py) — main loop. **Arm** on the TX12 (motors idle); flip the **record switch** to launch → the drone captures its takeoff pose, climbs `CLIMB_M` (default 1 m) and holds takeoff x/y + heading. Flip record back to land gently; **flick the arm switch to disarm = instant kill** at any time. FC stays in **Angle** mode (forced).
+- `controller.py` — world→body position PID → desired roll/pitch angle; altitude PI velocity loop that *learns* hover throttle; P-on-absolute-heading yaw hold.
+- `vicon_source.py` — owns the one Vicon receiver (shared with the recorder); gives world-frame `x,y,z,yaw,vx,vy,vz`.
+- `config.py` — climb target, gains, hover band, safety limits. **Toggle `DRY_RUN`** (default `True`) before flying.
+- `combine.py` / `plot.py` / `dashboard.py` — thin launchers over the Pipeline-A tools, defaulting to `flight_logs/`.
+
+```bash
+.venv/bin/python data_logging/joystick_flight.py --calibrate   # one-time TX12 cal (shared file)
+.venv/bin/python drone_control/Vicon_control/vicon_hover.py --dry-run   # DRY_RUN: print control, never arm
+.venv/bin/python drone_control/Vicon_control/vicon_hover.py             # fly (after dry-run dir-checks)
+```
+
+**Bring-up order (don't skip — props OFF until directions verified):**
+1. `--dry-run`: arm + record on the TX12, then **move the drone by hand** off the hover point and confirm the printed `des(R,P)` / throttle push *toward* the target (this is the gate that catches a sign inversion).
+2. Props off, on the bench: arm + record, confirm motors spin toward hover and fight a hand-induced displacement in the right direction.
+3. First hover: set `CLIMB_M = 0.3` in `config.py`, fly, land, then raise to 1.0 m and tune gains.
+
+### `apriltag_control/` — AprilTag hover (archived)
+
+The earlier closed-loop **AprilTag** hover (never fully reliable — vision dropouts,
+dead-reckoning pogo, compass-less yaw). Kept for reference.
+- [`tag_hover_v2.py`](drone_control/apriltag_control/tag_hover_v2.py) — cascaded position PID → angles, altitude PI that learns hover. Toggle `DRY_RUN` in `apriltag_control/controller_v2/config.py`.
+- [`tag_hover_controller.py`](drone_control/apriltag_control/tag_hover_controller.py) — older velocity-loop variant.
+- `controller_v2/` — control logic + gains; `camera_setup/` — calibration; `setup/` — Ranger/stick test utilities.
 
 ---
 
@@ -239,10 +279,11 @@ Not part of data logging, but shares the hardware/config. Closed-loop **AprilTag
 | What | Where |
 |---|---|
 | TX12 flights (raw + merged) | `data_logging/recordings/<stamp>/` |
-| TX12 calibration | `data_logging/tx12_joystick_cal.json` |
+| Vicon-controller flights (raw + merged) | `drone_control/Vicon_control/flight_logs/<stamp>/` |
+| TX12 calibration (shared) | `data_logging/tx12_joystick_cal.json` |
 | Standalone recordings + synced | `pycode_ViCON/DataExchange/` |
 | Blackbox decoder | `pycode_ViCON/tools/blackbox-tools/obj/blackbox_decode` |
-| Camera calibration | `drone_control/camera_setup/camera_calibration.npz` |
+| Camera calibration | `drone_control/apriltag_control/camera_setup/camera_calibration.npz` |
 
 All recording/data folders are git-ignored (placeholder `.gitkeep` keeps the folders).
 
@@ -280,4 +321,10 @@ python3            data_logging/monitor_tx12.py                     # see every 
 .venv/bin/python pycode_ViCON/UdpReceiver_datacollection.py         # SPACE to record
 .venv/bin/python pycode_ViCON/sync_log.py                           # merge w/ blackbox
 .venv/bin/python pycode_ViCON/dashboard_synced.py                   # web dashboard
+
+# --- autonomous Vicon hover (TX12 arms + records) ---
+.venv/bin/python drone_control/Vicon_control/vicon_hover.py --dry-run  # verify control directions
+.venv/bin/python drone_control/Vicon_control/vicon_hover.py            # fly (arm + flip record to launch)
+.venv/bin/python drone_control/Vicon_control/combine.py               # merge newest flight
+.venv/bin/python drone_control/Vicon_control/dashboard.py             # web dashboard (same UI)
 ```

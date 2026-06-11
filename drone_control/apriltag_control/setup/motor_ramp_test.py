@@ -46,8 +46,10 @@ try:
 except ImportError:
     sys.exit("pyserial not installed. Run: pip install pyserial")
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # live_telemetry is alongside
-from live_telemetry import (
+# CRSF builders moved to drone_control/common/ (setup → apriltag_control → drone_control).
+sys.path.insert(0, os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from common.live_telemetry import (
     CrsfParser, build_device_ping, build_rc_channels_packed,
     autodetect_port, decode_link_stats, decode_flight_mode, decode_battery,
     T_LINK_STATS, T_FLIGHT_MODE, T_DEVICE_INFO, T_BATTERY,

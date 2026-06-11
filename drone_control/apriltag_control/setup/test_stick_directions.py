@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import os
 import select
 import sys
 import termios
@@ -30,7 +31,10 @@ try:
 except ImportError:
     sys.exit("pyserial not installed. Run: pip install pyserial")
 
-from live_telemetry import build_rc_channels_packed, autodetect_port
+# CRSF builders moved to drone_control/common/ (setup → apriltag_control → drone_control).
+sys.path.insert(0, os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from common.live_telemetry import build_rc_channels_packed, autodetect_port  # noqa: E402
 
 # CRSF channel indices (AETR + AUX)
 ROLL_IDX = 0

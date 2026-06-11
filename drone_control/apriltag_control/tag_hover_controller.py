@@ -69,9 +69,10 @@ def suppress_c_stderr():
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(HERE, "setup"))
+# CRSF builders/parsers moved to drone_control/common/ (drone_control = HERE's parent).
+sys.path.insert(0, os.path.dirname(HERE))
 import serial  # noqa: E402
-from live_telemetry import (  # noqa: E402
+from common.live_telemetry import (  # noqa: E402
     build_rc_channels_packed, build_device_ping, autodetect_port, CrsfParser,
     decode_flight_mode, decode_battery, decode_attitude,
     T_FLIGHT_MODE, T_BATTERY, T_ATTITUDE,

@@ -13,6 +13,10 @@ pycode_ViCON/tools/blackbox-tools/
 data_logging/recordings/*
 !data_logging/recordings/.gitkeep
 
+# Vicon-controller flight sessions (same per-session layout) — keep folder, ignore data.
+drone_control/Vicon_control/flight_logs/*
+!drone_control/Vicon_control/flight_logs/.gitkeep
+
 # Downloaded blackbox logs you drop in after each flight (large) — keep the folder.
 data_logging/blackbox/*
 !data_logging/blackbox/.gitkeep
