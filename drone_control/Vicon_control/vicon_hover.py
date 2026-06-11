@@ -215,7 +215,8 @@ def run(args):
                 "kind": "vicon_hover", "climb_m": config.CLIMB_M,
                 "target": ({"x": launch[0], "y": launch[1], "z": launch[2] + config.CLIMB_M,
                             "yaw_rad": launch[3]} if launch else None),
-                "gains": {"kp_pos": config.KP_POS_DEG_PER_M, "kd_pos": config.KD_POS_DEG_PER_MPS,
+                "gains": {"kp_fwd": config.KP_FWD_DEG_PER_M, "kd_fwd": config.KD_FWD_DEG_PER_MPS,
+                          "kp_lat": config.KP_LAT_DEG_PER_M, "kd_lat": config.KD_LAT_DEG_PER_MPS,
                           "kp_up": config.KP_UP, "kv_up": config.KV_UP_US_PER_MPS,
                           "ki_up": config.KI_UP_US_PER_M, "kp_yaw": config.KP_YAW_US_PER_RAD}}}
             write_session_json(session, recorder, vicon_rec, cmd_log, telem, cal,

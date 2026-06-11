@@ -81,11 +81,70 @@ VICON_YAW_OFFSET_DEG = 90.0
 # last flight (KP=11/KD=14/KI=2.5) this is ~1.7x more P + damping authority, with a
 # gentler integral (KI=2.5 wound up and slow-oscillated). WATCH for fast oscillation
 # now — if it shakes quickly the response lag is the limit; lower KP.
-KP_POS_DEG_PER_M = 19.0        # ~162 us per m of error (was 93us) — firmer return
-KD_POS_DEG_PER_MPS = 25.0      # ~213 us per m/s — strong damping (lag + faster P)
-KI_POS_DEG_PER_M_S = 1.0       # ~8.5 us per m·s — gentle; auto-trims residual drift
-MAX_POS_INT_DEG = 20.0         # integral authority cap (~170 us)
-MAX_TILT_DEG = 25.0            # output clamp (~213 us ≈ 5.4° real tilt near center)
+#
+# PER-AXIS GAINS — the two horizontal PIDs are independent (controller.pid_fwd =
+# pitch/world-Y, controller.pid_lat = roll/world-X), so each gets its own gains.
+#
+# Diagnosis from flight 20260611_154818 (KP=19/KD=25/KI=1.0, shared): BOTH axes
+# slow-oscillate ±0.2–0.3 m about the origin with a ~25–35 s period (x a bit wider
+# than y, but the SAME problem — y is NOT actually tight). Two facts pin the cause:
+#   (1) it's CENTERED (mean ≈ 0) → the integral IS trimming the average; this is a
+#       swing AROUND target, not a standing offset.
+#   (2) the period is ~30 s → far too slow for a proportional/damping/lag oscillation
+#       (that cycles in seconds) → the INTEGRAL is driving the slow limit cycle.
+# Cross-flight trend confirms KI is the driver: KI=0 → ~1 m offset, no swing; KI=1.0
+# → centered, ±0.25 m swing; KI=2.5 → ±0.3 m worse swing. So the lever to REDUCE the
+# swing is to LOWER KI (1.0→0.5), NOT raise it — while stiffening P (so the gentler
+# integral still centers it: a stiffer P shrinks the offset the integral must chase)
+# and adding damping. Applied to BOTH axes (both oscillate); LAT gets a touch more
+# P+D since x swings wider. Gains are commanded-deg at 8.525 us/deg (large because the
+# FC near-center response is soft). UNFLOWN — if either axis now shakes FAST, the
+# ~300 ms response lag is the ceiling → drop that axis' KP. Gain-tuning has a limit
+# here (soft + laggy plant); if the swing persists, the real fixes are reducing the
+# command→tilt lag and/or linearizing the FC rates curve.
+
+# !!! RETUNE FOR A LINEARIZED FC RATE CURVE (after flight 20260611_164212) !!!
+# That flight MEASURED the real problem (FC attitude telemetry @97.5Hz AND the Vicon
+# quaternion AGREE): the drone tilts only ~1.5° when the controller commands ~7.6° —
+# a ~5x soft near-center response. Root cause (verified): BF 4.5 Angle mode follows
+# the ACTUAL-rates curve, and the stock curve (Center Sensitivity 70°/s vs Max Rate
+# 670°/s) is ~10:1 progressive = soft center. NO controller gain fixes a plant that
+# ignores ~80% of the command — that's why KP 11→19→26 barely helped.
+# THE FIX is FC-side: linearize roll+pitch rates (set roll_srate=pitch_srate=7 so
+# Center Sensitivity = Max Rate → straight-line curve → commanded angle = actual).
+# ONCE LINEAR, the drone tilts ~5x MORE for the same command, so these gains are cut
+# ~5x from the values above (KP 26-28 → 6) to a CONSERVATIVE baseline that ~preserves
+# the previous (stable) loop gain but now in HONEST degrees. Start here, confirm the
+# linear response is stable + that actual≈commanded tilt, THEN raise to tighten the
+# hover (now that the drone actually responds, raising KP will work). Both axes start
+# equal — the old per-axis split chased an asymmetry that may have been the curve;
+# re-split only if x still lags y once linear. APPLY THE FC CHANGE AND THESE TOGETHER
+# — linear curve with the OLD gains would be ~5x too hot. First linear flight = a
+# careful test: low CLIMB, finger on the disarm; if it shakes FAST, the ~0.3-0.5s
+# response lag is the ceiling → lower KP.
+
+# After flight 20260611_171558 (FIRST LINEAR flight): the rate-curve fix WORKED —
+# actual/commanded tilt = 0.99 (was 0.20), stable, gentle (max 3°), centered, alt
+# rock-solid. Swing was still ±0.2 m because the gains were cut 5x for safety, so net
+# authority ≈ before. Now that the plant is HONEST + has lots of margin (no fast
+# shake), raising KP finally tightens the hover for real. STEP 1: 2x (KP 6→12, KD
+# 8→16, ratio kept). If still loose + stable → raise again; if it shakes FAST → the
+# ~0.3-0.5 s cmd→tilt lag is the ceiling, back off. Both axes still equal (response is
+# now ~symmetric: roll slope 0.91 / pitch 0.74).
+
+# --- forward axis (pitch / world-Y) ---
+KP_FWD_DEG_PER_M = 12.0        # 2x (was 6) — honest deg/m, tighten the hold
+KD_FWD_DEG_PER_MPS = 16.0      # 2x (was 8) — damping, ratio kept ~1.33
+KI_FWD_DEG_PER_M_S = 0.5       # gentle auto-trim (unchanged)
+MAX_FWD_INT_DEG = 12.0         # integral contribution cap
+
+# --- lateral axis (roll / world-X) ---
+KP_LAT_DEG_PER_M = 12.0        # 2x (was 6)
+KD_LAT_DEG_PER_MPS = 16.0      # 2x (was 8)
+KI_LAT_DEG_PER_M_S = 0.5       # gentle auto-trim
+MAX_LAT_INT_DEG = 12.0         # integral contribution cap
+
+MAX_TILT_DEG = 15.0            # output clamp — real tilt; 15° is plenty (it used ~3°)
 
 # ============ altitude loop (PI velocity loop, self-learning hover) =============
 # The integrator state (hover_us) IS the hover throttle, in us: it SEEDS at

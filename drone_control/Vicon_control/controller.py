@@ -39,14 +39,18 @@ def _wrap_pi(rad):
 
 class ViconHoverController:
     def __init__(self):
-        ki = config.KI_POS_DEG_PER_M_S
-        i_clamp = (config.MAX_POS_INT_DEG / ki) if ki > 1e-9 else None
+        # Independent per-axis gains (fwd = pitch/world-Y, lat = roll/world-X): the
+        # two axes saw different disturbances in flight, so they're tuned apart.
+        kf = config.KI_FWD_DEG_PER_M_S
+        kf_clamp = (config.MAX_FWD_INT_DEG / kf) if kf > 1e-9 else None
+        kl = config.KI_LAT_DEG_PER_M_S
+        kl_clamp = (config.MAX_LAT_INT_DEG / kl) if kl > 1e-9 else None
         # D-on-measurement: caller passes derivative = d(error)/dt, so no output
         # clamp inside the PID — the tilt clamp is applied downstream.
-        self.pid_fwd = PID(kp=config.KP_POS_DEG_PER_M, ki=ki,
-                           kd=config.KD_POS_DEG_PER_MPS, i_clamp=i_clamp)
-        self.pid_lat = PID(kp=config.KP_POS_DEG_PER_M, ki=ki,
-                           kd=config.KD_POS_DEG_PER_MPS, i_clamp=i_clamp)
+        self.pid_fwd = PID(kp=config.KP_FWD_DEG_PER_M, ki=kf,
+                           kd=config.KD_FWD_DEG_PER_MPS, i_clamp=kf_clamp)
+        self.pid_lat = PID(kp=config.KP_LAT_DEG_PER_M, ki=kl,
+                           kd=config.KD_LAT_DEG_PER_MPS, i_clamp=kl_clamp)
         # hover_us IS the altitude integrator state, carried as absolute throttle.
         # Seeds near true hover (HOVER_START_US) so takeoff is quick.
         self.hover_us = float(config.HOVER_START_US)
