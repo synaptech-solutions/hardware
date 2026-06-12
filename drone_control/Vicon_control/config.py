@@ -201,14 +201,14 @@ CELLS = 1
 # of this (it flies a static HoldMission); only square_flight.py reads these.
 LEG_M = 2.0                    # square side length (forward/right/back/left distance)
 CRUISE_SPEED_MPS = 0.80        # moving-setpoint ("carrot") speed between waypoints —
-                               # the horizontal analog of VMAX_UP_MPS. (Note:
-                               # D-on-measurement adds ~KD*cruise of opposing tilt, so
-                               # the drone trails the carrot ~KD*v/KP m: ~0.3 m measured
-                               # at 0.4 m/s, so ~0.6 m expected here at 0.8 m/s — hence
-                               # LEASH_M is raised to stay above it. The arrival gate
-                               # waits for the DRONE, not the carrot, so the trailing is
-                               # benign; at speed the circle just flies a bit smaller +
-                               # more phase-lagged. Tighten with velocity feedforward.)
+                               # the horizontal analog of VMAX_UP_MPS. (History: pure
+                               # D-on-measurement made the drone trail the carrot by
+                               # ~KD*v/KP — measured 0.83-0.98 m / 55° of circle phase
+                               # lag at 0.8 m/s in flight 20260612_121316. FIXED by the
+                               # velocity feedforward: missions now report the carrot
+                               # velocity and the D term acts on (v_carrot - v_drone),
+                               # so the residual lag is just the FC response delay.
+                               # LEASH_M keeps its margin anyway as a stall backstop.)
 DWELL_S = 5.0                  # hold time at each square vertex
 INITIAL_HOVER_S = 3.0          # settle time at the takeoff hover before leg 1
 ARRIVE_TOL_M = 0.25            # carrot AT the WP and drone within this (horiz + vert)
@@ -235,8 +235,11 @@ CIRCLE_RADIUS_M = 1.0          # circle radius AND the forward approach distance
 CIRCLE_CW = True               # True = clockwise viewed from above (the carrot goes
                                # forward-point → right → back → left → forward-point);
                                # False = counter-clockwise
-SETTLE_S = 2.0                 # hold at the circle entry (clean start) and again at
-                               # the origin on return, before landing
+SETTLE_S = 2.0                 # hold at the circle entry (clean start), at the circle
+                               # EXIT (the dwell gates on the DRONE arriving, so any
+                               # phase lag closes the lap before the carrot heads home
+                               # — flight 20260612_121316 lost the last 60° without
+                               # this), and at the origin on return before landing
 
 # ============ loop rate (shared) ============
 TX_HZ = channels.TX_HZ         # 50 Hz, same as the data logger

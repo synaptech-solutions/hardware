@@ -58,19 +58,32 @@ class ViconHoverController:
         self.y_tgt = 0.0
         self.z_tgt = 0.0
         self.yaw_tgt = 0.0
+        # Setpoint velocity (world frame) — the carrot's own motion, for the D-term
+        # velocity feedforward. Zero for a static hover.
+        self.vx_tgt = 0.0
+        self.vy_tgt = 0.0
 
     def set_target(self, x, y, z, yaw):
         """Capture the hover setpoint (call once at takeoff) and reset state."""
         self.x_tgt, self.y_tgt, self.z_tgt, self.yaw_tgt = x, y, z, yaw
+        self.vx_tgt = self.vy_tgt = 0.0
         self.reset()
 
-    def set_setpoint(self, x, y, z, yaw):
+    def set_setpoint(self, x, y, z, yaw, vx=0.0, vy=0.0):
         """Update the target WITHOUT resetting state — for following a moving
         reference (waypoints). Unlike set_target this preserves hover_us (the
         learned hover throttle) and the position integrators, so the altitude
         trim and steady-state bias carry across legs. The reference moves smoothly
-        (a crawling carrot), so there's no setpoint step to kick the loop."""
+        (a crawling carrot), so there's no setpoint step to kick the loop.
+
+        (vx, vy): the reference's own world-frame velocity (the mission knows it
+        exactly — it moves the carrot). Feeds the D term the TRUE d(error)/dt =
+        v_target - v_drone, so cruising with the carrot generates no braking tilt;
+        without it the drone must trail by KD*v/KP (~1 m at 0.8 m/s) just to
+        cancel the phantom brake. Omitting them (static target) keeps the old
+        D-on-measurement behavior exactly."""
         self.x_tgt, self.y_tgt, self.z_tgt, self.yaw_tgt = x, y, z, yaw
+        self.vx_tgt, self.vy_tgt = vx, vy
 
     def reset(self, keep_alt_trim=False):
         """Zero the position integrators. keep_alt_trim preserves the learned
@@ -151,14 +164,21 @@ class ViconHoverController:
         x, y, z, yaw = pose["x"], pose["y"], pose["z"], pose["yaw"]
         if level_only:
             # Lift straight up: no horizontal correction, integrators untouched.
-            err_fwd = err_lat = v_fwd = v_lat = 0.0
+            err_fwd = err_lat = v_fwd = v_lat = tv_fwd = tv_lat = 0.0
             desired_pitch_deg = desired_roll_deg = 0.0
         else:
             err_fwd, err_lat = self._body_errors(x, y, yaw)
             v_fwd, v_lat = self._body_vel(pose["vx"], pose["vy"], yaw)
-            # d(err)/dt = d(target - pos)/dt = -v_body  (D-on-measurement, no kick).
-            desired_pitch_deg = self.pid_fwd.update(err_fwd, dt, derivative=-v_fwd)
-            desired_roll_deg = self.pid_lat.update(err_lat, dt, derivative=-v_lat)
+            # True d(err)/dt = d(target - pos)/dt = v_target - v_drone (body frame).
+            # The v_target part is the velocity FEEDFORWARD: keeping pace with a
+            # moving carrot gives derivative ≈ 0 → no braking tilt → no KD*v/KP
+            # standing lag. For a parked target (v_tgt = 0) this is exactly the
+            # old D-on-measurement: still no kick on setpoint position steps.
+            tv_fwd, tv_lat = self._body_vel(self.vx_tgt, self.vy_tgt, yaw)
+            desired_pitch_deg = self.pid_fwd.update(err_fwd, dt,
+                                                    derivative=tv_fwd - v_fwd)
+            desired_roll_deg = self.pid_lat.update(err_lat, dt,
+                                                   derivative=tv_lat - v_lat)
 
         pitch_us = self._angle_to_us(desired_pitch_deg, config.SIGN_PITCH)
         roll_us = self._angle_to_us(desired_roll_deg, config.SIGN_ROLL)
@@ -176,6 +196,7 @@ class ViconHoverController:
             "desired_pitch_deg": desired_pitch_deg,
             "err_fwd": err_fwd, "err_lat": err_lat,
             "v_fwd": v_fwd, "v_lat": v_lat,
+            "tv_fwd": tv_fwd, "tv_lat": tv_lat,
             "alt_err": alt_err, "v_des_up": v_des_up, "e_v_up": e_v_up,
             "hover_us": self.hover_us, "e_yaw_rad": e_yaw,
         }

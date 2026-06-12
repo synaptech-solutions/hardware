@@ -1,11 +1,17 @@
 """Mission target providers for the Vicon flight loop.
 
 A Mission converts the captured LAUNCH pose into a time-varying world-frame
-setpoint (x, y, z, yaw) that the shared flight loop (vicon_hover.run) feeds to the
-controller each tick via `controller.set_setpoint`. A Mission only SHAPES THE
-REFERENCE — it never touches serial / arming / recording / safety. When `done`
-goes True the loop lands exactly as if SPACEBAR were pressed (descend → cut →
-disarm → save → exit), so every existing failsafe still wraps the flight.
+setpoint (x, y, z, yaw) PLUS the setpoint's own velocity (svx, svy) that the
+shared flight loop (vicon_hover.run) feeds to the controller each tick via
+`controller.set_setpoint`. The velocity is the carrot's, known exactly (the
+mission moves it), and feeds the controller's D term as velocity FEEDFORWARD:
+D acts on (v_carrot - v_drone) instead of (-v_drone), so pacing a moving carrot
+no longer reads as "rushing at a fixed target" and the KD*v standing lag
+(~1.07 m at 0.8 m/s in flight 20260612_121316 — 55° of phase lag on the circle)
+goes away. A Mission only SHAPES THE REFERENCE — it never touches serial /
+arming / recording / safety. When `done` goes True the loop lands exactly as if
+SPACEBAR were pressed (descend → cut → disarm → save → exit), so every existing
+failsafe still wraps the flight.
 
   HoldMission     — fixed hover at the launch x/y/heading, CLIMB_M up. done is
                     False forever, so the flight ends only on SPACEBAR / low batt /
@@ -42,6 +48,22 @@ import math
 from . import config
 
 
+def _carrot_vel(px, py, cx, cy, dt, vmax):
+    """Carrot velocity this tick: the step it just took / dt. Zero during dwells
+    and leash pauses (the carrot didn't move). Clamped to vmax because a
+    timeout-park can JUMP the carrot a large distance in one tick — the P term
+    should see that step, but an unbounded one-tick velocity would kick the
+    D term hard."""
+    if dt <= 1e-6:
+        return 0.0, 0.0
+    vx, vy = (cx - px) / dt, (cy - py) / dt
+    speed = math.hypot(vx, vy)
+    if speed > vmax > 0.0:
+        k = vmax / speed
+        vx, vy = vx * k, vy * k
+    return vx, vy
+
+
 # ----------------------------------------------------------------------------- #
 class HoldMission:
     """Static hover at the launch x/y/heading, CLIMB_M above launch altitude.
@@ -53,7 +75,7 @@ class HoldMission:
 
     def update(self, pose, dt, airborne):
         x, y, z, yaw = self._t
-        return x, y, z, yaw, False
+        return x, y, z, yaw, 0.0, 0.0, False
 
     def status(self):
         return "hold"
@@ -122,9 +144,11 @@ class WaypointMission:
         self.sx, self.sy = nx, ny
 
     def update(self, pose, dt, airborne):
-        """One tick. Returns (x, y, z, yaw, done): the (x, y) is the moving carrot;
-        z + yaw are the active waypoint's."""
+        """One tick. Returns (x, y, z, yaw, svx, svy, done): the (x, y) is the
+        moving carrot, (svx, svy) its velocity (for the controller's velocity
+        feedforward); z + yaw are the active waypoint's."""
         wx, wy, wz, wyaw, dwell = self.wps[self.idx]
+        px, py = self.sx, self.sy
         if not self.done:
             self.t_in_phase += dt
             if self.phase == "GOTO":
@@ -146,7 +170,8 @@ class WaypointMission:
                         self.phase, self.t_in_phase = "GOTO", 0.0
                     else:
                         self.done = True
-        return self.sx, self.sy, wz, wyaw, self.done
+        svx, svy = _carrot_vel(px, py, self.sx, self.sy, dt, self.cruise)
+        return self.sx, self.sy, wz, wyaw, svx, svy, self.done
 
     def status(self):
         if self.done:
@@ -258,9 +283,12 @@ class PathMission:
     or arrive_timeout) before counting down, so the takeoff hover and the final
     home-settle still gate on the drone actually being there.
 
-    NOTE (from the square flight): at cruise the drone trails the carrot ~0.3 m,
-    so on a curve it flies a slightly smaller, phase-lagged path. Fine at 0.4 m/s;
-    add velocity feedforward when tightening.
+    NOTE (from the square flight): at cruise the drone used to trail the carrot
+    by ~KD*v/KP (0.3 m at 0.4 m/s; ~1 m at 0.8 — flight 20260612_121316 flew a
+    0.8 m oval of the 1.0 m circle and was 60° short of closing the lap when the
+    carrot moved on). Fixed by the velocity feedforward: update() now also
+    returns the carrot velocity and the controller's D term acts on
+    (v_carrot - v_drone), so pacing the carrot no longer generates braking tilt.
     """
 
     def __init__(self, launch, segments, *, cruise_mps, leash_m,
@@ -294,8 +322,9 @@ class PathMission:
     def update(self, pose, dt, airborne):
         if self.done or self.i >= len(self.segs):
             self.done = True
-            return self.cx, self.cy, self.z, self.yaw, True
+            return self.cx, self.cy, self.z, self.yaw, 0.0, 0.0, True
         seg = self.segs[self.i]
+        px, py = self.cx, self.cy
         self.t_in_seg += dt
         if seg["type"] == "dwell":
             self.cx, self.cy = seg["point"]
@@ -315,7 +344,8 @@ class PathMission:
             self.cx, self.cy = seg["at"](self.s)
             if self.s >= seg["len"] - 1e-9:
                 self._next_seg()
-        return self.cx, self.cy, self.z, self.yaw, self.done
+        svx, svy = _carrot_vel(px, py, self.cx, self.cy, dt, self.cruise)
+        return self.cx, self.cy, self.z, self.yaw, svx, svy, self.done
 
     def status(self):
         if self.done or self.i >= len(self.segs):
@@ -378,6 +408,10 @@ def build_circle_mission(launch):
         _line_seg((x0, y0), start, "forward"),
         _dwell_seg(start, config.SETTLE_S, "circle-entry"),
         _arc_seg(center, r, th0, dtheta, "circle"),
+        # Exit dwell: dwells gate on the DRONE arriving (arrive_tol/timeout), so
+        # any phase lag closes the lap here instead of being cut off when the
+        # carrot heads home (flight 20260612_121316 lost the last 60° to this).
+        _dwell_seg(start, config.SETTLE_S, "circle-exit"),
         _line_seg(start, (x0, y0), "return"),
         _dwell_seg((x0, y0), config.SETTLE_S, "home/settle"),
     ]

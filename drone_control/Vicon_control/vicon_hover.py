@@ -447,11 +447,13 @@ def run(args, make_mission=None):
                 airborne = (launch is not None
                             and (pose["z"] - launch[2]) > config.TAKEOFF_AIRBORNE_M)
                 # The mission supplies the world setpoint (a crawling carrot for the
-                # waypoint course; a fixed point for HoldMission). set_setpoint keeps
-                # the learned hover throttle + integrators (set_target would wipe
-                # them). done → land via the SAME path as SPACEBAR.
-                tx, ty, tz, tyaw, done = mission.update(pose, dt, airborne)
-                controller.set_setpoint(tx, ty, tz, tyaw)
+                # waypoint course; a fixed point for HoldMission) AND its velocity
+                # (D-term feedforward — pacing the carrot isn't braking-worthy).
+                # set_setpoint keeps the learned hover throttle + integrators
+                # (set_target would wipe them). done → land via the SAME path as
+                # SPACEBAR.
+                tx, ty, tz, tyaw, tvx, tvy, done = mission.update(pose, dt, airborne)
+                controller.set_setpoint(tx, ty, tz, tyaw, tvx, tvy)
                 ctl_out = controller.step(pose, dt, level_only=not airborne)
                 if done and not land_requested:
                     land_requested = True
