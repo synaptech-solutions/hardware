@@ -70,6 +70,11 @@ class ViconHoverController:
         # velocity feedforward. Zero for a static hover.
         self.vx_tgt = 0.0
         self.vy_tgt = 0.0
+        # Setpoint acceleration (world frame) + the LPF'd body-frame FF tilt state.
+        self.ax_tgt = 0.0
+        self.ay_tgt = 0.0
+        self.aff_fwd_f = 0.0
+        self.aff_lat_f = 0.0
         # Previous commanded heading, for the yaw-rate feedforward (None = no rate
         # yet — first tick after a reset contributes zero FF).
         self.prev_yaw_tgt = None
@@ -82,9 +87,10 @@ class ViconHoverController:
         """Capture the hover setpoint (call once at takeoff) and reset state."""
         self.x_tgt, self.y_tgt, self.z_tgt, self.yaw_tgt = x, y, z, yaw
         self.vx_tgt = self.vy_tgt = 0.0
+        self.ax_tgt = self.ay_tgt = 0.0
         self.reset()
 
-    def set_setpoint(self, x, y, z, yaw, vx=0.0, vy=0.0):
+    def set_setpoint(self, x, y, z, yaw, vx=0.0, vy=0.0, ax=0.0, ay=0.0):
         """Update the target WITHOUT resetting state — for following a moving
         reference (waypoints). Unlike set_target this preserves hover_us (the
         learned hover throttle) and the position integrators, so the altitude
@@ -96,9 +102,16 @@ class ViconHoverController:
         v_target - v_drone, so cruising with the carrot generates no braking tilt;
         without it the drone must trail by KD*v/KP (~1 m at 0.8 m/s) just to
         cancel the phantom brake. Omitting them (static target) keeps the old
-        D-on-measurement behavior exactly."""
+        D-on-measurement behavior exactly.
+
+        (ax, ay): the reference's world-frame ACCELERATION (ramp accel on
+        straights, v²/r centripetal on arcs). Fed forward as the tilt that
+        acceleration physically requires — atan(a/g) — so curves and speed
+        changes cost no standing error either (flight 20260612_160149's −4 cm
+        radius / 8° lag was the feedback manufacturing the inward lean)."""
         self.x_tgt, self.y_tgt, self.z_tgt, self.yaw_tgt = x, y, z, yaw
         self.vx_tgt, self.vy_tgt = vx, vy
+        self.ax_tgt, self.ay_tgt = ax, ay
 
     def reset(self, keep_alt_trim=False):
         """Zero the position integrators. keep_alt_trim preserves the learned
@@ -107,6 +120,7 @@ class ViconHoverController:
         self.pid_fwd.reset()
         self.pid_lat.reset()
         self.pid_yaw.reset()
+        self.aff_fwd_f = self.aff_lat_f = 0.0
         self.prev_yaw_tgt = None
         self.prev_yaw_meas = None
         self.yaw_rate_f = 0.0
@@ -129,12 +143,17 @@ class ViconHoverController:
         v_lat = s * vx - c * vy
         return v_fwd, v_lat
 
-    def _altitude_us(self, z, vz, dt, descent_rate=None):
+    def _altitude_us(self, z, vz, dt, descent_rate=None, tilt_comp=1.0):
         """PI velocity loop. position error → capped target velocity (or a fixed
         descent rate when landing) → velocity error → P (transient) + I. The
         integrator (hover_us) accumulates velocity error into an absolute throttle
         clamped to the HOVER_BAND, so it discovers + tracks true hover. Clean
-        drone-frame signs: alt_err>0 (below target) → climb → +vz."""
+        drone-frame signs: alt_err>0 (below target) → climb → +vz.
+
+        tilt_comp: 1/cos(commanded tilt) — scales the hover term so the VERTICAL
+        thrust component stays constant while tilted (feedforward; the reactive
+        loop alone let altitude dip −22 cm on the 2 m/s laps). Applied OUTSIDE
+        the integrator: hover_us keeps learning LEVEL hover."""
         alt_err = None
         if descent_rate is None:
             alt_err = self.z_tgt - z                      # >0 → below target
@@ -149,11 +168,15 @@ class ViconHoverController:
             self.hover_us = _clamp(
                 self.hover_us + config.KI_UP_US_PER_M * e_v * dt,
                 config.HOVER_BAND_LO_US, config.HOVER_BAND_HI_US)
-        thr_us = _clamp(self.hover_us + thr_p,
+        # Thrust ∝ throttle ABOVE idle, so compensate that span, not the absolute
+        # us (scaling 1352us outright would overcorrect ~4x): +42us at 27° tilt.
+        hover_comp = (channels.IDLE_THR_US
+                      + (self.hover_us - channels.IDLE_THR_US) * tilt_comp)
+        thr_us = _clamp(hover_comp + thr_p,
                         channels.IDLE_THR_US, config.MAX_THROTTLE_US)
         return thr_us, alt_err, v_des, e_v
 
-    def _yaw_us(self, yaw, dt):
+    def _yaw_us(self, yaw, dt, tgt_rate):
         """Heading PID + RATE FEEDFORWARD on the commanded heading.
 
         FF: the mission slews its heading setpoint (never steps), so differencing
@@ -167,13 +190,11 @@ class ViconHoverController:
         clamped I trims residuals (e.g. FF scale error while the heading ramps).
 
         Sign: e > 0 / target rotating CW(-) → yaw RIGHT (us>1500 with
-        SIGN_YAW=+1), so FF enters with the OPPOSITE sign of the target rate."""
+        SIGN_YAW=+1), so FF enters with the OPPOSITE sign of the target rate.
+
+        tgt_rate: rad/s (CCW+) of the commanded heading, computed in step()
+        (shared with the accel-FF lead rotation)."""
         e = _wrap_pi(yaw - self.yaw_tgt)                   # >0 → drone CCW of target
-        tgt_rate = 0.0                                     # rad/s, CCW+
-        if dt > 1e-6 and self.prev_yaw_tgt is not None:
-            tgt_rate = _clamp(_wrap_pi(self.yaw_tgt - self.prev_yaw_tgt) / dt,
-                              -math.pi, math.pi)           # spike guard (rad/s)
-        self.prev_yaw_tgt = self.yaw_tgt
         # Measured yaw rate for the D term (diff + 1-pole LPF; spike-guarded).
         if dt > 1e-6 and self.prev_yaw_meas is not None:
             raw = _clamp(_wrap_pi(yaw - self.prev_yaw_meas) / dt,
@@ -208,10 +229,19 @@ class ViconHoverController:
         Returns channel us + the intermediate quantities for logging.
         """
         x, y, z, yaw = pose["x"], pose["y"], pose["z"], pose["yaw"]
+        # Rate of the commanded heading (rad/s, CCW+): drives the yaw-rate FF and
+        # the accel-FF lead rotation. The mission slews yaw_tgt (never steps), so
+        # the diff is clean; spike-guarded anyway.
+        tgt_yaw_rate = 0.0
+        if dt > 1e-6 and self.prev_yaw_tgt is not None:
+            tgt_yaw_rate = _clamp(_wrap_pi(self.yaw_tgt - self.prev_yaw_tgt) / dt,
+                                  -math.pi, math.pi)
+        self.prev_yaw_tgt = self.yaw_tgt
         if level_only:
             # Lift straight up: no horizontal correction, integrators untouched.
             err_fwd = err_lat = v_fwd = v_lat = tv_fwd = tv_lat = 0.0
             desired_pitch_deg = desired_roll_deg = 0.0
+            self.aff_fwd_f = self.aff_lat_f = 0.0
         else:
             err_fwd, err_lat = self._body_errors(x, y, yaw)
             v_fwd, v_lat = self._body_vel(pose["vx"], pose["vy"], yaw)
@@ -221,17 +251,44 @@ class ViconHoverController:
             # standing lag. For a parked target (v_tgt = 0) this is exactly the
             # old D-on-measurement: still no kick on setpoint position steps.
             tv_fwd, tv_lat = self._body_vel(self.vx_tgt, self.vy_tgt, yaw)
-            desired_pitch_deg = self.pid_fwd.update(err_fwd, dt,
-                                                    derivative=tv_fwd - v_fwd)
-            desired_roll_deg = self.pid_lat.update(err_lat, dt,
-                                                   derivative=tv_lat - v_lat)
+            # ACCELERATION FEEDFORWARD: the tilt the reference's acceleration
+            # physically requires (atan(a/g), horizontal-thrust kinematics),
+            # LPF'd to swallow one-tick spikes. Same body rotation as velocity;
+            # added OUTSIDE the PIDs so the integrators never have to learn it.
+            ta_fwd, ta_lat = self._body_vel(self.ax_tgt, self.ay_tgt, yaw)
+            alpha = min(dt / config.ACCEL_FF_LPF_S, 1.0) if dt > 0.0 else 0.0
+            self.aff_fwd_f += (ta_fwd - self.aff_fwd_f) * alpha
+            self.aff_lat_f += (ta_lat - self.aff_lat_f) * alpha
+            # DRAG FEEDFORWARD: cruising costs ~K_DRAG·v of forward tilt. Ships
+            # WITH the accel FF: without this, the loop manufactures that tilt
+            # from a standing error — phase lag pre-accel-FF, or (worse) a speed
+            # deficit that shrinks curves once the accel FF removes the radial
+            # burden. Uses the REFERENCE velocity (already body-frame as tv_*),
+            # so it's exactly zero in hover/landing.
+            aff_pitch_deg = (math.degrees(math.atan2(self.aff_fwd_f, 9.81))
+                             + config.K_DRAG_DEG_PER_MPS * tv_fwd)
+            aff_roll_deg = (math.degrees(math.atan2(self.aff_lat_f, 9.81))
+                            + config.K_DRAG_DEG_PER_MPS * tv_lat)
+            desired_pitch_deg = aff_pitch_deg + self.pid_fwd.update(
+                err_fwd, dt, derivative=tv_fwd - v_fwd)
+            desired_roll_deg = aff_roll_deg + self.pid_lat.update(
+                err_lat, dt, derivative=tv_lat - v_lat)
 
         pitch_us = self._angle_to_us(desired_pitch_deg, config.SIGN_PITCH)
         roll_us = self._angle_to_us(desired_roll_deg, config.SIGN_ROLL)
 
+        # Tilt compensation from the COMMANDED (clamped) angles — what the FC is
+        # being asked to fly right now; instant, unlike waiting for the dip.
+        pc = math.radians(_clamp(desired_pitch_deg,
+                                 -config.MAX_TILT_DEG, config.MAX_TILT_DEG))
+        rc = math.radians(_clamp(desired_roll_deg,
+                                 -config.MAX_TILT_DEG, config.MAX_TILT_DEG))
+        tilt_comp = min(1.0 / max(math.cos(pc) * math.cos(rc), 1e-3),
+                        config.TILT_COMP_MAX)
+
         thr_us, alt_err, v_des_up, e_v_up = self._altitude_us(
-            z, pose["vz"], dt, descent_rate=descent_rate)
-        yaw_us, e_yaw = self._yaw_us(yaw, dt)
+            z, pose["vz"], dt, descent_rate=descent_rate, tilt_comp=tilt_comp)
+        yaw_us, e_yaw = self._yaw_us(yaw, dt, tgt_yaw_rate)
 
         return {
             "roll_us": int(roll_us),
@@ -243,6 +300,8 @@ class ViconHoverController:
             "err_fwd": err_fwd, "err_lat": err_lat,
             "v_fwd": v_fwd, "v_lat": v_lat,
             "tv_fwd": tv_fwd, "tv_lat": tv_lat,
+            "aff_fwd": self.aff_fwd_f, "aff_lat": self.aff_lat_f,
             "alt_err": alt_err, "v_des_up": v_des_up, "e_v_up": e_v_up,
+            "tilt_comp": tilt_comp,
             "hover_us": self.hover_us, "e_yaw_rad": e_yaw,
         }

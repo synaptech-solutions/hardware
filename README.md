@@ -118,7 +118,7 @@ Each session is its own folder; a `blackbox/` subfolder is auto-created as your 
 ```
 data_logging/recordings/<YYYYMMDD_HHMMSS>/
 ├── blackbox/<flight>.bbl     ← drop the FC blackbox here after landing
-├── commands.csv              outgoing RC frames @50 Hz: all 16 ch + full joystick
+├── commands.csv              outgoing RC frames @TX_HZ (100 Hz): all 16 ch + full joystick
 ├── telemetry.csv             decoded incoming CRSF telemetry (typed, per frame)
 ├── telemetry_raw.csv         every incoming frame as hex (lossless)
 ├── video.mp4                 drone feed

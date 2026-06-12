@@ -57,4 +57,11 @@ DEVICE_INDEX = 4
 WIDTH, HEIGHT = 1280, 720
 
 # --- loop rate ---
-TX_HZ = 50.0
+# 100 Hz (was 50, raised 2026-06-12). Within the link budget: the ELRS link runs
+# 150 Hz over-the-air (rf_mode 24 in flight telemetry, LQ 99-100), the laptop→
+# Ranger CRSF input rate is independent of the OTA rate, and an RC frame is only
+# ~0.62 ms at 420k baud (~6% bus). Vicon delivers ~99 Hz, so at 100 Hz the loop
+# consumes nearly every pose sample instead of every other one. The flight loops
+# pace on absolute deadlines and held 20.00±0.26 ms at 50 Hz with zero overruns —
+# verify the first 100 Hz session's commands.csv dt the same way.
+TX_HZ = 100.0

@@ -144,7 +144,34 @@ KD_LAT_DEG_PER_MPS = 20.0      # 2x (was 8)
 KI_LAT_DEG_PER_M_S = 0.4       # gentle auto-trim
 MAX_LAT_INT_DEG = 10.0         # integral contribution cap
 
-MAX_TILT_DEG = 15.0            # output clamp — real tilt; 15° is plenty (it used ~3°)
+MAX_TILT_DEG = 45.0            # output clamp — raised 15→45 for the 2 m/s circle:
+                               # centripetal alone is atan(v²/(r·g)) = 22.2° at
+                               # 2 m/s / r=1, plus drag FF ~5.5° and PID corrections.
+                               # Still well under the FC angle_limit (60°); 45° =
+                               # 384us of the ±511.5 stick range.
+
+# --- acceleration feedforward (the last rung: position ref → velocity FF → this) ---
+# The mission reports the carrot's acceleration (finite thanks to the trapezoid):
+# the ramp accel on straights, v²/r centripetal on arcs. The controller converts
+# it straight to the tilt that acceleration requires — atan(a/g) — instead of
+# letting feedback squeeze it out of error. Flight 20260612_160149 showed the
+# cost of its absence: −4.3 cm radius + 8° phase lag were the loop's way of
+# generating the ~3.7° inward lean from the D term.
+MAX_FF_ACCEL_MPS2 = 6.0        # cap on the relayed accel (a leash engage zeroes the
+                               # carrot velocity in one tick — don't relay that spike;
+                               # 6 m/s² ≈ 31° would exceed MAX_TILT anyway)
+ACCEL_FF_LPF_S = 0.08          # 1-pole LPF on the body-frame accel FF: swallows
+                               # one-tick spikes, adds only ~0.08 s to the (already
+                               # step-shaped) ramp transitions
+# DRAG feedforward — the partner the accel FF NEEDS. Cruising costs ~K_DRAG·v of
+# forward tilt against air drag; with no FF for it, the loop must generate that
+# tilt from a standing error. Without accel FF it used the tangential/phase-lag
+# channel (radius stayed ≈1); with accel FF alone the loop switches to a SPEED
+# DEFICIT channel instead — the drone runs slower on a smaller circle (sim:
+# r 0.90) — so the two FFs ship together. Tilt += K_DRAG · v_reference (body
+# frame). Value measured from flight 20260612_160149: holding 0.8 m/s took
+# ~2.2° of forward tilt → 2.75 °/(m/s). Refine from future flight logs.
+K_DRAG_DEG_PER_MPS = 2.75
 
 # ============ altitude loop (PI velocity loop, self-learning hover) =============
 # The integrator state (hover_us) IS the hover throttle, in us: it SEEDS at
@@ -154,13 +181,23 @@ MAX_TILT_DEG = 15.0            # output clamp — real tilt; 15° is plenty (it 
 # slow-sink.) Measured hover ≈ 1351-1405us; seeding at 1350 lifts in <1s instead
 # of the ~2.5s slow ramp from the 1300 floor.
 HOVER_BAND_LO_US = 1300        # integrator floor (clamp; lets it trim down if climbing fast)
-HOVER_BAND_HI_US = 1450        # integrator ceiling (clamp; measured hover ~1351-1405)
+HOVER_BAND_HI_US = 1550        # integrator ceiling (clamp; measured hover ~1351-1405)
 HOVER_START_US = 1350          # takeoff SEED for the integrator (near true hover → fast lift)
 MAX_THROTTLE_US = 1700         # hard rail; band ⊂ [IDLE, MAX] so it's never hit
 VMAX_UP_MPS = 0.50             # climb/descend speed cap (was 0.30 — faster takeoff)
 KP_UP = 0.7                    # 1/s: altitude error → target vertical velocity
 KV_UP_US_PER_MPS = 40.0        # P: throttle us per (m/s) of velocity error
 KI_UP_US_PER_M = 85.0          # I: hover-throttle us per (m) of accumulated v-error
+# TILT COMPENSATION feedforward: at tilt θ only cosθ of the thrust points up, so
+# holding altitude needs hover/cosθ of throttle. The reactive PI loop is hover-
+# soft and only responds AFTER altitude error builds — flight 20260612_165231
+# dipped −22 cm (std 8 cm) on the 22-27° laps while throttle sat at ~1352 (NOT
+# band-limited). Fix: scale the hover_us term by 1/(cos(pitch_cmd)·cos(roll_cmd))
+# using the COMMANDED (clamped) tilt — instant, no lag, zero at hover. The
+# integrator still learns LEVEL hover (comp applied outside it), so no transient
+# when the tilt returns to zero.
+TILT_COMP_MAX = 1.5            # cap on the 1/cos factor (1.414 at the 45° clamp;
+                               # guards against pathological cos→0)
 THR_CLIMB_TRIM_US = 100        # max +P correction (climbing) — asymmetric:
 THR_DESC_TRIM_US = 200         # max -P correction (gravity aids descent)
 LAND_SPEED_MPS = 0.25          # commanded descent rate when landing (SPACEBAR / low batt)
@@ -213,9 +250,10 @@ KD_YAW_US_PER_RAD_PER_S = 25.0 # damping: 1 rad/s of error rate → 25 us opposi
 YAW_RATE_LPF_S = 0.10          # 1-pole LPF on the differenced Vicon yaw rate the D
                                # term uses (50 Hz diff of ~0.2° noise ⇒ ~14°/s rate
                                # noise raw — filter before it reaches KD)
-MAX_YAW_US = 150               # was 120: 150us @ 0.587 (°/s)/us = 88°/s authority —
-                               # covers the 46°/s circle + 60°/s pre-rotation + room
-                               # for PID corrections on top of the FF
+MAX_YAW_US = 250               # 250us @ 0.587 (°/s)/us = 147°/s authority — the 2 m/s
+                               # circle needs 114.6°/s sustained (FF = 195us) plus
+                               # room for PID corrections; still well inside the
+                               # linear ±511.5us/300°/s curve
 YAW_DEADBAND_RAD = math.radians(2.0)   # zeroes the error fed to P+I (no twitching at
                                # rest); FF and D always run
 
@@ -239,7 +277,7 @@ CELLS = 1
 # launch yaw throughout (the legs are strafes, not turns). vicon_hover.py ignores all
 # of this (it flies a static HoldMission); only square_flight.py reads these.
 LEG_M = 2.0                    # square side length (forward/right/back/left distance)
-CRUISE_SPEED_MPS = 0.80        # moving-setpoint ("carrot") speed between waypoints —
+CRUISE_SPEED_MPS = 2.0         # moving-setpoint ("carrot") speed between waypoints —
                                # the horizontal analog of VMAX_UP_MPS. (History: pure
                                # D-on-measurement made the drone trail the carrot by
                                # ~KD*v/KP — measured 0.83-0.98 m / 55° of circle phase
@@ -280,6 +318,8 @@ LEASH_M = 1.2                  # the carrot never gets more than this far ahead 
 # held at the launch yaw the whole time (the circle is flown by translating). Reuses
 # CRUISE_SPEED_MPS / LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / INITIAL_HOVER_S.
 CIRCLE_RADIUS_M = 1.0          # circle radius AND the forward approach distance
+CIRCLE_LAPS = 3                # consecutive laps of the circle (one continuous arc —
+                               # no dwells between laps; entry/exit dwells unchanged)
 CIRCLE_CW = False              # True = clockwise viewed from above (the carrot goes
                                # forward-point → right → back → left → forward-point);
                                # False = counter-clockwise. CCW with FACE_TANGENT: the
@@ -296,11 +336,12 @@ CIRCLE_FACE_TANGENT = True     # True: nose follows the direction of travel arou
                                # cruise/radius, rotates back to the launch heading
                                # during the exit dwell). False: old strafing behavior
                                # (heading held at launch yaw for the whole course).
-YAW_SLEW_DPS = 60.0            # yaw-setpoint slew rate: pre-rotations in dwells ramp
+YAW_SLEW_DPS = 130.0           # yaw-setpoint slew rate: pre-rotations in dwells ramp
                                # the heading target at this rate (no 90° step → no
                                # saturated yaw command), and it caps tangent-following.
                                # MUST exceed the circle's yaw rate ω = cruise/radius
-                               # (46°/s at 0.8 m/s, r=1.0) or the heading ref lags.
+                               # (114.6°/s at 2 m/s, r=1.0) or the heading ref lags.
+                               # 130°/s FF = 222us, inside MAX_YAW_US.
 YAW_ARRIVE_TOL_DEG = 5.0       # a dwell with a heading target waits (same arrive_
                                # timeout backstop) until the drone's heading is within
                                # this of the target before its countdown starts — the

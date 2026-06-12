@@ -452,8 +452,9 @@ def run(args, make_mission=None):
                 # set_setpoint keeps the learned hover throttle + integrators
                 # (set_target would wipe them). done → land via the SAME path as
                 # SPACEBAR.
-                tx, ty, tz, tyaw, tvx, tvy, done = mission.update(pose, dt, airborne)
-                controller.set_setpoint(tx, ty, tz, tyaw, tvx, tvy)
+                (tx, ty, tz, tyaw, tvx, tvy,
+                 tax, tay, done) = mission.update(pose, dt, airborne)
+                controller.set_setpoint(tx, ty, tz, tyaw, tvx, tvy, tax, tay)
                 ctl_out = controller.step(pose, dt, level_only=not airborne)
                 if done and not land_requested:
                     land_requested = True

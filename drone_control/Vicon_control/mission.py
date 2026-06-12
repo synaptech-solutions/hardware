@@ -64,6 +64,24 @@ def _carrot_vel(px, py, cx, cy, dt, vmax):
     return vx, vy
 
 
+def _carrot_acc(pvx, pvy, vx, vy, dt):
+    """Carrot acceleration this tick: diff of the (already clamped) velocity.
+    With the trapezoid this is the ramp accel on straights plus the centripetal
+    v²/r on arcs — the signals the ACCELERATION FEEDFORWARD turns directly into
+    tilt. Clamped to MAX_FF_ACCEL_MPS2 because a leash engage zeroes the
+    velocity in one tick (a real but instant -v/dt spike the FF shouldn't
+    relay); the controller LPFs it as well."""
+    if dt <= 1e-6:
+        return 0.0, 0.0
+    ax, ay = (vx - pvx) / dt, (vy - pvy) / dt
+    mag = math.hypot(ax, ay)
+    amax = config.MAX_FF_ACCEL_MPS2
+    if mag > amax > 0.0:
+        k = amax / mag
+        ax, ay = ax * k, ay * k
+    return ax, ay
+
+
 # ----------------------------------------------------------------------------- #
 class HoldMission:
     """Static hover at the launch x/y/heading, CLIMB_M above launch altitude.
@@ -75,7 +93,7 @@ class HoldMission:
 
     def update(self, pose, dt, airborne):
         x, y, z, yaw = self._t
-        return x, y, z, yaw, 0.0, 0.0, False
+        return x, y, z, yaw, 0.0, 0.0, 0.0, 0.0, False
 
     def status(self):
         return "hold"
@@ -125,6 +143,7 @@ class WaypointMission:
         self.idx = 0
         self.sx, self.sy = launch[0], launch[1]
         self.v = 0.0               # carrot speed (trapezoid state)
+        self.svx, self.svy = 0.0, 0.0   # last reported carrot velocity (for accel)
         self.phase = "GOTO"
         self.t_in_phase = 0.0
         self.dwell_elapsed = 0.0
@@ -183,7 +202,9 @@ class WaypointMission:
                     else:
                         self.done = True
         svx, svy = _carrot_vel(px, py, self.sx, self.sy, dt, self.cruise)
-        return self.sx, self.sy, wz, wyaw, svx, svy, self.done
+        sax, say = _carrot_acc(self.svx, self.svy, svx, svy, dt)
+        self.svx, self.svy = svx, svy
+        return self.sx, self.sy, wz, wyaw, svx, svy, sax, say, self.done
 
     def status(self):
         if self.done:
@@ -365,6 +386,7 @@ class PathMission:
         self.i = 0                 # current segment index
         self.s = 0.0               # arc length into the current move
         self.v = 0.0               # carrot speed (trapezoid state)
+        self.svx, self.svy = 0.0, 0.0   # last reported carrot velocity (for accel)
         self.cx, self.cy = launch[0], launch[1]   # carrot (starts at launch x/y)
         self.dwell_elapsed = 0.0
         self.t_in_seg = 0.0
@@ -400,7 +422,7 @@ class PathMission:
     def update(self, pose, dt, airborne):
         if self.done or self.i >= len(self.segs):
             self.done = True
-            return self.cx, self.cy, self.z, self.yaw_sp, 0.0, 0.0, True
+            return self.cx, self.cy, self.z, self.yaw_sp, 0.0, 0.0, 0.0, 0.0, True
         seg = self.segs[self.i]
         px, py = self.cx, self.cy
         self.t_in_seg += dt
@@ -438,7 +460,9 @@ class PathMission:
             if self.s >= seg["len"] - 1e-9:
                 self._next_seg()
         svx, svy = _carrot_vel(px, py, self.cx, self.cy, dt, self.cruise)
-        return self.cx, self.cy, self.z, self.yaw_sp, svx, svy, self.done
+        sax, say = _carrot_acc(self.svx, self.svy, svx, svy, dt)
+        self.svx, self.svy = svx, svy
+        return self.cx, self.cy, self.z, self.yaw_sp, svx, svy, sax, say, self.done
 
     def _yaw_label(self, seg):
         if seg["yaw"] is None:
@@ -522,8 +546,12 @@ def build_circle_mission(launch):
     center = (x0, y0)                        # circle centered on the launch origin
     th0 = math.atan2(start[1] - center[1], start[0] - center[0])
     # CW (viewed from above) = negative sweep; CCW = positive (world yaw is CCW+).
-    dtheta = (-2.0 * math.pi) if config.CIRCLE_CW else (2.0 * math.pi)
-    arc = _arc_seg(center, r, th0, dtheta, "circle",
+    # CIRCLE_LAPS consecutive laps = one continuous arc (the trapezoid ramps once
+    # at the start and once at the end; the laps in between are constant-speed).
+    laps = max(1, int(config.CIRCLE_LAPS))
+    sweep = 2.0 * math.pi * laps
+    dtheta = -sweep if config.CIRCLE_CW else sweep
+    arc = _arc_seg(center, r, th0, dtheta, f"circle x{laps}",
                    yaw=("tangent" if config.CIRCLE_FACE_TANGENT else None))
     # Entry/exit headings for the pre-/de-rotation dwells (None = keep current).
     yaw_entry = arc["heading"](0.0) if config.CIRCLE_FACE_TANGENT else None
