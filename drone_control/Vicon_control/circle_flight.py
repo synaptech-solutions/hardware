@@ -4,19 +4,23 @@
 Built on vicon_hover.py exactly like square_flight.py — SAME arming, controller,
 recording, status line and failsafes — it just feeds the shared flight loop a
 PathMission (a carrot that FLOWS along a line+arc+line path) instead of a static
-hover. The course (relative to the LAUNCH pose; you start at the origin, nose +Y),
-heading HELD at the launch yaw throughout:
+hover. The course (relative to the LAUNCH pose; you start at the origin, nose +Y):
   1. climb to config.CLIMB_M and hover config.INITIAL_HOVER_S
   2. fly forward config.CIRCLE_RADIUS_M to the circle (centred on the launch origin),
-     settle config.SETTLE_S
+     settle config.SETTLE_S — and (CIRCLE_FACE_TANGENT) pre-rotate the nose to the
+     circle's first tangent direction; the dwell WAITS for the nose to get there
   3. trace ONE FULL CIRCLE of radius config.CIRCLE_RADIUS_M, direction config.CIRCLE_CW
-     (True = clockwise from above), at config.CRUISE_SPEED_MPS
-  4. return to the origin, settle config.SETTLE_S
+     (True = clockwise from above), at config.CRUISE_SPEED_MPS — nose following the
+     direction of travel (or strafing at the launch yaw if CIRCLE_FACE_TANGENT=False)
+  4. settle config.SETTLE_S at the exit (closes the lap; rotates back to the launch
+     heading), return to the origin, settle config.SETTLE_S
   5. land → cut → disarm → save → exit
-All tunables (CIRCLE_RADIUS_M, CIRCLE_CW, CRUISE_SPEED_MPS, SETTLE_S, …) live in
-config.py. The setpoint is a continuous crawling carrot, so the circle is smooth;
-the drone trails it ~0.3 m at 0.4 m/s (so it flies a slightly smaller, phase-lagged
-circle — fine for now, tighten later with velocity feedforward).
+All tunables (CIRCLE_RADIUS_M, CIRCLE_CW, CRUISE_SPEED_MPS, SETTLE_S,
+CARROT_ACCEL_MPS2, CIRCLE_FACE_TANGENT, YAW_SLEW_DPS, …) live in config.py. The
+setpoint is a continuous crawling carrot with a trapezoidal speed profile (ramps at
+CARROT_ACCEL_MPS2, arrives at segment ends at zero speed) and the controller gets
+the carrot's velocity as feedforward, so the drone rides the path within ~0.2 m
+with no tilt-clamp punches at segment transitions.
 
 SPACEBAR / disarm / low batt / Vicon loss abort to a controlled landing at any
 point, exactly as in vicon_hover. Arm + record triggers are identical.

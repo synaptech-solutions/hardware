@@ -2,7 +2,7 @@
 
   Position (world→body) → desired pitch/roll angle (deg)   ─┐
   Altitude (PI velocity loop; integral learns hover throttle)├─► CRSF us → FC (Angle mode)
-  Yaw      (P on absolute heading error, drift-free Vicon)  ─┘
+  Yaw      (heading PID + rate FF, drift-free Vicon yaw)    ─┘
 
 The FC is in Angle mode, so it interprets roll/pitch us as TARGET ANGLES; we
 convert our desired angles to us via config.STICK_US_PER_DEG and the FC's attitude
@@ -51,6 +51,14 @@ class ViconHoverController:
                            kd=config.KD_FWD_DEG_PER_MPS, i_clamp=kf_clamp)
         self.pid_lat = PID(kp=config.KP_LAT_DEG_PER_M, ki=kl,
                            kd=config.KD_LAT_DEG_PER_MPS, i_clamp=kl_clamp)
+        # Heading PID (us out) — the yaw-rate FF is added outside it in _yaw_us.
+        # The class deadband zeroes the error fed to P+I (no twitch at rest) while
+        # the D term (externally supplied derivative) still damps.
+        ky = config.KI_YAW_US_PER_RAD_S
+        ky_clamp = (config.MAX_YAW_I_US / ky) if ky > 1e-9 else None
+        self.pid_yaw = PID(kp=config.KP_YAW_US_PER_RAD, ki=ky,
+                           kd=config.KD_YAW_US_PER_RAD_PER_S, i_clamp=ky_clamp,
+                           deadband=config.YAW_DEADBAND_RAD)
         # hover_us IS the altitude integrator state, carried as absolute throttle.
         # Seeds near true hover (HOVER_START_US) so takeoff is quick.
         self.hover_us = float(config.HOVER_START_US)
@@ -62,6 +70,13 @@ class ViconHoverController:
         # velocity feedforward. Zero for a static hover.
         self.vx_tgt = 0.0
         self.vy_tgt = 0.0
+        # Previous commanded heading, for the yaw-rate feedforward (None = no rate
+        # yet — first tick after a reset contributes zero FF).
+        self.prev_yaw_tgt = None
+        # Measured-yaw-rate state for the heading D term: previous Vicon yaw and
+        # the low-pass-filtered rate (differencing 50 Hz yaw is noisy raw).
+        self.prev_yaw_meas = None
+        self.yaw_rate_f = 0.0
 
     def set_target(self, x, y, z, yaw):
         """Capture the hover setpoint (call once at takeoff) and reset state."""
@@ -91,6 +106,10 @@ class ViconHoverController:
         re-seeds it to HOVER_START_US so takeoff lifts quickly."""
         self.pid_fwd.reset()
         self.pid_lat.reset()
+        self.pid_yaw.reset()
+        self.prev_yaw_tgt = None
+        self.prev_yaw_meas = None
+        self.yaw_rate_f = 0.0
         if not keep_alt_trim:
             self.hover_us = float(config.HOVER_START_US)
 
@@ -134,14 +153,41 @@ class ViconHoverController:
                         channels.IDLE_THR_US, config.MAX_THROTTLE_US)
         return thr_us, alt_err, v_des, e_v
 
-    def _yaw_us(self, yaw):
-        """P on absolute heading error with deadband. Vicon yaw is drift-free, so
-        we hold the captured heading directly."""
+    def _yaw_us(self, yaw, dt):
+        """Heading PID + RATE FEEDFORWARD on the commanded heading.
+
+        FF: the mission slews its heading setpoint (never steps), so differencing
+        yaw_tgt across ticks gives a clean rate; the FF converts it to us via the
+        FC's LINEAR yaw curve (config.YAW_LINEAR_MAX_DPS — see the paired
+        Betaflight change) so holding a moving heading costs zero standing error.
+
+        PID around it: P on the (deadbanded) error; D on the MEASURED yaw rate
+        (differenced Vicon yaw, low-passed) minus the target rate — i.e. true
+        d(err)/dt with no setpoint kick — damps the transport+FC lag; small
+        clamped I trims residuals (e.g. FF scale error while the heading ramps).
+
+        Sign: e > 0 / target rotating CW(-) → yaw RIGHT (us>1500 with
+        SIGN_YAW=+1), so FF enters with the OPPOSITE sign of the target rate."""
         e = _wrap_pi(yaw - self.yaw_tgt)                   # >0 → drone CCW of target
-        if abs(e) < config.YAW_DEADBAND_RAD:
+        tgt_rate = 0.0                                     # rad/s, CCW+
+        if dt > 1e-6 and self.prev_yaw_tgt is not None:
+            tgt_rate = _clamp(_wrap_pi(self.yaw_tgt - self.prev_yaw_tgt) / dt,
+                              -math.pi, math.pi)           # spike guard (rad/s)
+        self.prev_yaw_tgt = self.yaw_tgt
+        # Measured yaw rate for the D term (diff + 1-pole LPF; spike-guarded).
+        if dt > 1e-6 and self.prev_yaw_meas is not None:
+            raw = _clamp(_wrap_pi(yaw - self.prev_yaw_meas) / dt,
+                         -2.0 * math.pi, 2.0 * math.pi)
+            alpha = min(dt / config.YAW_RATE_LPF_S, 1.0)
+            self.yaw_rate_f += (raw - self.yaw_rate_f) * alpha
+        self.prev_yaw_meas = yaw
+        # d(err)/dt = d(yaw - yaw_tgt)/dt = yaw_rate - tgt_rate (both CCW+).
+        u_pid = self.pid_yaw.update(e, dt,
+                                    derivative=self.yaw_rate_f - tgt_rate)
+        u_ff = -config.YAW_FF_US_PER_DPS * math.degrees(tgt_rate)
+        u = _clamp(u_pid + u_ff, -config.MAX_YAW_US, config.MAX_YAW_US)
+        if u == 0.0:
             return channels.NEUTRAL_US, e
-        u = _clamp(config.KP_YAW_US_PER_RAD * e,
-                   -config.MAX_YAW_US, config.MAX_YAW_US)
         return int(round(channels.NEUTRAL_US + config.SIGN_YAW * u)), e
 
     def _angle_to_us(self, deg, sign):
@@ -185,7 +231,7 @@ class ViconHoverController:
 
         thr_us, alt_err, v_des_up, e_v_up = self._altitude_us(
             z, pose["vz"], dt, descent_rate=descent_rate)
-        yaw_us, e_yaw = self._yaw_us(yaw)
+        yaw_us, e_yaw = self._yaw_us(yaw, dt)
 
         return {
             "roll_us": int(roll_us),

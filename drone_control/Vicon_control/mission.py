@@ -119,29 +119,40 @@ class WaypointMission:
         self.leash = float(leash_m)
         self.arrive_tol = float(arrive_tol_m)
         self.arrive_timeout = float(arrive_timeout_s)
+        self.accel = float(config.CARROT_ACCEL_MPS2)
         # The carrot starts on the first waypoint (== the launch hover); index 0
         # is that takeoff/hover point, so its GOTO is just the vertical climb.
         self.idx = 0
         self.sx, self.sy = launch[0], launch[1]
+        self.v = 0.0               # carrot speed (trapezoid state)
         self.phase = "GOTO"
         self.t_in_phase = 0.0
         self.dwell_elapsed = 0.0
         self.done = False
 
     def _advance_carrot(self, wx, wy, pose, dt):
-        """Crawl the carrot toward (wx, wy) at cruise speed, leashed to the drone."""
+        """Crawl the carrot toward (wx, wy), leashed to the drone. Trapezoid speed:
+        accelerate at `accel`, capped by cruise AND by the braking parabola
+        sqrt(2*a*dist) so the carrot arrives at the waypoint with zero speed (the
+        old instant 0↔cruise steps slammed the velocity feedforward into the tilt
+        clamp at every leg transition — flight 20260612_132718)."""
         dx, dy = wx - self.sx, wy - self.sy
         dist = math.hypot(dx, dy)
         if dist < 1e-9:
+            self.v = 0.0
             return
-        step = min(self.cruise * dt, dist)        # never overshoot the waypoint
+        v_next = min(self.cruise, self.v + self.accel * dt,
+                     math.sqrt(2.0 * self.accel * dist))
+        step = min(v_next * dt, dist)             # never overshoot the waypoint
         ux, uy = dx / dist, dy / dist
         nx, ny = self.sx + ux * step, self.sy + uy * step
         # Leash: if advancing would put the carrot more than leash_m from the
         # drone, pause it this tick and let the drone catch up (bounds the error).
         if self.leash > 0.0 and math.hypot(nx - pose["x"], ny - pose["y"]) > self.leash:
+            self.v = 0.0                          # paused → re-ramp on release
             return
         self.sx, self.sy = nx, ny
+        self.v = v_next
 
     def update(self, pose, dt, airborne):
         """One tick. Returns (x, y, z, yaw, svx, svy, done): the (x, y) is the
@@ -163,6 +174,7 @@ class WaypointMission:
                     self.phase, self.dwell_elapsed = "HOLD", 0.0
             elif self.phase == "HOLD":
                 self.sx, self.sy = wx, wy          # park the carrot on the vertex
+                self.v = 0.0
                 self.dwell_elapsed += dt
                 if self.dwell_elapsed >= dwell:
                     if self.idx + 1 < len(self.wps):
@@ -241,9 +253,24 @@ def build_square_mission(launch):
 # Path segments for PathMission. A "move" segment is parametrized by ARC LENGTH s
 # (so the carrot keeps a constant ground speed on straights AND curves); a "dwell"
 # holds a point for a duration (the carrot waits there).
-def _line_seg(p0, p1, label):
+#
+# Heading (`yaw` key): move segs take None (hold the current heading target) or
+# "tangent" (nose follows the direction of travel — `heading`(s) gives the world
+# heading of the path tangent at arc length s). Dwell segs take None or a fixed
+# heading (rad) to rotate to during the dwell; the rotation is SLEWED (no step)
+# and the dwell countdown waits for the drone's nose to actually get there.
+def _wrap_pi(rad):
+    while rad > math.pi:
+        rad -= 2.0 * math.pi
+    while rad < -math.pi:
+        rad += 2.0 * math.pi
+    return rad
+
+
+def _line_seg(p0, p1, label, yaw=None):
     dx, dy = p1[0] - p0[0], p1[1] - p0[1]
     length = math.hypot(dx, dy)
+    hdg = math.atan2(dy, dx)
 
     def at(s):
         if length < 1e-9:
@@ -251,10 +278,11 @@ def _line_seg(p0, p1, label):
         f = s / length
         return (p0[0] + dx * f, p0[1] + dy * f)
 
-    return {"type": "move", "at": at, "len": length, "label": label}
+    return {"type": "move", "at": at, "len": length, "label": label,
+            "yaw": yaw, "heading": lambda s: hdg}
 
 
-def _arc_seg(center, radius, theta0, dtheta, label):
+def _arc_seg(center, radius, theta0, dtheta, label, yaw=None):
     """Arc of `radius` about `center`, from angle theta0 sweeping dtheta (signed;
     negative = clockwise viewed from above, since world yaw is CCW-positive about
     +Z and the bird's-eye view looks down -Z). Length = radius*|dtheta|."""
@@ -266,11 +294,18 @@ def _arc_seg(center, radius, theta0, dtheta, label):
         return (center[0] + radius * math.cos(th),
                 center[1] + radius * math.sin(th))
 
-    return {"type": "move", "at": at, "len": length, "label": label}
+    def heading(s):
+        # d(at)/ds = sgn*(-sin th, cos th): the travel direction along the arc.
+        th = theta0 + sgn * (s / radius)
+        return math.atan2(sgn * math.cos(th), -sgn * math.sin(th))
+
+    return {"type": "move", "at": at, "len": length, "label": label,
+            "yaw": yaw, "heading": heading}
 
 
-def _dwell_seg(point, dur, label):
-    return {"type": "dwell", "point": (point[0], point[1]), "dur": dur, "label": label}
+def _dwell_seg(point, dur, label, yaw=None):
+    return {"type": "dwell", "point": (point[0], point[1]), "dur": dur,
+            "label": label, "yaw": yaw}
 
 
 class PathMission:
@@ -278,8 +313,9 @@ class PathMission:
     path (line + arc segments) at `cruise` m/s — leashed to the drone exactly like
     WaypointMission — with optional dwells. Unlike WaypointMission (stop-and-settle
     at each vertex) the carrot FLOWS through move segments without waiting for the
-    drone, so curves are smooth; z + yaw are held (config.CLIMB_M above launch, at
-    the launch heading). A `dwell` waits for the drone to arrive (within arrive_tol,
+    drone, so curves are smooth; z is held at config.CLIMB_M above launch, and the
+    heading follows each segment's yaw spec (see HEADING below; default = hold the
+    launch heading). A `dwell` waits for the drone to arrive (within arrive_tol,
     or arrive_timeout) before counting down, so the takeoff hover and the final
     home-settle still gate on the drone actually being there.
 
@@ -289,21 +325,46 @@ class PathMission:
     carrot moved on). Fixed by the velocity feedforward: update() now also
     returns the carrot velocity and the controller's D term acts on
     (v_carrot - v_drone), so pacing the carrot no longer generates braking tilt.
+
+    SPEED PROFILE (after flight 20260612_132718): the carrot's speed is a
+    TRAPEZOID, not a step — it accelerates at `accel` from rest and brakes to
+    arrive at every move-segment end with ZERO speed (brake point at v²/2a from
+    the end). The old instant 0↔cruise steps made the velocity feedforward slam
+    the tilt command into the MAX_TILT clamp at every segment transition and the
+    drone overspeed to 1.4 m/s catching up. A leash pause zeroes the carrot
+    speed (it re-ramps when released). NOTE: a move that chains directly into
+    another move still brakes to zero between them — insert dwells (as the
+    circle course does) or extend this if a future course needs flowing joints.
+
+    HEADING: `self.yaw_sp` is the commanded heading, slewed at `yaw_slew` rad/s
+    (never stepped, so the yaw P loop is never kicked). Move segs with
+    yaw="tangent" track the path's travel direction; dwell segs with a fixed
+    heading rotate to it and their countdown additionally WAITS until the
+    drone's nose is within `yaw_tol` of the target (same arrive_timeout
+    backstop), so e.g. the circle can't start until the pre-rotation finished.
     """
 
     def __init__(self, launch, segments, *, cruise_mps, leash_m,
-                 arrive_tol_m, arrive_timeout_s):
+                 arrive_tol_m, arrive_timeout_s, accel_mps2=None,
+                 yaw_slew_dps=None, yaw_tol_deg=None):
         if not segments:
             raise ValueError("PathMission needs at least one segment")
         self.segs = list(segments)
         self.z = launch[2] + config.CLIMB_M
-        self.yaw = launch[3]
+        self.yaw_sp = launch[3]    # commanded heading (slewed, never stepped)
         self.cruise = float(cruise_mps)
         self.leash = float(leash_m)
         self.arrive_tol = float(arrive_tol_m)
         self.arrive_timeout = float(arrive_timeout_s)
+        self.accel = float(accel_mps2 if accel_mps2 is not None
+                           else config.CARROT_ACCEL_MPS2)
+        self.yaw_slew = math.radians(yaw_slew_dps if yaw_slew_dps is not None
+                                     else config.YAW_SLEW_DPS)
+        self.yaw_tol = math.radians(yaw_tol_deg if yaw_tol_deg is not None
+                                    else config.YAW_ARRIVE_TOL_DEG)
         self.i = 0                 # current segment index
         self.s = 0.0               # arc length into the current move
+        self.v = 0.0               # carrot speed (trapezoid state)
         self.cx, self.cy = launch[0], launch[1]   # carrot (starts at launch x/y)
         self.dwell_elapsed = 0.0
         self.t_in_seg = 0.0
@@ -313,76 +374,129 @@ class PathMission:
         return (math.hypot(px - pose["x"], py - pose["y"]) < self.arrive_tol
                 and abs(self.z - pose["z"]) < self.arrive_tol)
 
+    def _slew_yaw(self, target, dt):
+        """Move the commanded heading toward `target` (shortest way), rate-capped."""
+        if target is None:
+            return
+        err = _wrap_pi(target - self.yaw_sp)
+        step = max(-self.yaw_slew * dt, min(self.yaw_slew * dt, err))
+        self.yaw_sp = _wrap_pi(self.yaw_sp + step)
+
+    def _yaw_arrived(self, pose, target):
+        """Heading setpoint finished slewing AND the drone's nose followed it."""
+        if target is None:
+            return True
+        if abs(_wrap_pi(target - self.yaw_sp)) > 1e-3:
+            return False
+        pyaw = pose.get("yaw")
+        return pyaw is None or abs(_wrap_pi(pyaw - target)) < self.yaw_tol
+
     def _next_seg(self):
         self.i += 1
-        self.s = self.dwell_elapsed = self.t_in_seg = 0.0
+        self.s = self.v = self.dwell_elapsed = self.t_in_seg = 0.0
         if self.i >= len(self.segs):
             self.done = True
 
     def update(self, pose, dt, airborne):
         if self.done or self.i >= len(self.segs):
             self.done = True
-            return self.cx, self.cy, self.z, self.yaw, 0.0, 0.0, True
+            return self.cx, self.cy, self.z, self.yaw_sp, 0.0, 0.0, True
         seg = self.segs[self.i]
         px, py = self.cx, self.cy
         self.t_in_seg += dt
         if seg["type"] == "dwell":
             self.cx, self.cy = seg["point"]
-            # Start counting only once the drone is here (or the timeout backstop).
-            if (self.dwell_elapsed > 0.0 or self._drone_close(pose, self.cx, self.cy)
+            self._slew_yaw(seg["yaw"], dt)
+            # Start counting once the drone is here AND facing the dwell's heading
+            # (if it has one) — or the timeout backstop.
+            if (self.dwell_elapsed > 0.0
+                    or (self._drone_close(pose, self.cx, self.cy)
+                        and self._yaw_arrived(pose, seg["yaw"]))
                     or self.t_in_seg > self.arrive_timeout):
                 self.dwell_elapsed += dt
             if self.dwell_elapsed >= seg["dur"]:
                 self._next_seg()
-        else:  # move — flow the carrot along the path at cruise, leashed
+        else:  # move — flow the carrot along the path, trapezoid speed, leashed
             if airborne:
-                ns = min(self.s + self.cruise * dt, seg["len"])
+                # Speed up at `accel`, capped by cruise AND by the braking
+                # parabola sqrt(2*a*remaining) so it reaches the end at v=0.
+                remaining = max(seg["len"] - self.s, 0.0)
+                v_next = min(self.cruise, self.v + self.accel * dt,
+                             math.sqrt(2.0 * self.accel * remaining))
+                ns = min(self.s + v_next * dt, seg["len"])
                 nx, ny = seg["at"](ns)
-                if not (self.leash > 0.0
+                if (self.leash > 0.0
                         and math.hypot(nx - pose["x"], ny - pose["y"]) > self.leash):
-                    self.s = ns
+                    self.v = 0.0          # paused by the leash → re-ramp on release
+                else:
+                    self.s, self.v = ns, v_next
             self.cx, self.cy = seg["at"](self.s)
+            if seg["yaw"] == "tangent":
+                self._slew_yaw(seg["heading"](self.s), dt)
+            else:
+                self._slew_yaw(seg["yaw"], dt)
             if self.s >= seg["len"] - 1e-9:
                 self._next_seg()
         svx, svy = _carrot_vel(px, py, self.cx, self.cy, dt, self.cruise)
-        return self.cx, self.cy, self.z, self.yaw, svx, svy, self.done
+        return self.cx, self.cy, self.z, self.yaw_sp, svx, svy, self.done
+
+    def _yaw_label(self, seg):
+        if seg["yaw"] is None:
+            return "yaw hold"
+        if seg["yaw"] == "tangent":
+            return "yaw tangent"
+        return f"yaw→{math.degrees(seg['yaw']):+.0f}°"
 
     def status(self):
         if self.done or self.i >= len(self.segs):
             return "MISSION done"
         seg = self.segs[self.i]
         if seg["type"] == "dwell":
-            return f"{seg['label']} {self.dwell_elapsed:.1f}/{seg['dur']:.0f}s"
+            base = f"{seg['label']} {self.dwell_elapsed:.1f}/{seg['dur']:.0f}s"
+            if seg["yaw"] is not None and self.dwell_elapsed == 0.0:
+                base += f" (rotating {math.degrees(self.yaw_sp):+.0f}°" \
+                        f"→{math.degrees(seg['yaw']):+.0f}°)"
+            return base
         pct = 100.0 * self.s / seg["len"] if seg["len"] > 1e-9 else 100.0
-        return f"{seg['label']} {pct:3.0f}%"
+        return f"{seg['label']} {pct:3.0f}% v={self.v:.2f}"
 
     def describe(self):
         lines = [f"  Mission: path follow ({len(self.segs)} segments, "
-                 f"cruise {self.cruise:.2f} m/s, leash {self.leash:.2f} m) "
-                 f"at z={self.z:+.2f} yaw={math.degrees(self.yaw):+.0f}°:"]
+                 f"cruise {self.cruise:.2f} m/s, accel {self.accel:.2f} m/s², "
+                 f"leash {self.leash:.2f} m, yaw slew "
+                 f"{math.degrees(self.yaw_slew):.0f}°/s) at z={self.z:+.2f}, "
+                 f"launch yaw={math.degrees(self.yaw_sp):+.0f}°:"]
         for k, seg in enumerate(self.segs):
             if seg["type"] == "dwell":
                 lines.append(f"    [{k}] dwell {seg['label']:11s} "
                              f"at ({seg['point'][0]:+.2f},{seg['point'][1]:+.2f}) "
-                             f"for {seg['dur']:.0f}s")
+                             f"for {seg['dur']:.0f}s  [{self._yaw_label(seg)}]")
             else:
                 end = seg["at"](seg["len"])
                 lines.append(f"    [{k}] move  {seg['label']:11s} "
-                             f"len={seg['len']:.2f}m → ({end[0]:+.2f},{end[1]:+.2f})")
+                             f"len={seg['len']:.2f}m → ({end[0]:+.2f},{end[1]:+.2f})"
+                             f"  [{self._yaw_label(seg)}]")
         return lines
 
     def summary(self):
         segs = []
         for seg in self.segs:
+            yaw_spec = (seg["yaw"] if seg["yaw"] in (None, "tangent")
+                        else math.degrees(seg["yaw"]))
             if seg["type"] == "dwell":
                 segs.append({"type": "dwell", "label": seg["label"],
-                             "point": list(seg["point"]), "dwell_s": seg["dur"]})
+                             "point": list(seg["point"]), "dwell_s": seg["dur"],
+                             "yaw": yaw_spec})
             else:
                 end = seg["at"](seg["len"])
                 segs.append({"type": "move", "label": seg["label"],
-                             "len_m": seg["len"], "end": list(end)})
-        return {"kind": "path", "cruise_mps": self.cruise, "leash_m": self.leash,
-                "arrive_tol_m": self.arrive_tol, "z": self.z, "yaw_rad": self.yaw,
+                             "len_m": seg["len"], "end": list(end),
+                             "yaw": yaw_spec})
+        return {"kind": "path", "cruise_mps": self.cruise,
+                "accel_mps2": self.accel, "leash_m": self.leash,
+                "arrive_tol_m": self.arrive_tol, "z": self.z,
+                "launch_yaw_rad": self.yaw_sp,
+                "yaw_slew_dps": math.degrees(self.yaw_slew),
                 "segments": segs}
 
 
@@ -391,8 +505,14 @@ def build_circle_mission(launch):
     """Build the circle course from config: take off + hover, fly forward
     CIRCLE_RADIUS_M to the circle (centered on the launch origin, so the forward
     point lands exactly on it), trace one full circle (CIRCLE_CW), return to the
-    origin, settle, and land. Heading is held at the launch yaw throughout (the
-    circle is flown by translating, not turning)."""
+    origin, settle, and land.
+
+    Heading: with CIRCLE_FACE_TANGENT the nose follows the direction of travel
+    around the circle — the entry dwell pre-rotates to the first tangent (90° to
+    the right of the launch heading for CW) and GATES on the nose getting there,
+    so the lap never starts with a standing yaw error; the exit dwell rotates
+    back to the launch heading before the (strafed) return leg. With the flag
+    off, the whole course strafes at the launch yaw like before."""
     x0, y0, z0, yaw0 = launch
     c, s = math.cos(yaw0), math.sin(yaw0)
     r = config.CIRCLE_RADIUS_M
@@ -403,15 +523,21 @@ def build_circle_mission(launch):
     th0 = math.atan2(start[1] - center[1], start[0] - center[0])
     # CW (viewed from above) = negative sweep; CCW = positive (world yaw is CCW+).
     dtheta = (-2.0 * math.pi) if config.CIRCLE_CW else (2.0 * math.pi)
+    arc = _arc_seg(center, r, th0, dtheta, "circle",
+                   yaw=("tangent" if config.CIRCLE_FACE_TANGENT else None))
+    # Entry/exit headings for the pre-/de-rotation dwells (None = keep current).
+    yaw_entry = arc["heading"](0.0) if config.CIRCLE_FACE_TANGENT else None
+    yaw_exit = yaw0 if config.CIRCLE_FACE_TANGENT else None
     segs = [
         _dwell_seg((x0, y0), config.INITIAL_HOVER_S, "takeoff/hover"),
         _line_seg((x0, y0), start, "forward"),
-        _dwell_seg(start, config.SETTLE_S, "circle-entry"),
-        _arc_seg(center, r, th0, dtheta, "circle"),
+        _dwell_seg(start, config.SETTLE_S, "circle-entry", yaw=yaw_entry),
+        arc,
         # Exit dwell: dwells gate on the DRONE arriving (arrive_tol/timeout), so
         # any phase lag closes the lap here instead of being cut off when the
         # carrot heads home (flight 20260612_121316 lost the last 60° to this).
-        _dwell_seg(start, config.SETTLE_S, "circle-exit"),
+        # Also rotates the nose back to the launch heading before heading home.
+        _dwell_seg(start, config.SETTLE_S, "circle-exit", yaw=yaw_exit),
         _line_seg(start, (x0, y0), "return"),
         _dwell_seg((x0, y0), config.SETTLE_S, "home/settle"),
     ]

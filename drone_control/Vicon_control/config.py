@@ -3,7 +3,7 @@
 Architecture (FC in Angle mode → inner attitude loop in firmware):
   Position (world→body)  : body fwd/lat error (m) → desired pitch/roll angle (deg)
   Altitude (PI velocity)  : the integrator IS the learned hover throttle → us
-  Yaw                     : P on ABSOLUTE heading error (Vicon yaw, drift-free) → us
+  Yaw                     : heading PID + rate FF (ABSOLUTE Vicon yaw, drift-free) → us
 
 Desired angles → CRSF us via the FC Angle-mode stick scaling (STICK_US_PER_DEG).
 
@@ -20,14 +20,14 @@ from common import channels   # __init__ puts drone_control on sys.path
 # ============ run mode ============
 DRY_RUN = False                 # True = compute + print, NEVER open Ranger / arm.
                                # Flip to False only after DRY_RUN dir-checks pass.
-RECORD_VIDEO = False            # Vicon flights don't need the drone-feed video (Vicon
-                               # is the truth) — skip it to save disk. The other
-                               # streams (vicon/commands/telemetry) still record.
+RECORD_VIDEO = True             # record the drone-feed video alongside the other
+                               # streams (vicon/commands/telemetry). Needs the VRX →
+                               # Cam Link chain plugged in (device index in channels.py).
 
 # ============ target ============
 # Hover holds the takeoff x/y and heading, CLIMB_M above the takeoff altitude.
 # FIRST FLIGHTS: set CLIMB_M = 0.3 and confirm a stable low hover before 1.0 m.
-CLIMB_M = 1.0
+CLIMB_M = 0.8
 
 # ============ FC angle-mode stick → angle scaling (from the Air75 measurement) ===
 # Measured 2026-05-29: full deflection ≈ ±511.5us reaches angle_limit (60°), so
@@ -176,9 +176,48 @@ TAKEOFF_AIRBORNE_M = 0.3
 # ============ yaw loop (absolute heading hold — Vicon yaw is drift-free) ========
 # err = wrap(yaw - yaw_target); err > 0 (drone yawed CCW/left of target) → yaw
 # RIGHT (us>1500) to recenter, with SIGN_YAW=+1. No magnetometer hack needed.
-KP_YAW_US_PER_RAD = 200.0
-MAX_YAW_US = 120
-YAW_DEADBAND_RAD = math.radians(2.0)
+#
+# !!! PAIRED WITH AN FC CHANGE (2026-06-12, for the tangent-facing circle) !!!
+# Yaw in Angle mode is a RATE command through the ACTUAL-rates curve, and yaw was
+# still on the stock progressive curve (center 70°/s / max 670°/s) — the same
+# soft-center plant that broke roll/pitch before 20260611_171558. Within our
+# MAX_YAW_US the drone could only do ~16°/s; the circle needs 46°/s sustained.
+# FIX (Betaflight CLI): linearize yaw at 300°/s —
+#     set yaw_rc_rate = 30 ; set yaw_srate = 30 ; set yaw_expo = 0 ; save
+# YAW_LINEAR_MAX_DPS documents that FC setting; the feedforward gain is derived
+# from it. FLY THE FC CHANGE AND THIS CONFIG TOGETHER (without the FC change the
+# FF is ~4x too weak near center — safe, the dwell gate just waits — but the
+# tangent tracking will lag badly).
+YAW_LINEAR_MAX_DPS = 300.0     # FC linear yaw rate: full stick (511.5us) = 300°/s
+# Yaw-rate FEEDFORWARD: the mission's heading setpoint moves (46°/s around the
+# circle, YAW_SLEW_DPS in pre-rotations); P-only would need ~22° of standing error
+# to hold that rate. The controller differences the commanded heading and adds
+# us = rate / (linear curve slope), so the rate costs zero error — same fix as
+# the position-loop velocity FF, applied to yaw.
+YAW_FF_US_PER_DPS = STICK_FULL_DEFLECTION_US / YAW_LINEAR_MAX_DPS   # 1.705
+# Full heading PID (P+I+D around the FF). Why yaw got away with P-only while
+# position needed PID: our yaw output is a RATE command closed by the FC's own
+# yaw-rate PID, so heading(u) is a SINGLE integrator — P alone is a stable
+# first-order loop (no overshoot in the ideal). Position is a DOUBLE integrator
+# (tilt→accel→vel→pos), unstable under pure P, hence KD from day one. The real
+# chain has ~0.2-0.4 s of transport+FC lag though, so:
+#   D (on MEASURED yaw rate, LPF'd, minus the target rate — no setpoint kick)
+#     buys damping margin against that lag;
+#   I (small, clamped) trims constant residuals the deadbanded P never fixes —
+#     e.g. FF scale error while the heading ramps around the circle (true curve
+#     slope ≠ exactly 300°/s ⇒ constant rate deficit ⇒ standing heading error).
+KP_YAW_US_PER_RAD = 200.0      # 3.49 us/deg
+KI_YAW_US_PER_RAD_S = 30.0     # trims a 5.7° standing offset in ~10 s
+MAX_YAW_I_US = 30              # integral contribution cap (windup guard)
+KD_YAW_US_PER_RAD_PER_S = 25.0 # damping: 1 rad/s of error rate → 25 us opposing
+YAW_RATE_LPF_S = 0.10          # 1-pole LPF on the differenced Vicon yaw rate the D
+                               # term uses (50 Hz diff of ~0.2° noise ⇒ ~14°/s rate
+                               # noise raw — filter before it reaches KD)
+MAX_YAW_US = 150               # was 120: 150us @ 0.587 (°/s)/us = 88°/s authority —
+                               # covers the 46°/s circle + 60°/s pre-rotation + room
+                               # for PID corrections on top of the FF
+YAW_DEADBAND_RAD = math.radians(2.0)   # zeroes the error fed to P+I (no twitching at
+                               # rest); FF and D always run
 
 # ============ safety ============
 # The flight ends ONLY on: SPACEBAR (laptop), low battery, manual disarm (TX12),
@@ -209,6 +248,15 @@ CRUISE_SPEED_MPS = 0.80        # moving-setpoint ("carrot") speed between waypoi
                                # velocity and the D term acts on (v_carrot - v_drone),
                                # so the residual lag is just the FC response delay.
                                # LEASH_M keeps its margin anyway as a stall backstop.)
+CARROT_ACCEL_MPS2 = 1.0        # carrot speed-ramp accel (trapezoidal profile): the
+                               # carrot speeds 0→cruise over cruise/a s and BRAKES to
+                               # arrive at every move-segment end with ZERO speed
+                               # (ramp distance v²/2a = 0.32 m at 0.8). Replaces the
+                               # instant 0↔cruise velocity steps that slammed the
+                               # tilt cmd into the 15° clamp at every transition and
+                               # overswung the drone to 1.4 m/s (flight 20260612_132718).
+                               # Also makes the carrot acceleration finite, so accel
+                               # feedforward becomes possible later.
 DWELL_S = 5.0                  # hold time at each square vertex
 INITIAL_HOVER_S = 3.0          # settle time at the takeoff hover before leg 1
 ARRIVE_TOL_M = 0.25            # carrot AT the WP and drone within this (horiz + vert)
@@ -232,14 +280,34 @@ LEASH_M = 1.2                  # the carrot never gets more than this far ahead 
 # held at the launch yaw the whole time (the circle is flown by translating). Reuses
 # CRUISE_SPEED_MPS / LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / INITIAL_HOVER_S.
 CIRCLE_RADIUS_M = 1.0          # circle radius AND the forward approach distance
-CIRCLE_CW = True               # True = clockwise viewed from above (the carrot goes
+CIRCLE_CW = False              # True = clockwise viewed from above (the carrot goes
                                # forward-point → right → back → left → forward-point);
-                               # False = counter-clockwise
+                               # False = counter-clockwise. CCW with FACE_TANGENT: the
+                               # entry pre-rotation turns LEFT 90° from the launch
+                               # heading (tangent at the forward point is -X).
 SETTLE_S = 2.0                 # hold at the circle entry (clean start), at the circle
                                # EXIT (the dwell gates on the DRONE arriving, so any
                                # phase lag closes the lap before the carrot heads home
                                # — flight 20260612_121316 lost the last 60° without
                                # this), and at the origin on return before landing
+CIRCLE_FACE_TANGENT = True     # True: nose follows the direction of travel around the
+                               # circle (pre-rotates to the tangent during the entry
+                               # dwell, yaws continuously through the lap at ω =
+                               # cruise/radius, rotates back to the launch heading
+                               # during the exit dwell). False: old strafing behavior
+                               # (heading held at launch yaw for the whole course).
+YAW_SLEW_DPS = 60.0            # yaw-setpoint slew rate: pre-rotations in dwells ramp
+                               # the heading target at this rate (no 90° step → no
+                               # saturated yaw command), and it caps tangent-following.
+                               # MUST exceed the circle's yaw rate ω = cruise/radius
+                               # (46°/s at 0.8 m/s, r=1.0) or the heading ref lags.
+YAW_ARRIVE_TOL_DEG = 5.0       # a dwell with a heading target waits (same arrive_
+                               # timeout backstop) until the drone's heading is within
+                               # this of the target before its countdown starts — the
+                               # circle can't begin until the nose actually points
+                               # down the tangent. 5° is tight for the P-only yaw
+                               # loop (deadband is 2°) — needs the FC yaw rates
+                               # linearized so small commands actually turn the drone
 
 # ============ loop rate (shared) ============
 TX_HZ = channels.TX_HZ         # 50 Hz, same as the data logger
