@@ -133,16 +133,16 @@ VICON_YAW_OFFSET_DEG = 90.0
 # now ~symmetric: roll slope 0.91 / pitch 0.74).
 
 # --- forward axis (pitch / world-Y) ---
-KP_FWD_DEG_PER_M = 12.0        # 2x (was 6) — honest deg/m, tighten the hold
+KP_FWD_DEG_PER_M = 15.0        # 2x (was 6) — honest deg/m, tighten the hold
 KD_FWD_DEG_PER_MPS = 16.0      # 2x (was 8) — damping, ratio kept ~1.33
-KI_FWD_DEG_PER_M_S = 0.5       # gentle auto-trim (unchanged)
-MAX_FWD_INT_DEG = 12.0         # integral contribution cap
+KI_FWD_DEG_PER_M_S = 0.4       # gentle auto-trim (unchanged)
+MAX_FWD_INT_DEG = 10.0         # integral contribution cap
 
 # --- lateral axis (roll / world-X) ---
-KP_LAT_DEG_PER_M = 12.0        # 2x (was 6)
+KP_LAT_DEG_PER_M = 15.0        # 2x (was 6)
 KD_LAT_DEG_PER_MPS = 16.0      # 2x (was 8)
-KI_LAT_DEG_PER_M_S = 0.5       # gentle auto-trim
-MAX_LAT_INT_DEG = 12.0         # integral contribution cap
+KI_LAT_DEG_PER_M_S = 0.4       # gentle auto-trim
+MAX_LAT_INT_DEG = 10.0         # integral contribution cap
 
 MAX_TILT_DEG = 15.0            # output clamp — real tilt; 15° is plenty (it used ~3°)
 
@@ -160,7 +160,7 @@ MAX_THROTTLE_US = 1700         # hard rail; band ⊂ [IDLE, MAX] so it's never h
 VMAX_UP_MPS = 0.50             # climb/descend speed cap (was 0.30 — faster takeoff)
 KP_UP = 0.7                    # 1/s: altitude error → target vertical velocity
 KV_UP_US_PER_MPS = 40.0        # P: throttle us per (m/s) of velocity error
-KI_UP_US_PER_M = 80.0          # I: hover-throttle us per (m) of accumulated v-error
+KI_UP_US_PER_M = 85.0          # I: hover-throttle us per (m) of accumulated v-error
 THR_CLIMB_TRIM_US = 100        # max +P correction (climbing) — asymmetric:
 THR_DESC_TRIM_US = 200         # max -P correction (gravity aids descent)
 LAND_SPEED_MPS = 0.25          # commanded descent rate when landing (SPACEBAR / low batt)
@@ -171,7 +171,7 @@ LAND_CUT_M = 0.30              # descend to this height above launch, then CUT t
 # Clean takeoff: until the drone is this far above its takeoff altitude, hold LEVEL
 # (no roll/pitch) and freeze the horizontal integrators so it lifts STRAIGHT UP
 # instead of scooting on the ground; engage horizontal hold once above it.
-TAKEOFF_AIRBORNE_M = 0.15
+TAKEOFF_AIRBORNE_M = 0.3
 
 # ============ yaw loop (absolute heading hold — Vicon yaw is drift-free) ========
 # err = wrap(yaw - yaw_target); err > 0 (drone yawed CCW/left of target) → yaw
