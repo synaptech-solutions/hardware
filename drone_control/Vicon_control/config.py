@@ -134,13 +134,13 @@ VICON_YAW_OFFSET_DEG = 90.0
 
 # --- forward axis (pitch / world-Y) ---
 KP_FWD_DEG_PER_M = 15.0        # 2x (was 6) — honest deg/m, tighten the hold
-KD_FWD_DEG_PER_MPS = 16.0      # 2x (was 8) — damping, ratio kept ~1.33
+KD_FWD_DEG_PER_MPS = 20.0      # 2x (was 8) — damping, ratio kept ~1.33
 KI_FWD_DEG_PER_M_S = 0.4       # gentle auto-trim (unchanged)
 MAX_FWD_INT_DEG = 10.0         # integral contribution cap
 
 # --- lateral axis (roll / world-X) ---
 KP_LAT_DEG_PER_M = 15.0        # 2x (was 6)
-KD_LAT_DEG_PER_MPS = 16.0      # 2x (was 8)
+KD_LAT_DEG_PER_MPS = 20.0      # 2x (was 8)
 KI_LAT_DEG_PER_M_S = 0.4       # gentle auto-trim
 MAX_LAT_INT_DEG = 10.0         # integral contribution cap
 
