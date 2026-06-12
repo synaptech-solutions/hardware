@@ -64,6 +64,14 @@ class ViconHoverController:
         self.x_tgt, self.y_tgt, self.z_tgt, self.yaw_tgt = x, y, z, yaw
         self.reset()
 
+    def set_setpoint(self, x, y, z, yaw):
+        """Update the target WITHOUT resetting state — for following a moving
+        reference (waypoints). Unlike set_target this preserves hover_us (the
+        learned hover throttle) and the position integrators, so the altitude
+        trim and steady-state bias carry across legs. The reference moves smoothly
+        (a crawling carrot), so there's no setpoint step to kick the loop."""
+        self.x_tgt, self.y_tgt, self.z_tgt, self.yaw_tgt = x, y, z, yaw
+
     def reset(self, keep_alt_trim=False):
         """Zero the position integrators. keep_alt_trim preserves the learned
         hover throttle (a slow battery estimate, still valid); a fresh target

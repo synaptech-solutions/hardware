@@ -71,6 +71,7 @@ from common.recorders import (                           # noqa: E402
 from Vicon_control import config                         # noqa: E402
 from Vicon_control.vicon_source import ViconPoseSource   # noqa: E402
 from Vicon_control.controller import ViconHoverController  # noqa: E402
+from Vicon_control.mission import HoldMission              # noqa: E402
 
 CSI = "\033["
 REC_DIR = os.path.join(HERE, "flight_logs")
@@ -88,7 +89,7 @@ def clamp(v, lo, hi):
 
 
 def render(state, ch, pose, ctl, tx_armed, fc_armed, record_on, pose_age,
-           flight_mode, pack_v, vic_samples, recording, dry):
+           flight_mode, pack_v, vic_samples, recording, dry, mission_lbl=""):
     mode_lbl = "DRY-RUN" if dry else "LIVE"
     col = {"DISARMED": "0", "ARMED_IDLE": "33", "FLYING": "32", "LANDING": "36"}.get(state, "0")
     arm_txt = (f"{CSI}32mARM{CSI}0m" if tx_armed else "safe")
@@ -103,16 +104,20 @@ def render(state, ch, pose, ctl, tx_armed, fc_armed, record_on, pose_age,
     c = (f"des(R{ctl['desired_roll_deg']:+.1f} P{ctl['desired_pitch_deg']:+.1f})deg "
          f"hov={ctl['hover_us']:.0f}" if ctl else "")
     v = f"{pack_v:.2f}V" if pack_v is not None else "—"
+    ms = f"{CSI}35m{mission_lbl}{CSI}0m " if mission_lbl else ""
     sys.stdout.write(
         f"\r{CSI}K[{mode_lbl}] {CSI}{col}m{state:10s}{CSI}0m {arm_txt} {fc_txt} "
-        f"rec{'ON' if record_on else '--'} | "
+        f"rec{'ON' if record_on else '--'} {ms}| "
         f"R{ch[channels.CH_ROLL]:4d} P{ch[channels.CH_PITCH]:4d} "
         f"T{ch[channels.CH_THR]:4d} Y{ch[channels.CH_YAW]:4d} | {p} {c} | "
         f"{vic} FC:{flight_mode or '—'} {v}")
     sys.stdout.flush()
 
 
-def run(args):
+def run(args, make_mission=None):
+    """Shared Vicon flight loop. make_mission is an optional callable(launch_tuple)
+    -> Mission that provides the per-tick world setpoint (see mission.py); when
+    None it flies a static HoldMission, reproducing the original hover behavior."""
     cal = load_cal(args.cal_file)
     js = Joystick(args.js)
     print(f"Joystick: {js.name}  ({args.js})")
@@ -178,6 +183,7 @@ def run(args):
     seen_disarmed = False
     land_requested = False         # set by SPACEBAR (or low batt) → controlled land + exit
     launch = None                  # (x0, y0, z0, yaw0) captured at takeoff
+    mission = None                 # target provider (HoldMission, or a WaypointMission)
     fly_t0 = None
     land_t0 = None
 
@@ -218,7 +224,8 @@ def run(args):
                 "gains": {"kp_fwd": config.KP_FWD_DEG_PER_M, "kd_fwd": config.KD_FWD_DEG_PER_MPS,
                           "kp_lat": config.KP_LAT_DEG_PER_M, "kd_lat": config.KD_LAT_DEG_PER_MPS,
                           "kp_up": config.KP_UP, "kv_up": config.KV_UP_US_PER_MPS,
-                          "ki_up": config.KI_UP_US_PER_M, "kp_yaw": config.KP_YAW_US_PER_RAD}}}
+                          "ki_up": config.KI_UP_US_PER_M, "kp_yaw": config.KP_YAW_US_PER_RAD}},
+                "mission": (mission.summary() if mission is not None else None)}
             write_session_json(session, recorder, vicon_rec, cmd_log, telem, cal,
                                ranger_port, args.baud, extra=extra)
             sys.stdout.write(f"\n{CSI}33m■ SESSION SAVED{CSI}0m {session['stamp']}  "
@@ -368,7 +375,8 @@ def run(args):
                     break
                 if sess_active:
                     end_session()
-                state, launch, fly_t0, land_t0 = "DISARMED", None, None, None
+                state, launch, mission, fly_t0, land_t0 = \
+                    "DISARMED", None, None, None, None
                 controller.reset()
             elif state == "DISARMED":
                 state = "ARMED_IDLE"
@@ -380,6 +388,8 @@ def run(args):
                     break
                 if fc_armed and record_on and pose_fresh:
                     launch = (pose["x"], pose["y"], pose["z"], pose["yaw"])
+                    mission = (make_mission(launch) if make_mission is not None
+                               else HoldMission(launch))
                     controller.set_target(launch[0], launch[1],
                                           launch[2] + config.CLIMB_M, launch[3])
                     begin_session()
@@ -388,6 +398,8 @@ def run(args):
                         f"\n{CSI}32m▶ LAUNCH{CSI}0m from ({launch[0]:+.2f},{launch[1]:+.2f},"
                         f"{launch[2]:+.2f}) → climb to {launch[2] + config.CLIMB_M:+.2f} m  "
                         f"(SPACEBAR to land)\n")
+                    for line in mission.describe():
+                        sys.stdout.write(line + "\n")
             elif state == "FLYING":
                 if pose is None or pose_age > config.VICON_KILL_S:
                     sys.stdout.write(f"\n{CSI}1;31mVICON LOST {pose_age:.2f}s — cut + exit.{CSI}0m\n")
@@ -434,7 +446,16 @@ def run(args):
                 # level + freeze horizontal integrators so it lifts straight up.
                 airborne = (launch is not None
                             and (pose["z"] - launch[2]) > config.TAKEOFF_AIRBORNE_M)
+                # The mission supplies the world setpoint (a crawling carrot for the
+                # waypoint course; a fixed point for HoldMission). set_setpoint keeps
+                # the learned hover throttle + integrators (set_target would wipe
+                # them). done → land via the SAME path as SPACEBAR.
+                tx, ty, tz, tyaw, done = mission.update(pose, dt, airborne)
+                controller.set_setpoint(tx, ty, tz, tyaw)
                 ctl_out = controller.step(pose, dt, level_only=not airborne)
+                if done and not land_requested:
+                    land_requested = True
+                    sys.stdout.write(f"\n{CSI}32m✔ MISSION COMPLETE — landing.{CSI}0m\n")
             elif state == "LANDING" and pose is not None:
                 ctl_out = controller.step(pose, dt, descent_rate=config.LAND_SPEED_MPS)
             elif state == "FLYING" and pose is not None:
@@ -469,8 +490,10 @@ def run(args):
 
             # --- status line + optional preview (throttled, off the control path) ---
             if now_mono - last_render > 0.066:
+                mission_lbl = mission.status() if mission is not None else ""
                 render(state, ch, pose, ctl_out, tx_armed, fc_armed, record_on, pose_age,
-                       flight_mode, pack_v, vicon_rec.samples, vicon_rec.recording, dry)
+                       flight_mode, pack_v, vicon_rec.samples, vicon_rec.recording, dry,
+                       mission_lbl)
                 if recorder is not None and CV2_OK:
                     if recorder.recording:
                         frame = recorder.get_latest_frame()
@@ -509,8 +532,8 @@ def run(args):
         print("Stopped.")
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
+def build_parser(description=__doc__):
+    ap = argparse.ArgumentParser(description=description,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("port", nargs="?", default=None, help="Ranger serial port (default: autodetect)")
     ap.add_argument("baud", nargs="?", type=int, default=420000, help="Ranger baud (default: 420000)")
@@ -518,8 +541,11 @@ def main():
     ap.add_argument("--cal-file", default=DEFAULT_CAL_PATH, help="TX12 calibration JSON (shared)")
     ap.add_argument("--dry-run", action="store_true",
                     help="read TX12 + Vicon, print control outputs; never open Ranger / never arm")
-    args = ap.parse_args()
-    run(args)
+    return ap
+
+
+def main():
+    run(build_parser().parse_args())
 
 
 if __name__ == "__main__":

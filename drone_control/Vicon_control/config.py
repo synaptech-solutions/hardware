@@ -191,5 +191,52 @@ BATT_PRESENT_V = 2.5           # below this = no/!valid pack reading, ignore
 MIN_CELL_V = 3.3
 CELLS = 1
 
+# ============ waypoint mission (square_flight.py only) ==========================
+# square_flight.py flies a course built in the LAUNCH BODY FRAME (forward/right
+# relative to the nose at takeoff) and converted to FIXED world waypoints ONCE, at
+# launch, using the captured launch yaw (mission.build_square_mission). The default
+# course: take off + hover, then forward → right → back → left by LEG_M with DWELL_S
+# holds at each vertex, returning over the origin, then land. Heading is HELD at the
+# launch yaw throughout (the legs are strafes, not turns). vicon_hover.py ignores all
+# of this (it flies a static HoldMission); only square_flight.py reads these.
+LEG_M = 2.0                    # square side length (forward/right/back/left distance)
+CRUISE_SPEED_MPS = 0.80        # moving-setpoint ("carrot") speed between waypoints —
+                               # the horizontal analog of VMAX_UP_MPS. (Note:
+                               # D-on-measurement adds ~KD*cruise of opposing tilt, so
+                               # the drone trails the carrot ~KD*v/KP m: ~0.3 m measured
+                               # at 0.4 m/s, so ~0.6 m expected here at 0.8 m/s — hence
+                               # LEASH_M is raised to stay above it. The arrival gate
+                               # waits for the DRONE, not the carrot, so the trailing is
+                               # benign; at speed the circle just flies a bit smaller +
+                               # more phase-lagged. Tighten with velocity feedforward.)
+DWELL_S = 5.0                  # hold time at each square vertex
+INITIAL_HOVER_S = 3.0          # settle time at the takeoff hover before leg 1
+ARRIVE_TOL_M = 0.25            # carrot AT the WP and drone within this (horiz + vert)
+                               # → start the hold
+ARRIVE_TIMEOUT_S = 12.0        # backstop (counted only while airborne): proceed to the
+                               # hold after this long in a leg even if never within tol,
+                               # so a drone that never quite settles can't hang the run
+LEASH_M = 1.2                  # the carrot never gets more than this far ahead of the
+                               # drone — bounds the position error (and thus tilt/speed)
+                               # if the drone falls behind; 0.0 disables the leash. Keep
+                               # it ~2x the steady-state trailing lag (≈KD*v/KP) so it
+                               # only catches a real stall, not normal cruise: 0.6 worked
+                               # at 0.4 m/s (lag ~0.3), so 1.2 here at 0.8 m/s (lag ~0.6).
+                               # Too low and the leash chops the motion (stutters/stops).
+
+# ============ circle mission (circle_flight.py only) ===========================
+# circle_flight.py: take off + hover, fly FORWARD CIRCLE_RADIUS_M to reach a circle
+# CENTERED ON THE LAUNCH ORIGIN (so the forward point lands exactly on it), trace
+# one full circle, return to the origin, settle, land. The forward distance and the
+# radius are the SAME value by construction (the origin is the centre). Heading is
+# held at the launch yaw the whole time (the circle is flown by translating). Reuses
+# CRUISE_SPEED_MPS / LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / INITIAL_HOVER_S.
+CIRCLE_RADIUS_M = 1.0          # circle radius AND the forward approach distance
+CIRCLE_CW = True               # True = clockwise viewed from above (the carrot goes
+                               # forward-point → right → back → left → forward-point);
+                               # False = counter-clockwise
+SETTLE_S = 2.0                 # hold at the circle entry (clean start) and again at
+                               # the origin on return, before landing
+
 # ============ loop rate (shared) ============
 TX_HZ = channels.TX_HZ         # 50 Hz, same as the data logger
