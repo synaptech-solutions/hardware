@@ -54,7 +54,7 @@ def _signed_sweep(center, r, th0, sweep, entry_yaw):
 def _rebuild_segments(segments):
     """session.json `segments` → mission seg dicts (with the `at`/`len` callables).
     Prefers the lossless `geom` block; infers line-vs-launch-centred-arc otherwise."""
-    from Vicon_control.mission import _line_seg, _arc_seg, _dwell_seg
+    from Vicon_control.mission import _line_seg, _arc_seg, _dwell_seg, _lemniscate_seg
 
     origin = next((tuple(s["point"]) for s in segments if s["type"] == "dwell"), None)
     out, cur, prev_dwell_yaw = [], origin, None
@@ -73,6 +73,10 @@ def _rebuild_segments(segments):
             seg = _arc_seg(tuple(geom["center"]), float(geom["radius"]),
                            float(geom["theta0"]), float(geom["dtheta"]),
                            s.get("label", ""), yaw=yaw)
+        elif geom and geom.get("kind") == "lemniscate":
+            seg = _lemniscate_seg(tuple(geom["center"]), float(geom["scale"]),
+                                  float(geom["t0"]), float(geom["t1"]),
+                                  s.get("label", ""), yaw=yaw)
         else:                                        # no geom → infer from the chord
             end = tuple(s["end"])
             start = cur if cur is not None else end

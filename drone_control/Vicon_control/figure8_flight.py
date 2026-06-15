@@ -7,23 +7,24 @@ shared flight loop a PathMission (a carrot that FLOWS along a smooth ∞ path)
 instead of a static hover. The course (relative to the LAUNCH pose; you start at
 the origin, which IS the figure-8's crossover):
   1. climb to config.CLIMB_M and hover config.INITIAL_HOVER_S at the origin
-  2. trace config.FIG8_LAPS full figure-8(s) — two circles tangent at the origin,
-     long axis along world X, radius config.FIG8_END_X_M/2, so the ends pass
-     through (±config.FIG8_END_X_M, 0). The loops alternate sense (config.FIG8_CW
-     sets the first), so the path tangent is continuous at the crossover and the
-     carrot flows through at config.FIG8_SPEED_MPS — no stop at the centre. With
-     config.FIG8_FACE_TANGENT the nose follows the travel direction (default off:
-     strafe at the launch heading — see the DYNAMICS note in config.py)
+  2. trace config.FIG8_LAPS smooth figure-8(s) — a BERNOULLI LEMNISCATE (the classic
+     ∞) centred at the origin, peaks at (±config.FIG8_PEAK_M, 0) on world X, crossing
+     at the origin. Its curvature is CONTINUOUS (zero at the crossing → straight
+     through the centre, greatest at the peak tips), so there's no instantaneous
+     bank/yaw reversal at the middle — that was the awkward, untrackable transition
+     of the old two-tangent-circles design. One continuous segment at
+     config.FIG8_SPEED_MPS (ramps up once, brakes once into the home dwell). With
+     config.FIG8_FACE_TANGENT (default ON, like the circle) the nose follows the
+     direction of travel; pre-rotates to the start tangent during takeoff.
   3. settle config.SETTLE_S back at the origin, then land
-Unlike the circle there is NO forward approach leg: the crossover is the launch
+Unlike the circle there is NO forward approach leg: the crossing is the launch
 point, so the drone is already on the path at takeoff. All tunables live in
 config.py (the FIG8_* block + the shared carrot params).
 
-!!! The figure-8 loops are HALF the circle's radius, so at the same speed the
-centripetal load is DOUBLE the circle's and reverses at each crossover — at 2 m/s
-that is 39° of bank (vs 22° for the circle) and a 229°/s tangent yaw rate the yaw
-loop can't follow. See the DYNAMICS note in config.py; fly ~1.0–1.2 m/s to match
-the circle's dynamics. DRY-RUN first and read the commanded bank in the plan. !!!
+!!! SPEED is yaw-limited for tangent-facing: the lemniscate's tip turn radius is
+≈PEAK/3 (0.67 m at PEAK=2), so the peak yaw rate is v/0.67. FIG8_SPEED_MPS=1.3 →
+112°/s yaw, 14° bank — gentle and trackable. NOT the circle's 2 m/s: that lapped the
+drone on the old tight figure-8 (flight 20260615_160611). DRY-RUN first. !!!
 
 SPACEBAR / disarm / low batt / Vicon loss abort to a controlled landing at any
 point, exactly as in vicon_hover. Arm + record triggers are identical.

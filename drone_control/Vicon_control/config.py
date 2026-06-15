@@ -146,11 +146,11 @@ KD_LAT_DEG_PER_MPS = 20.0      # 2x (was 8)
 KI_LAT_DEG_PER_M_S = 0.4       # gentle auto-trim
 MAX_LAT_INT_DEG = 10.0         # integral contribution cap
 
-MAX_TILT_DEG = 45.0            # output clamp — raised 15→45 for the 2 m/s circle:
-                               # centripetal alone is atan(v²/(r·g)) = 22.2° at
-                               # 2 m/s / r=1, plus drag FF ~5.5° and PID corrections.
-                               # Still well under the FC angle_limit (60°); 45° =
-                               # 384us of the ±511.5 stick range.
+MAX_TILT_DEG = 55.0            # output clamp. The 3 m/s circle (r=1) needs total bank
+                               # hypot(centripetal 42.5°, drag 8.2°) = 43.3°; 55° keeps
+                               # PID correction headroom while staying under the FC
+                               # angle_limit (60°) — NEVER set this ≥60 (the FC clips
+                               # there) or near 90 (a quad makes ZERO lift at 90°).
 
 # --- acceleration feedforward (the last rung: position ref → velocity FF → this) ---
 # The mission reports the carrot's acceleration (finite thanks to the trapezoid):
@@ -159,21 +159,18 @@ MAX_TILT_DEG = 45.0            # output clamp — raised 15→45 for the 2 m/s c
 # letting feedback squeeze it out of error. Flight 20260612_160149 showed the
 # cost of its absence: −4.3 cm radius + 8° phase lag were the loop's way of
 # generating the ~3.7° inward lean from the D term.
-MAX_FF_ACCEL_MPS2 = 9.0        # cap on the relayed accel — its PURPOSE is spike
+MAX_FF_ACCEL_MPS2 = 12.0       # cap on the relayed accel — its PURPOSE is spike
                                # rejection: the carrot accel is a finite diff of carrot
                                # velocity, so a leash engage / timeout-park (carrot
                                # velocity steps in one tick) finite-differences into a
                                # huge bogus accel; this bounds it (ACCEL_FF_LPF_S smooths
-                               # it too). Raised 6→9 (2026-06-15): the figure-8 at 2 m/s
-                               # on R=0.5 needs v²/R = 8 m/s² of centripetal, which 6
-                               # clipped — the FF could supply only ¾ of the 39° lean, so
-                               # the feedback loop made up the rest as tracking error
-                               # (the very lag the accel FF exists to remove). 9 m/s² =
-                               # atan(9/9.81)=42.5°, just under the 45° MAX_TILT clamp, so
-                               # the CLAMP — not this guard — is now the ceiling (the
-                               # honest physical limit: max commandable centripetal is
-                               # g·tan(MAX_TILT)=9.81 m/s²). Raise this WITH MAX_TILT for
-                               # faster flight / tighter radii in future.
+                               # it too). Raised 9→12 (2026-06-15) for the 3 m/s circle:
+                               # v²/r = 9 m/s² of centripetal must pass UNCLIPPED (at the
+                               # old 9 cap it sat exactly at the limit with no margin);
+                               # 12 m/s² = atan(12/9.81)=50.7°, under the 55° MAX_TILT
+                               # clamp, so the CLAMP — not this guard — stays the real
+                               # ceiling. (figure-8 @2m/s R=0.5 needs only 8.) Raise WITH
+                               # MAX_TILT for faster flight / tighter radii in future.
 ACCEL_FF_LPF_S = 0.08          # 1-pole LPF on the body-frame accel FF: swallows
                                # one-tick spikes, adds only ~0.08 s to the (already
                                # step-shaped) ramp transitions
@@ -264,10 +261,14 @@ KD_YAW_US_PER_RAD_PER_S = 25.0 # damping: 1 rad/s of error rate → 25 us opposi
 YAW_RATE_LPF_S = 0.10          # 1-pole LPF on the differenced Vicon yaw rate the D
                                # term uses (50 Hz diff of ~0.2° noise ⇒ ~14°/s rate
                                # noise raw — filter before it reaches KD)
-MAX_YAW_US = 250               # 250us @ 0.587 (°/s)/us = 147°/s authority — the 2 m/s
-                               # circle needs 114.6°/s sustained (FF = 195us) plus
-                               # room for PID corrections; still well inside the
-                               # linear ±511.5us/300°/s curve
+MAX_YAW_US = 450               # 450us = 264°/s authority (450/1.705). The 3 m/s circle
+                               # needs 172°/s sustained (FF = 293us), leaving 157us
+                               # (~92°/s) for the yaw PID on top — plenty of correction
+                               # headroom. The PHYSICAL ceiling is full stick 511.5us =
+                               # 300°/s (the FC linear yaw curve); 450 stays under it.
+                               # (Was mistakenly 300us = only 176°/s, which left just
+                               # 7us of headroom and looked like saturation — that was a
+                               # too-low clamp, NOT the drone's limit.)
 YAW_DEADBAND_RAD = math.radians(2.0)   # zeroes the error fed to P+I (no twitching at
                                # rest); FF and D always run
 
@@ -291,7 +292,13 @@ CELLS = 1
 # launch yaw throughout (the legs are strafes, not turns). vicon_hover.py ignores all
 # of this (it flies a static HoldMission); only square_flight.py reads these.
 LEG_M = 2.0                    # square side length (forward/right/back/left distance)
-CRUISE_SPEED_MPS = 2.0         # moving-setpoint ("carrot") speed between waypoints —
+CRUISE_SPEED_MPS = 3.0         # moving-setpoint ("carrot") speed between waypoints —
+                               # 3.0 is ~the fastest the CURRENT 1 m circle sustains:
+                               # bank 43° (g-limited, 17° under FC limit) is comfy, but
+                               # the yaw FF hits 293us at ω=172°/s against the 300°/s
+                               # FC linear yaw curve — yaw authority is the real wall
+                               # here. Go faster only on a LARGER radius (bank ∝ v²/r,
+                               # yaw rate ∝ v/r — both ease with r).
                                # the horizontal analog of VMAX_UP_MPS. (History: pure
                                # D-on-measurement made the drone trail the carrot by
                                # ~KD*v/KP — measured 0.83-0.98 m / 55° of circle phase
@@ -300,9 +307,14 @@ CRUISE_SPEED_MPS = 2.0         # moving-setpoint ("carrot") speed between waypoi
                                # velocity and the D term acts on (v_carrot - v_drone),
                                # so the residual lag is just the FC response delay.
                                # LEASH_M keeps its margin anyway as a stall backstop.)
-CARROT_ACCEL_MPS2 = 1.0        # carrot speed-ramp accel (trapezoidal profile): the
+CARROT_ACCEL_MPS2 = 2.0        # carrot speed-ramp accel (trapezoidal profile): the
                                # carrot speeds 0→cruise over cruise/a s and BRAKES to
-                               # arrive at every move-segment end with ZERO speed
+                               # arrive at every move-segment end with ZERO speed.
+                               # Raised 1→2 (2026-06-15) for 3 m/s: at a=1 the ramp
+                               # distance v²/2a = 4.5 m would eat most of the 6.3 m
+                               # lap; a=2 → 2.25 m, so the 18.85 m (3-lap) arc holds
+                               # full speed for ~14 m. The ramp tilt = a/g = 11.5° is
+                               # still gentle vs the 55° clamp.
                                # (ramp distance v²/2a = 0.32 m at 0.8). Replaces the
                                # instant 0↔cruise velocity steps that slammed the
                                # tilt cmd into the 15° clamp at every transition and
@@ -350,12 +362,11 @@ CIRCLE_FACE_TANGENT = True     # True: nose follows the direction of travel arou
                                # cruise/radius, rotates back to the launch heading
                                # during the exit dwell). False: old strafing behavior
                                # (heading held at launch yaw for the whole course).
-YAW_SLEW_DPS = 130.0           # yaw-setpoint slew rate: pre-rotations in dwells ramp
+YAW_SLEW_DPS = 200.0           # yaw-setpoint slew rate: pre-rotations in dwells ramp
                                # the heading target at this rate (no 90° step → no
                                # saturated yaw command), and it caps tangent-following.
                                # MUST exceed the circle's yaw rate ω = cruise/radius
-                               # (114.6°/s at 2 m/s, r=1.0) or the heading ref lags.
-                               # 130°/s FF = 222us, inside MAX_YAW_US.
+                               # (172°/s at 3 m/s, r=1.0) or the heading ref lags.
 YAW_ARRIVE_TOL_DEG = 5.0       # a dwell with a heading target waits (same arrive_
                                # timeout backstop) until the drone's heading is within
                                # this of the target before its countdown starts — the
@@ -365,50 +376,50 @@ YAW_ARRIVE_TOL_DEG = 5.0       # a dwell with a heading target waits (same arriv
                                # linearized so small commands actually turn the drone
 
 # ============ figure-8 mission (figure8_flight.py only) ========================
-# figure8_flight.py: take off + hover AT the figure-8's crossover (the launch
-# origin), trace one full figure-8, settle back at the origin, land — the circle's
-# twin (same PathMission / carrot / feedforward / leash / dwell machinery). The
-# figure-8 is two circles tangent at the launch origin, long axis along WORLD X: a
-# RIGHT loop (centre (x0+R, y0)) and a LEFT loop (centre (x0-R, y0)), radius R =
-# FIG8_END_X_M/2, so the far ends pass through (x0±FIG8_END_X_M, y0). The loops are
-# traced in OPPOSITE senses, so the path tangent is CONTINUOUS at the crossover
-# (both world -Y) and the carrot flows through at cruise — one smooth ∞, no stop at
-# the centre. Reuses LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / INITIAL_HOVER_S /
-# SETTLE_S / CARROT_ACCEL_MPS2, exactly like the circle. Held at CLIMB_M above
-# launch (set CLIMB_M=1.0 for the spec'd flat 1 m height).
+# figure8_flight.py: take off + hover AT the figure-8's crossing (the launch origin),
+# trace one smooth figure-8, settle back at the origin, land — the circle's twin
+# (same PathMission / carrot / feedforward / leash / dwell machinery, nose following
+# the direction of travel). Reuses LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S /
+# INITIAL_HOVER_S / SETTLE_S / CARROT_ACCEL_MPS2, exactly like the circle. Held at
+# CLIMB_M above launch.
 #
-# !!! DYNAMICS — READ BEFORE FLYING !!! The figure-8 loops are HALF the circle's
-# radius (R=0.5 m for the default ±1 m ends), so at a GIVEN SPEED the centripetal
-# load is DOUBLE the circle's and it REVERSES sign at every crossover (the right
-# loop banks one way, the left the other — a fast roll reversal as the carrot
-# crosses the centre). At FIG8_SPEED_MPS = 2 m/s, R=0.5: centripetal v²/R = 8 m/s²
-# → 39° of bank (vs the circle's 22° at 2 m/s, R=1), and it REVERSES sign at every
-# crossover (a fast roll flip as the carrot crosses the centre, smoothed by
-# ACCEL_FF_LPF_S). The accel-FF cap was raised 6→9 m/s² so the feedforward now
-# SUPPLIES that full 39° lean (at the old 6 it clipped to 31° and the loops tracked
-# loose) — but that leaves only ~6° of PID headroom under the 45° MAX_TILT clamp.
-# The tangent yaw rate v/R = 229°/s still far exceeds the ~147°/s yaw authority, so
-# FIG8_FACE_TANGENT must stay False. For more margin (and a gentler crossover), fly
-# the figure-8 at ~1.0–1.2 m/s — there v/R and v²/R equal the circle's. DRY-RUN
-# first and watch the commanded bank in the segment plan.
-FIG8_END_X_M = 1.0             # centre→end distance along world X; loop radius R is
-                               # half this. Far ends pass through (±FIG8_END_X_M, 0).
-FIG8_LAPS = 1                  # full figure-8 traversals (each = right loop + left
-                               # loop). The whole run flows at cruise; only the first
-                               # loop ramps up and only the last brakes to the home dwell.
-FIG8_CW = False                # sense of the FIRST (right) loop viewed from above:
-                               # False = CCW first (departs the crossover heading world
-                               # -Y); True = CW first (departs +Y). The second loop
-                               # always takes the opposite sense (smooth crossover).
-FIG8_FACE_TANGENT = False      # nose follows the travel direction. KEEP FALSE at the
-                               # default speed/radius: the figure-8's yaw rate v/R is
-                               # 2x the circle's (229°/s at 2 m/s, R=0.5) — far over the
-                               # yaw authority. Only enable if FIG8_SPEED_MPS is low
-                               # enough that v/R < YAW_SLEW_DPS (≈1.1 m/s at R=0.5).
-FIG8_SPEED_MPS = CRUISE_SPEED_MPS   # carrot speed — defaults to the circle's so it's
-                               # "the same speed as the circle". Tune DOWN here (not
-                               # CRUISE_SPEED_MPS) to fly the figure-8 gentler / trace it
-                               # tighter without touching the proven circle (see DYNAMICS).
+# The path is a BERNOULLI LEMNISCATE (the classic ∞), centred at the launch origin,
+# peaks at (±FIG8_PEAK_M, 0) on world X, crossing at the origin. Unlike the previous
+# two-tangent-circles design, its curvature is CONTINUOUS — zero at the crossing
+# (the carrot flies STRAIGHT through the centre) and greatest at the peak tips — so
+# there is no instantaneous bank/yaw reversal at the middle. That reversal, on R=0.5
+# circles at 2 m/s, is what saturated the tilt clamp and lapped the drone in flight
+# 20260615_160611; this replaces it. It is ONE continuous segment: the carrot ramps
+# up once at the start and brakes once into the home dwell, flowing at cruise through
+# the middle.
+#
+# SPEED is yaw-rate-limited for tangent-facing: the lemniscate's tip turn radius is
+# ≈FIG8_PEAK_M/3 (0.67 m at PEAK=2), so the peak yaw rate is v/0.67 and the peak bank
+# is atan(v²/0.67/g). FIG8_SPEED_MPS=1.3 → 112°/s yaw (under the 130°/s YAW_SLEW_DPS
+# and 147°/s authority) and 14° bank — gentle and trackable. Keep ≤1.4 m/s for
+# tangent-facing at PEAK=2; to go faster, enlarge FIG8_PEAK_M (the tip radius grows
+# ∝ peak) or raise the yaw authority (MAX_YAW_US / YAW_SLEW_DPS). DRY-RUN first.
+FIG8_PEAK_M = 2.0              # figure-8 half-length: the peaks (tips) are at
+                               # (±FIG8_PEAK_M, 0). Tip turn radius ≈ FIG8_PEAK_M/3.
+FIG8_LAPS = 1                  # smooth figure-8 traversals (one ∞ = crossing → lobe →
+                               # crossing → other lobe → crossing). Continuous; the
+                               # carrot only ramps at the very start / brakes at the end.
+FIG8_CW = True                 # traversal direction (which lobe is flown first / the
+                               # nose's sweep sense). False vs True just mirror in time;
+                               # True starts toward +45° (a 45° pre-rotation from the +Y
+                               # launch heading) vs False's -135° (135°) — True is the
+                               # gentler takeoff turn, so it's the default.
+FIG8_FACE_TANGENT = True       # nose follows the direction of travel (like the circle):
+                               # pre-rotate to the start tangent during takeoff, sweep
+                               # with the path, rotate back to the launch heading at home.
+                               # Feasible here (unlike the old tight two-circle design)
+                               # because the lemniscate + low speed cap the yaw rate at
+                               # ~112°/s. Set False to strafe at the launch heading.
+FIG8_SPEED_MPS = 1.3           # carrot speed. Yaw-limited for tangent-facing (see above):
+                               # 1.3 is gentle (112°/s yaw, 14° bank at PEAK=2). NOT the
+                               # circle's 2 m/s — that lapped the drone on the old tight
+                               # figure-8 (flight 20260615_160611). Raise toward 1.4 only
+                               # after a clean flight; >1.4 needs more yaw authority.
 
 # ============ loop rate (shared) ============
 TX_HZ = channels.TX_HZ         # 50 Hz, same as the data logger

@@ -43,6 +43,7 @@ config.VICON_YAW_OFFSET_DEG = 90 and the controller's heading 0 is nose +X), thi
 gives (dx, dy) = (right, fwd): forward → +Y, right → +X — the expected square.
 Heading is HELD at yaw0 for the whole course (the legs are strafes, not turns).
 """
+import bisect
 import math
 
 from . import config
@@ -335,6 +336,78 @@ def _dwell_seg(point, dur, label, yaw=None):
             "geom": {"kind": "dwell", "point": [point[0], point[1]]}}
 
 
+def _param_seg(fn, t0, t1, label, yaw=None, geom=None, n=1000):
+    """A general smooth parametric curve — fn(t)->(x, y) for t in [t0, t1] — as a
+    MOVE segment, RE-PARAMETRIZED BY ARC LENGTH so the carrot holds a constant
+    ground speed along it (a curve's natural parameter usually isn't arc length).
+    Densely samples the curve ONCE at build time, builds a cumulative-length table,
+    and serves at(s) by interpolation and heading(s) as the smooth path tangent
+    (central difference) — so the nose can follow the direction of travel on an
+    arbitrary curve, not just lines/arcs. `geom` is the lossless spec the dashboard
+    re-traces from (see planned_path). Lines and circles still use _line_seg/_arc_seg
+    (closed-form, exact); this is for curves with no closed-form arc length (the
+    figure-8 lemniscate)."""
+    ts = [t0 + (t1 - t0) * k / n for k in range(n + 1)]
+    pts = [fn(t) for t in ts]
+    cum = [0.0] * (n + 1)
+    for i in range(1, n + 1):
+        cum[i] = cum[i - 1] + math.hypot(pts[i][0] - pts[i - 1][0],
+                                         pts[i][1] - pts[i - 1][1])
+    length = cum[n]
+
+    def _idx(s):
+        """Sample interval (i) + fraction (f) for arc length s, clamped to the span."""
+        if s <= 0.0:
+            return 0, 0.0
+        if s >= length:
+            return n - 1, 1.0
+        i = bisect.bisect_right(cum, s) - 1
+        span = cum[i + 1] - cum[i]
+        return i, ((s - cum[i]) / span if span > 1e-12 else 0.0)
+
+    def at(s):
+        i, f = _idx(s)
+        return (pts[i][0] + (pts[i + 1][0] - pts[i][0]) * f,
+                pts[i][1] + (pts[i + 1][1] - pts[i][1]) * f)
+
+    def _tan(j):                             # travel tangent at sample j (central chord)
+        lo, hi = max(0, j - 1), min(n, j + 1)
+        return pts[hi][0] - pts[lo][0], pts[hi][1] - pts[lo][1]
+
+    def heading(s):
+        # Interpolate the tangent ACROSS the interval (not piecewise-constant per
+        # sample) so the heading is continuous — else the yaw setpoint sees a 1-cm
+        # staircase and jitters. Central-chord tangent at each end, blended by f.
+        i, f = _idx(s)
+        ax, ay = _tan(i)
+        bx, by = _tan(i + 1)
+        return math.atan2(ay + (by - ay) * f, ax + (bx - ax) * f)
+
+    return {"type": "move", "at": at, "len": length, "label": label,
+            "yaw": yaw, "heading": heading, "geom": geom}
+
+
+def _lemniscate_seg(center, scale, t0, t1, label, yaw=None):
+    """Bernoulli lemniscate (the classic ∞) centred at `center`, peaks at
+    center ± (scale, 0) on world X, self-crossing at the centre. Its CURVATURE is
+    CONTINUOUS — zero at the crossing (the path runs straight through the centre)
+    and greatest at the peak tips (radius ≈ scale/3) — so there is no instantaneous
+    bank/yaw reversal at the middle the way two tangent circles have. Parametrized
+    x = cos t/(1+sin²t), y = sin t cos t/(1+sin²t) (crossing at t=π/2, 3π/2; peaks at
+    t=0, π); wrapped in _param_seg for constant-speed arc-length travel + tangent
+    heading."""
+    cx, cy = center
+
+    def fn(t):
+        d = 1.0 + math.sin(t) ** 2
+        return (cx + scale * math.cos(t) / d,
+                cy + scale * math.sin(t) * math.cos(t) / d)
+
+    geom = {"kind": "lemniscate", "center": [cx, cy], "scale": scale,
+            "t0": t0, "t1": t1}
+    return _param_seg(fn, t0, t1, label, yaw=yaw, geom=geom)
+
+
 class PathMission:
     """Continuous path follower: a carrot crawls along a concatenated parametric
     path (line + arc segments) at `cruise` m/s — leashed to the drone exactly like
@@ -613,54 +686,48 @@ def build_circle_mission(launch):
 # ----------------------------------------------------------------------------- #
 def build_figure8_mission(launch):
     """Build the figure-8 course from config: take off + hover AT the figure-8's
-    crossover (which IS the launch origin), trace FIG8_LAPS full figure-8s, settle
-    back at the origin, land. Structurally the circle's twin — same PathMission,
-    same carrot/feedforward/leash/dwell machinery — just a different path.
+    crossover (which IS the launch origin), trace FIG8_LAPS smooth figure-8s, settle
+    back at the origin, land. Structurally the circle's twin — same PathMission, same
+    carrot/feedforward/leash/dwell machinery, nose following the travel direction —
+    just a different path.
 
-    The figure-8 is two circles tangent at the launch origin, long axis along WORLD
-    X: a RIGHT loop (centre (x0+R, y0)) and a LEFT loop (centre (x0-R, y0)), each of
-    radius R = FIG8_END_X_M/2, so the far ends pass through (x0±FIG8_END_X_M, y0).
-    The loops are traced in OPPOSITE senses (right CCW, left CW for FIG8_CW=False),
-    which makes the path tangent CONTINUOUS at the crossover (both point world -Y),
-    so the carrot FLOWS straight through at cruise (PathMission._exit_speed) — one
-    smooth ∞, no stop at the centre. Only the first loop ramps up from the takeoff
-    hover and only the last brakes into the home-settle dwell.
+    The path is a BERNOULLI LEMNISCATE (_lemniscate_seg) centred at the launch
+    origin, peaks at (x0±FIG8_PEAK_M, y0) on world X, crossing at the origin. Its
+    curvature is CONTINUOUS (zero at the crossing → straight through the centre,
+    greatest at the peak tips), so there's no instantaneous bank/yaw reversal at the
+    middle — that reversal was the awkward, untrackable transition of the old
+    two-tangent-circles design (flight 20260615_160611, which lapped the drone at
+    2 m/s). It's ONE continuous move segment, so the carrot ramps up once from the
+    takeoff hover and brakes once into the home-settle dwell; mid-path (including the
+    centre crossing) it flows at cruise.
 
-    Heading: with FIG8_FACE_TANGENT the nose follows the travel direction — the
-    takeoff dwell pre-rotates to the first loop's start tangent and GATES on the
-    nose getting there, the home dwell rotates back to the launch heading. Default
-    OFF: at the default speed/radius the figure-8's yaw rate (v/R) is double the
-    circle's and exceeds the yaw authority (see config) — so the whole figure-8 is
-    strafed at the launch heading, the drone translating along the ∞.
+    Heading: with FIG8_FACE_TANGENT (default ON, like the circle) the nose follows
+    the travel direction — the takeoff dwell pre-rotates to the path's start tangent
+    and GATES on the nose getting there; the home dwell rotates back to the launch
+    heading. The lemniscate + the modest FIG8_SPEED_MPS keep the peak yaw rate within
+    authority (see config), which is what makes tangent-facing feasible here.
 
-    Unlike the circle there is NO forward approach leg: the crossover is the launch
-    point, so the drone is already on the path at takeoff."""
+    Like the old figure-8 there is NO forward approach leg: the crossing is the
+    launch point, so the drone is already on the path at takeoff."""
     x0, y0, z0, yaw0 = launch
-    r = 0.5 * config.FIG8_END_X_M            # loop radius (half the centre→end span)
-    c_right, c_left = (x0 + r, y0), (x0 - r, y0)   # loop centres, on the world-X axis
     laps = max(1, int(config.FIG8_LAPS))
-    sweep = 2.0 * math.pi
-    # First (right) loop sense: CCW (+) departs the crossover heading world -Y; CW
-    # (-) departs +Y. The left loop always takes the OPPOSITE sense so its start
-    # tangent matches the right loop's exit and the carrot flows through unbroken.
-    d_right = -sweep if config.FIG8_CW else sweep
-    d_left = sweep if config.FIG8_CW else -sweep
-    th_right, th_left = math.pi, 0.0         # the crossover's angle on each loop
+    # The lemniscate parametrization crosses the centre at t=π/2; start there so the
+    # course begins at the launch origin. Sweep ±2π·laps — sign = traversal direction
+    # (which lobe is flown first / the nose's sweep sense); the two mirror in time.
+    t0 = math.pi / 2.0
+    span = (-1.0 if config.FIG8_CW else 1.0) * 2.0 * math.pi * laps
     face = config.FIG8_FACE_TANGENT
-    yaw_arc = "tangent" if face else None
-    arcs = []
-    for k in range(laps):
-        arcs.append(_arc_seg(c_right, r, th_right, d_right,
-                             f"R-loop {k + 1}/{laps}", yaw=yaw_arc))
-        arcs.append(_arc_seg(c_left, r, th_left, d_left,
-                             f"L-loop {k + 1}/{laps}", yaw=yaw_arc))
-    # Tangent-facing: pre-rotate to the first loop's start tangent during takeoff,
-    # rotate back to the launch heading during the home settle (None = hold heading).
-    yaw_start = arcs[0]["heading"](0.0) if face else None
+    lem = _lemniscate_seg((x0, y0), config.FIG8_PEAK_M, t0, t0 + span,
+                          f"figure-8 x{laps}", yaw=("tangent" if face else None))
+    # Tangent-facing: pre-rotate to the path's start tangent during takeoff, rotate
+    # back to the launch heading during the home settle (None = hold heading).
+    yaw_start = lem["heading"](0.0) if face else None
     yaw_home = yaw0 if face else None
-    segs = [_dwell_seg((x0, y0), config.INITIAL_HOVER_S, "takeoff/hover", yaw=yaw_start)]
-    segs += arcs
-    segs.append(_dwell_seg((x0, y0), config.SETTLE_S, "home/settle", yaw=yaw_home))
+    segs = [
+        _dwell_seg((x0, y0), config.INITIAL_HOVER_S, "takeoff/hover", yaw=yaw_start),
+        lem,
+        _dwell_seg((x0, y0), config.SETTLE_S, "home/settle", yaw=yaw_home),
+    ]
     return PathMission(
         launch, segs,
         cruise_mps=config.FIG8_SPEED_MPS, leash_m=config.LEASH_M,
