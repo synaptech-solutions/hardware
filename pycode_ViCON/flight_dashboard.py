@@ -22,6 +22,7 @@ import csv
 import json
 import os
 import re
+import sys
 import threading
 import warnings
 import webbrowser
@@ -208,6 +209,34 @@ def load_synced_fields(path):
     if path.lower().endswith(".csv"):
         return _load_synced_csv(path)
     return sio.loadmat(path)
+
+
+def _load_carrot(path, m, t, col):
+    """Setpoint overlay data for the 3D trajectory, or None if not applicable:
+      ref_x/ref_y/ref_z  the PLANNED path (geometric, traced from session.json) —
+                         the designed course, always available for a mission flight.
+      cx/cy/cz/cyaw      the per-sample MOVING carrot, ONLY if the flight logged it
+                         (sp_* columns). Older flights have just the planned path.
+    Best-effort: any import/parse failure simply omits the overlay."""
+    carrot = {}
+    try:                                  # planned path (needs Vicon_control on sys.path)
+        _dc = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "drone_control")
+        if _dc not in sys.path:
+            sys.path.insert(0, _dc)
+        from Vicon_control.planned_path import planned_path
+        planned = planned_path(path)
+        if planned:
+            carrot.update(planned)
+    except Exception:
+        pass
+    # logged moving setpoint — only if the columns exist AND actually hold values
+    # (a hand-flown flight carries all-blank sp_* columns; skip those).
+    if all(k in m for k in ("sp_x", "sp_y", "sp_z")) and np.isfinite(col("sp_x")).any():
+        carrot["cx"], carrot["cy"], carrot["cz"] = col("sp_x"), col("sp_y"), col("sp_z")
+        if "sp_yaw" in m:
+            carrot["cyaw"] = col("sp_yaw")
+    return carrot or None
 
 
 def load_channels(path):
@@ -436,8 +465,9 @@ def load_channels(path):
 
     quat = ({q: col("b1_" + q) for q in ("qx", "qy", "qz", "qw")}
             if has("b1_qx", "b1_qy", "b1_qz", "b1_qw") else None)
+    carrot = _load_carrot(path, m, t, col)
     return dict(t=t, panels=panels, x=x, y=y, z=z, color_opts=color_opts,
-                quat=quat, meta=meta, path=path)
+                quat=quat, meta=meta, path=path, carrot=carrot)
 
 
 def single_panel_fig(panel, window):
@@ -481,11 +511,13 @@ def single_panel_fig(panel, window):
 ORIENT_COLOR = "#000000"       # distinct from the Viridis trajectory
 
 
-def _orientation_traces(data, mask):
+def _orientation_traces(data, mask, arm_len=None):
     """A small weather-flag 'L' on EVERY shown point: long arm = body forward
     (×2), short arm = body up (×1), perpendicular. One trace (disconnected
     segments via None breaks), one distinct color. Each L is sized to the local
-    point spacing so it sits right at its point rather than floating over the path."""
+    point spacing so it sits right at its point rather than floating over the path.
+    arm_len overrides the long-arm length (used for the single current-pose flag in
+    playback, where there's no local spacing to measure)."""
     q = data["quat"]
     X, Y, Z = data["x"][mask], data["y"][mask], data["z"][mask]
     n = X.size
@@ -495,7 +527,9 @@ def _orientation_traces(data, mask):
     # Long arm = 2× the median inter-point spacing (was 1×); short arm stays at
     # half the long arm, preserving the 2:1 length:height proportion.
     ARM_SCALE = 2.0
-    if n > 1:
+    if arm_len is not None:
+        l_long = float(arm_len)
+    elif n > 1:
         d = np.linalg.norm(np.diff(P, axis=0), axis=1)
         d = d[d > 0]
         l_long = ARM_SCALE * (float(np.median(d)) if d.size else 1e-3)
@@ -520,7 +554,43 @@ def _orientation_traces(data, mask):
                         name="orientation (long=facing, short=up)")
 
 
-def build_3d(data, color_by, window, show_orient=False):
+CARROT_COLOR = "#ff7f0e"        # setpoint/carrot overlay — orange, off the Viridis scale
+DRONE_COLOR = "#1f77b4"         # the moving "drone now" marker in playback
+_3D_HINT = "(drag = rotate · right-click/ctrl-drag = pan · scroll = zoom)"
+
+
+def _axis_range(*arrays):
+    """[lo, hi] spanning every finite value across the arrays (+ a small pad), or
+    None. Used to FIX the playback view so it doesn't rescale as the trail grows."""
+    vals = [np.asarray(a, float).ravel() for a in arrays
+            if a is not None and len(a)]
+    if not vals:
+        return None
+    v = np.concatenate(vals)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return None
+    lo, hi = float(v.min()), float(v.max())
+    pad = max((hi - lo) * 0.05, 0.05)
+    return [lo - pad, hi + pad]
+
+
+def build_3d(data, color_by, window, show_orient=False, *, mode="window",
+             playhead=None, show_carrot=False):
+    """3D trajectory figure in one of two modes:
+      'window'   — the slice inside the time window (the original behavior).
+      'playback' — the flight UP TO `playhead` seconds, with a moving drone (and,
+                   if logged, setpoint) marker — i.e. one frame of a video scrub.
+    With show_carrot the planned setpoint path is overlaid; in playback the logged
+    moving carrot (sp_*) is drawn too, alongside the drone, so the two evolve
+    together as you play."""
+    carrot = data.get("carrot") if show_carrot else None
+    if mode == "playback":
+        return _build_3d_playback(data, color_by, playhead, show_orient, carrot)
+    return _build_3d_window(data, color_by, window, show_orient, carrot)
+
+
+def _build_3d_window(data, color_by, window, show_orient, carrot):
     t = data["t"]
     lo, hi = window
     mask = (t >= lo) & (t <= hi)
@@ -529,6 +599,11 @@ def build_3d(data, color_by, window, show_orient=False):
     x, y, z = data["x"][mask], data["y"][mask], data["z"][mask]
     c = data["color_opts"].get(color_by, t)[mask]
     fig = go.Figure()
+    if carrot and "ref_x" in carrot:        # the designed course, drawn underneath
+        fig.add_trace(go.Scatter3d(
+            x=carrot["ref_x"], y=carrot["ref_y"], z=carrot["ref_z"], mode="lines",
+            line=dict(color=CARROT_COLOR, width=4), opacity=0.55,
+            name="planned setpoint path", hoverinfo="skip"))
     fig.add_trace(go.Scatter3d(
         x=x, y=y, z=z, mode="markers+lines", name="trajectory",
         marker=dict(size=2, color=c, colorscale="Viridis", showscale=True,
@@ -550,8 +625,85 @@ def build_3d(data, color_by, window, show_orient=False):
         legend=dict(x=0.0, y=0.99, xanchor="left", yanchor="top",
                     bgcolor="rgba(255,255,255,0.7)"),
         uirevision="keep3d",
-        title=f"3D trajectory — {color_by}   "
-              "(drag = rotate · right-click/ctrl-drag = pan · scroll = zoom)")
+        title=f"3D trajectory — {color_by}   " + _3D_HINT)
+    return fig
+
+
+def _build_3d_playback(data, color_by, playhead, show_orient, carrot):
+    t = data["t"]
+    t0, t1 = float(t[0]), float(t[-1])
+    th = t1 if playhead is None else float(playhead)
+    N = t.size
+    # Subsample the growing/context traces so a ~10 fps rebuild stays snappy; the
+    # "now" markers below use the full-res sample, so the position stays exact.
+    stride = max(1, N // 1500)
+    sl = slice(None, None, stride)
+    td = t[sl]
+    xd, yd, zd = data["x"][sl], data["y"][sl], data["z"][sl]
+    cfull = np.asarray(data["color_opts"].get(color_by, t), float)
+    cd = cfull[sl]
+    cmin, cmax = float(np.nanmin(cfull)), float(np.nanmax(cfull))
+    seen = td <= th
+    if not seen.any():
+        seen[0] = True
+    cur = int(np.nonzero(t <= th)[0][-1]) if (t <= th).any() else 0
+
+    rx, ry, rz = [data["x"]], [data["y"]], [data["z"]]   # for fixed axis ranges
+    fig = go.Figure()
+    # context: faint full flight path + faint full planned path
+    fig.add_trace(go.Scatter3d(x=xd, y=yd, z=zd, mode="lines",
+        line=dict(color="rgba(140,140,140,0.25)", width=2),
+        name="full flight", hoverinfo="skip"))
+    if carrot and "ref_x" in carrot:
+        fig.add_trace(go.Scatter3d(x=carrot["ref_x"], y=carrot["ref_y"], z=carrot["ref_z"],
+            mode="lines", line=dict(color=CARROT_COLOR, width=3), opacity=0.3,
+            name="planned setpoint path", hoverinfo="skip"))
+        rx.append(carrot["ref_x"]); ry.append(carrot["ref_y"]); rz.append(carrot["ref_z"])
+    # actual flight, flown so far (colored — this is what "evolves" as you play)
+    fig.add_trace(go.Scatter3d(x=xd[seen], y=yd[seen], z=zd[seen], mode="lines+markers",
+        marker=dict(size=2, color=cd[seen], colorscale="Viridis", cmin=cmin, cmax=cmax,
+                    showscale=True, colorbar=dict(title=color_by, thickness=14, x=1.0,
+                                                  xanchor="left", len=0.85)),
+        line=dict(color="rgba(70,70,70,0.6)", width=3), name="flown"))
+    # drone "now"
+    fig.add_trace(go.Scatter3d(x=[data["x"][cur]], y=[data["y"][cur]], z=[data["z"][cur]],
+        mode="markers", marker=dict(size=6, color=DRONE_COLOR), name="drone"))
+    # logged moving carrot: trail so far + "now" diamond + tracking-error connector
+    if carrot and "cx" in carrot:
+        cx, cy, cz = carrot["cx"], carrot["cy"], carrot["cz"]
+        rx.append(cx); ry.append(cy); rz.append(cz)
+        cxd, cyd, czd = cx[sl], cy[sl], cz[sl]
+        tm = seen & np.isfinite(cxd)
+        fig.add_trace(go.Scatter3d(x=cxd[tm], y=cyd[tm], z=czd[tm], mode="lines",
+            line=dict(color=CARROT_COLOR, width=3), opacity=0.75,
+            name="setpoint trail", hoverinfo="skip"))
+        if np.isfinite(cx[cur]):
+            fig.add_trace(go.Scatter3d(x=[cx[cur]], y=[cy[cur]], z=[cz[cur]], mode="markers",
+                marker=dict(size=6, color=CARROT_COLOR, symbol="diamond"), name="setpoint"))
+            fig.add_trace(go.Scatter3d(
+                x=[data["x"][cur], cx[cur]], y=[data["y"][cur], cy[cur]],
+                z=[data["z"][cur], cz[cur]], mode="lines",
+                line=dict(color="rgba(214,39,40,0.85)", width=2, dash="dot"),
+                name="tracking error", hoverinfo="skip"))
+    # orientation flag at the current pose (sized to the trajectory spacing)
+    if show_orient and data.get("quat"):
+        P = np.column_stack([data["x"], data["y"], data["z"]])
+        dd = np.linalg.norm(np.diff(P, axis=0), axis=1); dd = dd[dd > 0]
+        arm = 2.0 * (float(np.median(dd)) if dd.size else 1e-3)
+        cmask = np.zeros(N, bool); cmask[cur] = True
+        ot = _orientation_traces(data, cmask, arm_len=arm)
+        if ot is not None:
+            fig.add_trace(ot)
+    fig.update_layout(
+        autosize=True, margin=dict(l=0, r=0, t=36, b=0),
+        scene=dict(xaxis=dict(title="x (m)", range=_axis_range(*rx)),
+                   yaxis=dict(title="y (m)", range=_axis_range(*ry)),
+                   zaxis=dict(title="z (m)", range=_axis_range(*rz)),
+                   aspectmode="data"),
+        legend=dict(x=0.0, y=0.99, xanchor="left", yanchor="top",
+                    bgcolor="rgba(255,255,255,0.7)"),
+        uirevision="keep3d",
+        title=f"3D playback — t = {th:5.1f} / {t1:.1f} s — {color_by}")
     return fig
 
 
@@ -599,6 +751,7 @@ _FS_ID_JS = """function(n){
 
 GCFG = {"scrollZoom": True, "displaylogo": False, "responsive": True}
 _SLIDER_TIP = {"placement": "bottom", "always_visible": False}   # shows only while dragging
+PLAY_MS = 100            # playback timer tick (ms); flight-time/tick = PLAY_MS/1000 × speed
 
 
 def _fs_button(bid):
@@ -690,6 +843,16 @@ def make_app(data, title):
                                updatemode="drag" if live else "mouseup",
                                tooltip=_SLIDER_TIP)
 
+    # The setpoint overlay option only appears for flights that have one (a mission's
+    # planned path and/or logged sp_* columns); default it ON when available.
+    has_carrot = data.get("carrot") is not None
+    show3d_opts = [{"label": " show 3D", "value": "on"},
+                   {"label": " overlay orientation (L)", "value": "orient"}]
+    show3d_val = ["on"]
+    if has_carrot:
+        show3d_opts.append({"label": " overlay setpoint/carrot path", "value": "carrot"})
+        show3d_val.append("carrot")
+
     app.layout = html.Div(style={"fontFamily": "system-ui, sans-serif", "margin": "0 14px"},
                           children=[
         html.H3(title, style={"marginBottom": "2px"}),
@@ -715,19 +878,49 @@ def make_app(data, title):
         # ---------- 3D SECTION ----------
         _section_head("3D trajectory"),
         html.Div(style={"display": "flex", "gap": "18px", "alignItems": "flex-start"}, children=[
-            html.Div(style={"flex": "0 0 220px"}, children=[
-                dcc.Checklist(id="show3d",
-                              options=[{"label": " show 3D", "value": "on"},
-                                       {"label": " overlay orientation (L)", "value": "orient"}],
-                              value=["on"]),
-                html.Label("color by", style={"fontSize": "12px"}),
+            html.Div(style={"flex": "0 0 230px"}, children=[
+                dcc.Checklist(id="show3d", options=show3d_opts, value=show3d_val,
+                              labelStyle={"display": "block"}),
+                html.Label("view mode", style={"fontWeight": "600", "fontSize": "12px",
+                                                "marginTop": "10px", "display": "block"}),
+                dcc.RadioItems(id="mode3d",
+                               options=[{"label": " window", "value": "window"},
+                                        {"label": " playback (video)", "value": "playback"}],
+                               value="window",
+                               labelStyle={"display": "block", "fontSize": "13px"}),
+                html.Label("color by", style={"fontSize": "12px", "marginTop": "10px",
+                                              "display": "block"}),
                 dcc.Dropdown(id="color3d",
                              options=[{"label": c, "value": c} for c in color_choices],
                              value="time", clearable=False, style={"width": "180px"})]),
             html.Div(style={"flex": "1 1 auto"}, children=[
-                html.Label("Time window — 3D trajectory (s) — live",
-                           style={"fontWeight": "600", "fontSize": "13px"}),
-                time_slider("win3d", live=True),
+                # window mode: the original two-handle time-window slider
+                html.Div(id="win3d-wrap", children=[
+                    html.Label("Time window — 3D trajectory (s) — live",
+                               style={"fontWeight": "600", "fontSize": "13px"}),
+                    time_slider("win3d", live=True)]),
+                # playback mode: play / pause / speed + a single-handle playhead, like
+                # a video scrubber (hidden until the mode is switched).
+                html.Div(id="play3d-wrap", style={"display": "none"}, children=[
+                    html.Div(style={"display": "flex", "alignItems": "center",
+                                    "gap": "12px", "marginBottom": "6px"}, children=[
+                        html.Button("▶ Play", id="play-btn", n_clicks=0,
+                                    style={"cursor": "pointer", "fontSize": "14px",
+                                           "padding": "3px 16px", "flex": "0 0 auto"}),
+                        html.Label("speed", style={"fontSize": "12px"}),
+                        dcc.Dropdown(id="play-speed",
+                                     options=[{"label": f"{s}×", "value": s}
+                                              for s in (0.25, 0.5, 1, 2, 4)],
+                                     value=1, clearable=False, style={"width": "88px"}),
+                        html.Span("drag the bar to scrub · Play to watch the flight "
+                                  "(and setpoint) evolve",
+                                  style={"fontSize": "12px", "color": "#888"})]),
+                    dcc.Slider(id="play3d", min=t0, max=t1, value=t0,
+                               step=max((t1 - t0) / 1000.0, 1e-3),
+                               marks=_slider_marks(t0, t1),
+                               updatemode="drag", tooltip=_SLIDER_TIP),
+                    dcc.Interval(id="play-timer", interval=PLAY_MS, disabled=True),
+                    dcc.Store(id="play-on", data=False)]),
                 html.Div(id="traj3d-wrap", style={
                     "height": "660px", "display": "flex", "flexDirection": "column",
                     "marginTop": "10px", "background": "#fff"}, children=[
@@ -791,13 +984,57 @@ def make_app(data, title):
             out.append(patch)
         return out
 
+    # Show the window slider OR the playback controls, per the mode toggle.
+    @app.callback(Output("win3d-wrap", "style"), Output("play3d-wrap", "style"),
+                  Input("mode3d", "value"))
+    def _mode_vis(mode):
+        shown, hidden = {"display": "block"}, {"display": "none"}
+        return (hidden, shown) if mode == "playback" else (shown, hidden)
+
+    # The 3D figure: driven by the window slider in window mode and by the playhead
+    # in playback mode (both are Inputs; build_3d uses whichever the mode selects).
     @app.callback(Output("traj3d", "figure"),
-                  Input("show3d", "value"), Input("color3d", "value"), Input("win3d", "value"))
-    def _t3(show, color, window):
-        if "on" not in (show or []):
+                  Input("show3d", "value"), Input("color3d", "value"),
+                  Input("mode3d", "value"), Input("win3d", "value"),
+                  Input("play3d", "value"))
+    def _t3(show, color, mode, window, playhead):
+        show = show or []
+        if "on" not in show:
             return go.Figure(layout=dict(annotations=[dict(
                 text="3D hidden", showarrow=False, font=dict(size=16))]))
-        return build_3d(data, color, window, show_orient="orient" in (show or []))
+        return build_3d(data, color, window, show_orient="orient" in show,
+                        mode=mode, playhead=playhead, show_carrot="carrot" in show)
+
+    # Play/Pause button: toggle the run state, flip the timer, relabel the button.
+    # Pressing Play at the very end restarts from the beginning.
+    @app.callback(Output("play-on", "data"), Output("play-timer", "disabled"),
+                  Output("play-btn", "children"), Output("play3d", "value"),
+                  Input("play-btn", "n_clicks"),
+                  dash.State("play-on", "data"), dash.State("play3d", "value"),
+                  prevent_initial_call=True)
+    def _toggle_play(_n, on, val):
+        on = not bool(on)
+        newval = dash.no_update
+        if on and val is not None and float(val) >= t1 - 1e-6:
+            newval = t0                       # at the end → rewind, then play
+        return on, (not on), ("⏸ Pause" if on else "▶ Play"), newval
+
+    # Advance the playhead each timer tick while playing; stop at the end.
+    @app.callback(Output("play3d", "value", allow_duplicate=True),
+                  Output("play-on", "data", allow_duplicate=True),
+                  Output("play-timer", "disabled", allow_duplicate=True),
+                  Output("play-btn", "children", allow_duplicate=True),
+                  Input("play-timer", "n_intervals"),
+                  dash.State("play-on", "data"), dash.State("play3d", "value"),
+                  dash.State("play-speed", "value"),
+                  prevent_initial_call=True)
+    def _advance(_n, on, val, speed):
+        if not on:
+            raise dash.exceptions.PreventUpdate
+        nxt = (t0 if val is None else float(val)) + float(speed) * (PLAY_MS / 1000.0)
+        if nxt >= t1:
+            return t1, False, True, "▶ Play"          # reached the end → pause
+        return nxt, dash.no_update, dash.no_update, dash.no_update
 
     # Per-graph fullscreen (2D, pattern-matching) + 3D fullscreen.
     app.clientside_callback(_FS_MATCH_JS,

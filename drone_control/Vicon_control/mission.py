@@ -300,7 +300,10 @@ def _line_seg(p0, p1, label, yaw=None):
         return (p0[0] + dx * f, p0[1] + dy * f)
 
     return {"type": "move", "at": at, "len": length, "label": label,
-            "yaw": yaw, "heading": lambda s: hdg}
+            "yaw": yaw, "heading": lambda s: hdg,
+            # Lossless geometry for offline reconstruction (the dashboard's carrot
+            # overlay) — `len`+`end` alone can't tell a line from an arc.
+            "geom": {"kind": "line", "p0": [p0[0], p0[1]], "p1": [p1[0], p1[1]]}}
 
 
 def _arc_seg(center, radius, theta0, dtheta, label, yaw=None):
@@ -321,12 +324,15 @@ def _arc_seg(center, radius, theta0, dtheta, label, yaw=None):
         return math.atan2(sgn * math.cos(th), -sgn * math.sin(th))
 
     return {"type": "move", "at": at, "len": length, "label": label,
-            "yaw": yaw, "heading": heading}
+            "yaw": yaw, "heading": heading,
+            "geom": {"kind": "arc", "center": [center[0], center[1]],
+                     "radius": radius, "theta0": theta0, "dtheta": dtheta}}
 
 
 def _dwell_seg(point, dur, label, yaw=None):
     return {"type": "dwell", "point": (point[0], point[1]), "dur": dur,
-            "label": label, "yaw": yaw}
+            "label": label, "yaw": yaw,
+            "geom": {"kind": "dwell", "point": [point[0], point[1]]}}
 
 
 class PathMission:
@@ -414,10 +420,32 @@ class PathMission:
         return pyaw is None or abs(_wrap_pi(pyaw - target)) < self.yaw_tol
 
     def _next_seg(self):
+        # Carry the carrot speed straight into the next segment when BOTH this
+        # segment and the next are moves (a continuous-tangent joint, e.g. the
+        # figure-8's crossover) — flow through instead of braking to a stop.
+        # Otherwise (move→dwell, dwell→move, or the course end) reset to rest, as
+        # before — so the circle/square (every move is followed by a dwell) are
+        # byte-for-byte unchanged.
+        flowing = (self.segs[self.i]["type"] == "move"
+                   and self.i + 1 < len(self.segs)
+                   and self.segs[self.i + 1]["type"] == "move")
         self.i += 1
-        self.s = self.v = self.dwell_elapsed = self.t_in_seg = 0.0
+        self.s = self.dwell_elapsed = self.t_in_seg = 0.0
+        if not flowing:
+            self.v = 0.0
         if self.i >= len(self.segs):
             self.done = True
+
+    def _exit_speed(self):
+        """Carrot speed to AIM FOR at the end of the current move: cruise if the
+        next segment is also a move (flow through the joint at speed), else 0 (brake
+        to a stop for a dwell / the course end). Flowing is only smooth when the
+        joint is tangent-continuous — the course builder owns that (build_figure8_
+        mission alternates loop senses so the crossover tangent matches)."""
+        nxt = self.i + 1
+        if nxt < len(self.segs) and self.segs[nxt]["type"] == "move":
+            return self.cruise
+        return 0.0
 
     def update(self, pose, dt, airborne):
         if self.done or self.i >= len(self.segs):
@@ -440,11 +468,15 @@ class PathMission:
                 self._next_seg()
         else:  # move — flow the carrot along the path, trapezoid speed, leashed
             if airborne:
-                # Speed up at `accel`, capped by cruise AND by the braking
-                # parabola sqrt(2*a*remaining) so it reaches the end at v=0.
+                # Speed up at `accel`, capped by cruise AND by the braking parabola
+                # sqrt(v_exit² + 2*a*remaining) so it reaches the segment end at
+                # v_exit: 0 before a dwell/end (brake to a stop, the old behavior),
+                # or cruise before another move (flow straight through, e.g. the
+                # figure-8 crossover — no tilt-clamp punch from a stop-and-go).
                 remaining = max(seg["len"] - self.s, 0.0)
+                v_exit = self._exit_speed()
                 v_next = min(self.cruise, self.v + self.accel * dt,
-                             math.sqrt(2.0 * self.accel * remaining))
+                             math.sqrt(v_exit * v_exit + 2.0 * self.accel * remaining))
                 ns = min(self.s + v_next * dt, seg["len"])
                 nx, ny = seg["at"](ns)
                 if (self.leash > 0.0
@@ -507,15 +539,18 @@ class PathMission:
         for seg in self.segs:
             yaw_spec = (seg["yaw"] if seg["yaw"] in (None, "tangent")
                         else math.degrees(seg["yaw"]))
+            # `geom` is the lossless shape (line endpoints / arc center+sweep / dwell
+            # point) so an offline tool can re-trace the exact carrot path; `end`/
+            # `len_m` stay for human-readability and backward compatibility.
             if seg["type"] == "dwell":
                 segs.append({"type": "dwell", "label": seg["label"],
                              "point": list(seg["point"]), "dwell_s": seg["dur"],
-                             "yaw": yaw_spec})
+                             "yaw": yaw_spec, "geom": seg.get("geom")})
             else:
                 end = seg["at"](seg["len"])
                 segs.append({"type": "move", "label": seg["label"],
                              "len_m": seg["len"], "end": list(end),
-                             "yaw": yaw_spec})
+                             "yaw": yaw_spec, "geom": seg.get("geom")})
         return {"kind": "path", "cruise_mps": self.cruise,
                 "accel_mps2": self.accel, "leash_m": self.leash,
                 "arrive_tol_m": self.arrive_tol, "z": self.z,
@@ -572,4 +607,61 @@ def build_circle_mission(launch):
     return PathMission(
         launch, segs,
         cruise_mps=config.CRUISE_SPEED_MPS, leash_m=config.LEASH_M,
+        arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S)
+
+
+# ----------------------------------------------------------------------------- #
+def build_figure8_mission(launch):
+    """Build the figure-8 course from config: take off + hover AT the figure-8's
+    crossover (which IS the launch origin), trace FIG8_LAPS full figure-8s, settle
+    back at the origin, land. Structurally the circle's twin — same PathMission,
+    same carrot/feedforward/leash/dwell machinery — just a different path.
+
+    The figure-8 is two circles tangent at the launch origin, long axis along WORLD
+    X: a RIGHT loop (centre (x0+R, y0)) and a LEFT loop (centre (x0-R, y0)), each of
+    radius R = FIG8_END_X_M/2, so the far ends pass through (x0±FIG8_END_X_M, y0).
+    The loops are traced in OPPOSITE senses (right CCW, left CW for FIG8_CW=False),
+    which makes the path tangent CONTINUOUS at the crossover (both point world -Y),
+    so the carrot FLOWS straight through at cruise (PathMission._exit_speed) — one
+    smooth ∞, no stop at the centre. Only the first loop ramps up from the takeoff
+    hover and only the last brakes into the home-settle dwell.
+
+    Heading: with FIG8_FACE_TANGENT the nose follows the travel direction — the
+    takeoff dwell pre-rotates to the first loop's start tangent and GATES on the
+    nose getting there, the home dwell rotates back to the launch heading. Default
+    OFF: at the default speed/radius the figure-8's yaw rate (v/R) is double the
+    circle's and exceeds the yaw authority (see config) — so the whole figure-8 is
+    strafed at the launch heading, the drone translating along the ∞.
+
+    Unlike the circle there is NO forward approach leg: the crossover is the launch
+    point, so the drone is already on the path at takeoff."""
+    x0, y0, z0, yaw0 = launch
+    r = 0.5 * config.FIG8_END_X_M            # loop radius (half the centre→end span)
+    c_right, c_left = (x0 + r, y0), (x0 - r, y0)   # loop centres, on the world-X axis
+    laps = max(1, int(config.FIG8_LAPS))
+    sweep = 2.0 * math.pi
+    # First (right) loop sense: CCW (+) departs the crossover heading world -Y; CW
+    # (-) departs +Y. The left loop always takes the OPPOSITE sense so its start
+    # tangent matches the right loop's exit and the carrot flows through unbroken.
+    d_right = -sweep if config.FIG8_CW else sweep
+    d_left = sweep if config.FIG8_CW else -sweep
+    th_right, th_left = math.pi, 0.0         # the crossover's angle on each loop
+    face = config.FIG8_FACE_TANGENT
+    yaw_arc = "tangent" if face else None
+    arcs = []
+    for k in range(laps):
+        arcs.append(_arc_seg(c_right, r, th_right, d_right,
+                             f"R-loop {k + 1}/{laps}", yaw=yaw_arc))
+        arcs.append(_arc_seg(c_left, r, th_left, d_left,
+                             f"L-loop {k + 1}/{laps}", yaw=yaw_arc))
+    # Tangent-facing: pre-rotate to the first loop's start tangent during takeoff,
+    # rotate back to the launch heading during the home settle (None = hold heading).
+    yaw_start = arcs[0]["heading"](0.0) if face else None
+    yaw_home = yaw0 if face else None
+    segs = [_dwell_seg((x0, y0), config.INITIAL_HOVER_S, "takeoff/hover", yaw=yaw_start)]
+    segs += arcs
+    segs.append(_dwell_seg((x0, y0), config.SETTLE_S, "home/settle", yaw=yaw_home))
+    return PathMission(
+        launch, segs,
+        cruise_mps=config.FIG8_SPEED_MPS, leash_m=config.LEASH_M,
         arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S)

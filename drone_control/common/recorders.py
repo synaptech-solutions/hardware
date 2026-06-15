@@ -452,15 +452,26 @@ class CommandLogger:
         self.n_axes = n_axes
         self.n_buttons = n_buttons
 
-    def log(self, t_wall, ch, armed, record_on, axes, buttons):
-        """One row: timestamps, all 16 channel µs, arm/record flags, then the
-        raw joystick axes and buttons (blank where the device didn't report)."""
+    # World-frame SETPOINT ("carrot") columns appended to each row when an
+    # autonomous controller supplies one (blank for hand-flown frames / on the
+    # ground). These are the reference the controller tracked — position, heading,
+    # and the carrot's own velocity feedforward — so a flight's planned vs actual
+    # path can be overlaid afterwards without reconstructing it (see the dashboard).
+    SP_COLS = ["sp_x", "sp_y", "sp_z", "sp_yaw", "sp_vx", "sp_vy"]
+
+    def log(self, t_wall, ch, armed, record_on, axes, buttons, setpoint=None):
+        """One row: timestamps, all 16 channel µs, arm/record flags, the raw
+        joystick axes + buttons (blank where the device didn't report), then the
+        world-frame setpoint (blank when no controller setpoint this frame).
+
+        setpoint: (x, y, z, yaw, vx, vy) in world frame, or None."""
         row = [t_wall - self.t0, t_wall]
         row.extend(int(c) for c in ch)
         row.append(1 if armed else 0)
         row.append(1 if record_on else 0)
         row.extend(axes.get(i, "") for i in range(self.n_axes))
         row.extend(buttons.get(i, "") for i in range(self.n_buttons))
+        row.extend(setpoint if setpoint is not None else [""] * len(self.SP_COLS))
         self.rows.append(row)
 
     def save(self):
@@ -470,7 +481,8 @@ class CommandLogger:
                   + [f"ch{i:02d}_us" for i in range(16)]
                   + ["armed", "record_on"]
                   + [f"ax{i}" for i in range(self.n_axes)]
-                  + [f"btn{i}" for i in range(self.n_buttons)])
+                  + [f"btn{i}" for i in range(self.n_buttons)]
+                  + self.SP_COLS)
         os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
         with open(self.path, "w", newline="") as f:
             w = csv.writer(f)

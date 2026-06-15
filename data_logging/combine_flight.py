@@ -242,6 +242,7 @@ def load_commands(path):
         np.zeros(0, bool)
     keep = [c for c in header if c.startswith("ch") and c.endswith("_us")]
     keep += [c for c in ("armed", "record_on") if c in cols]
+    keep += [c for c in header if c.startswith("sp_")]   # autonomous setpoint ("carrot")
     series = {c: _to_float(cols[c])[order][keepinc] for c in keep}
     return t_sorted[keepinc], series
 
@@ -494,8 +495,12 @@ def main():
             cols[f"motor_cmd_{m}"] = _interp_lin(
                 bb_q, bb_rel, bb_cols[f"motor_{m}"], bb_lo, bb_hi)
 
-    # Outgoing commands -> cmd_<name>. If commands IS the master clock, the values
-    # are already on tq (use as-is); otherwise zero-order-hold onto tq.
+    # Outgoing commands -> cmd_<name>; the autonomous setpoint -> sp_<name> (kept
+    # under its own prefix — it is the controller's reference, not a raw channel).
+    # If commands IS the master clock the values are already on tq; otherwise
+    # zero-order-hold onto tq (NaN-safe: blanks/non-flying frames stay blank).
+    def _merged_name(c):
+        return c if c.startswith("sp_") else "cmd_" + c
     n_cmd = 0
     if cmd is not None:
         ct, cser = cmd
@@ -503,11 +508,11 @@ def main():
         if n_cmd:
             if master == "commands":
                 for c, y in cser.items():
-                    cols["cmd_" + c] = y
+                    cols[_merged_name(c)] = y
             else:
                 clo, chi = ct[0], ct[-1]
                 for c, y in cser.items():
-                    cols["cmd_" + c] = _interp_hold(tq, ct, y, clo, chi)
+                    cols[_merged_name(c)] = _interp_hold(tq, ct, y, clo, chi)
 
     # Incoming telemetry -> tlm_<name> (linear measurements, hold for categorical).
     n_tlm_ch = 0

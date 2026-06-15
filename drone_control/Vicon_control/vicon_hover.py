@@ -441,6 +441,7 @@ def run(args, make_mission=None):
             ch[channels.AUX2_CH] = (channels.AUX2_HIGH_US if state in ("FLYING", "LANDING")
                                     else aux2_us_for_switch(js, cal.get("record")))
             ctl_out = None
+            setpoint = None        # world-frame carrot to log this frame (None = blank)
             if state == "FLYING" and pose_fresh:
                 # Until airborne (TAKEOFF_AIRBORNE_M above the launch altitude), hold
                 # level + freeze horizontal integrators so it lifts straight up.
@@ -455,6 +456,7 @@ def run(args, make_mission=None):
                 (tx, ty, tz, tyaw, tvx, tvy,
                  tax, tay, done) = mission.update(pose, dt, airborne)
                 controller.set_setpoint(tx, ty, tz, tyaw, tvx, tvy, tax, tay)
+                setpoint = (tx, ty, tz, tyaw, tvx, tvy)   # logged → dashboard overlay
                 ctl_out = controller.step(pose, dt, level_only=not airborne)
                 if done and not land_requested:
                     land_requested = True
@@ -475,7 +477,8 @@ def run(args, make_mission=None):
 
             # --- log every commanded frame while a session is active ---
             if sess_active:
-                cmd_log.log(now_wall, ch, tx_armed, record_on, js.axes, js.buttons)
+                cmd_log.log(now_wall, ch, tx_armed, record_on, js.axes, js.buttons,
+                            setpoint=setpoint)
 
             # --- transmit (+ keepalive ping + 10 Hz MSP IMU poll), like the logger ---
             if ser is not None:
