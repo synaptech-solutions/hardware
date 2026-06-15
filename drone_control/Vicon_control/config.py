@@ -368,47 +368,43 @@ YAW_ARRIVE_TOL_DEG = 5.0       # a dwell with a heading target waits (same arriv
 # figure8_flight.py: take off + hover AT the figure-8's crossover (the launch
 # origin), trace one full figure-8, settle back at the origin, land — the circle's
 # twin (same PathMission / carrot / feedforward / leash / dwell machinery). The
-# figure-8 is two circles tangent at the launch origin, long axis along WORLD X: a
-# RIGHT loop (centre (x0+R, y0)) and a LEFT loop (centre (x0-R, y0)), radius R =
-# FIG8_END_X_M/2, so the far ends pass through (x0±FIG8_END_X_M, y0). The loops are
-# traced in OPPOSITE senses, so the path tangent is CONTINUOUS at the crossover
-# (both world -Y) and the carrot flows through at cruise — one smooth ∞, no stop at
-# the centre. Reuses LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / INITIAL_HOVER_S /
-# SETTLE_S / CARROT_ACCEL_MPS2, exactly like the circle. Held at CLIMB_M above
-# launch (set CLIMB_M=1.0 for the spec'd flat 1 m height).
+# path is a single smooth LEMNISCATE OF BERNOULLI (mission._lemniscate_seg), long
+# axis along WORLD X, half-span FIG8_END_X_M, so the far ends pass through
+# (x0±FIG8_END_X_M, y0) and the crossover is the launch origin. Reuses LEASH_M /
+# ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / INITIAL_HOVER_S / SETTLE_S / CARROT_ACCEL_MPS2,
+# exactly like the circle. Held at CLIMB_M above launch (set CLIMB_M=1.0 for the
+# spec'd flat 1 m height).
 #
-# !!! DYNAMICS — READ BEFORE FLYING !!! The figure-8 loops are HALF the circle's
-# radius (R=0.5 m for the default ±1 m ends), so at a GIVEN SPEED the centripetal
-# load is DOUBLE the circle's and it REVERSES sign at every crossover (the right
-# loop banks one way, the left the other — a fast roll reversal as the carrot
-# crosses the centre). At FIG8_SPEED_MPS = 2 m/s, R=0.5: centripetal v²/R = 8 m/s²
-# → 39° of bank (vs the circle's 22° at 2 m/s, R=1), and it REVERSES sign at every
-# crossover (a fast roll flip as the carrot crosses the centre, smoothed by
-# ACCEL_FF_LPF_S). The accel-FF cap was raised 6→9 m/s² so the feedforward now
-# SUPPLIES that full 39° lean (at the old 6 it clipped to 31° and the loops tracked
-# loose) — but that leaves only ~6° of PID headroom under the 45° MAX_TILT clamp.
-# The tangent yaw rate v/R = 229°/s still far exceeds the ~147°/s yaw authority, so
-# FIG8_FACE_TANGENT must stay False. For more margin (and a gentler crossover), fly
-# the figure-8 at ~1.0–1.2 m/s — there v/R and v²/R equal the circle's. DRY-RUN
-# first and watch the commanded bank in the segment plan.
+# !!! DYNAMICS — READ BEFORE FLYING !!! This replaces the old two-tangent-circles ∞,
+# whose curvature flipped sign (+1/R → -1/R) at the crossover — an INSTANT lateral-
+# accel reversal (±8 m/s² at 2 m/s, a 16 m/s² step) the drone couldn't track, which
+# is why the loops deviated at the centre. The lemniscate's curvature is CONTINUOUS:
+# ZERO at the crossover (the drone flies nearly straight through) and peaking at
+# κ = 3/FIG8_END_X_M at the FAR ENDS. So the worst-case bank is now at the ends, not
+# the centre: centripetal v²·κ = v²·3/FIG8_END_X_M. At FIG8_END_X_M=1.0 that is
+# 3·v² m/s² → keep it under the 9 m/s² accel-FF cap (g·tan45°≈9.8 tilt clamp) with
+# PID headroom, i.e. v ≲ 1.5 m/s; the default below is 1.2 m/s (peak ≈ 4.3 m/s² →
+# 24° bank, like the circle). The tangent yaw rate also peaks at v·3/FIG8_END_X_M
+# (206°/s at 1.2 m/s) > the ~147°/s yaw authority, so FIG8_FACE_TANGENT must stay
+# False unless you slow down further. DRY-RUN and preview.py first.
 FIG8_END_X_M = 1.0             # centre→end distance along world X; loop radius R is
                                # half this. Far ends pass through (±FIG8_END_X_M, 0).
 FIG8_LAPS = 1                  # full figure-8 traversals (each = right loop + left
                                # loop). The whole run flows at cruise; only the first
                                # loop ramps up and only the last brakes to the home dwell.
-FIG8_CW = False                # sense of the FIRST (right) loop viewed from above:
-                               # False = CCW first (departs the crossover heading world
-                               # -Y); True = CW first (departs +Y). The second loop
-                               # always takes the opposite sense (smooth crossover).
+FIG8_CW = False                # sense of the lemniscate (which loop is traced first,
+                               # viewed from above): False = left loop first; True =
+                               # right loop first (flips the sign of y). Both are one
+                               # continuous smooth ∞ through the crossover.
 FIG8_FACE_TANGENT = False      # nose follows the travel direction. KEEP FALSE at the
-                               # default speed/radius: the figure-8's yaw rate v/R is
-                               # 2x the circle's (229°/s at 2 m/s, R=0.5) — far over the
-                               # yaw authority. Only enable if FIG8_SPEED_MPS is low
-                               # enough that v/R < YAW_SLEW_DPS (≈1.1 m/s at R=0.5).
-FIG8_SPEED_MPS = CRUISE_SPEED_MPS   # carrot speed — defaults to the circle's so it's
-                               # "the same speed as the circle". Tune DOWN here (not
-                               # CRUISE_SPEED_MPS) to fly the figure-8 gentler / trace it
-                               # tighter without touching the proven circle (see DYNAMICS).
+                               # default speed/size: the yaw rate peaks at v·3/
+                               # FIG8_END_X_M (206°/s at 1.2 m/s) — over the ~147°/s yaw
+                               # authority. Only enable if FIG8_SPEED_MPS is low enough
+                               # that v·3/FIG8_END_X_M < YAW_SLEW_DPS.
+FIG8_SPEED_MPS = 1.2           # carrot speed. LOWER than the circle's cruise on purpose:
+                               # the lemniscate's peak curvature is 3/FIG8_END_X_M at the
+                               # ends, so peak bank ∝ v²; 1.2 m/s keeps it ~4.3 m/s² (24°,
+                               # like the circle). Raise toward ~1.5 m/s max (see DYNAMICS).
 
 # ============ loop rate (shared) ============
 TX_HZ = channels.TX_HZ         # 50 Hz, same as the data logger

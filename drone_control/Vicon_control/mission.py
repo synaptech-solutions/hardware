@@ -43,6 +43,7 @@ config.VICON_YAW_OFFSET_DEG = 90 and the controller's heading 0 is nose +X), thi
 gives (dx, dy) = (right, fwd): forward → +Y, right → +X — the expected square.
 Heading is HELD at yaw0 for the whole course (the legs are strafes, not turns).
 """
+import bisect
 import math
 
 from . import config
@@ -335,6 +336,71 @@ def _dwell_seg(point, dur, label, yaw=None):
             "geom": {"kind": "dwell", "point": [point[0], point[1]]}}
 
 
+def _param_seg(p, u0, u1, label, yaw, geom, samples=2000):
+    """Arc-length-parameterized segment for an arbitrary smooth planar curve p(u),
+    u in [u0, u1]. Densely samples the curve once to build a cumulative arc-length
+    table, so at(s) advances the carrot at UNIT speed in arc length (like the line
+    and arc segs — the trapezoid speed profile assumes that) and heading(s) is the
+    local travel direction. No analytic derivative needed: heading comes from the
+    sample spacing, which is plenty smooth at the default density."""
+    n = max(2, int(samples))
+    us = [u0 + (u1 - u0) * k / n for k in range(n + 1)]
+    pts = [p(u) for u in us]
+    cum = [0.0] * (n + 1)
+    for k in range(1, n + 1):
+        cum[k] = cum[k - 1] + math.hypot(pts[k][0] - pts[k - 1][0],
+                                         pts[k][1] - pts[k - 1][1])
+    length = cum[n]
+
+    def _idx(s):
+        # bracketing sample index i and fraction f into [pts[i], pts[i+1]]
+        if s <= 0.0:
+            return 0, 0.0
+        if s >= length:
+            return n - 1, 1.0
+        i = bisect.bisect_right(cum, s) - 1
+        span = cum[i + 1] - cum[i]
+        return i, (0.0 if span < 1e-12 else (s - cum[i]) / span)
+
+    def at(s):
+        i, f = _idx(s)
+        (x0, y0), (x1, y1) = pts[i], pts[i + 1]
+        return (x0 + (x1 - x0) * f, y0 + (y1 - y0) * f)
+
+    def heading(s):
+        i, _ = _idx(s)                       # forward diff = travel direction
+        (x0, y0), (x1, y1) = pts[i], pts[i + 1]
+        return math.atan2(y1 - y0, x1 - x0)
+
+    return {"type": "move", "at": at, "len": length, "label": label,
+            "yaw": yaw, "heading": heading, "geom": geom}
+
+
+def _lemniscate_seg(center, a, label, yaw=None, cw=False, laps=1):
+    """Smooth figure-8 — the lemniscate of BERNOULLI — centred at `center`, long
+    axis along world X, half-span `a` (the far ends sit at center ± (a, 0)). Started
+    at the CROSSOVER (parameter t0 = π/2) so the carrot begins and ends at `center`,
+    and traced for `laps` full loops.
+
+    Unlike two tangent circles (whose curvature FLIPS sign +1/R → -1/R at the
+    crossover — an instant lateral-accel reversal the drone can't track), this is a
+    single C-∞ curve: curvature is CONTINUOUS, zero at the crossover and peaking at
+    3/a at the far ends. cw flips the loop sense (sign of y)."""
+    cx, cy = center
+    sgn = -1.0 if cw else 1.0
+
+    def p(t):
+        d = 1.0 + math.sin(t) ** 2
+        return (cx + a * math.cos(t) / d, cy + sgn * a * math.sin(t) * math.cos(t) / d)
+
+    laps = max(1, int(laps))
+    t0 = 0.5 * math.pi
+    return _param_seg(p, t0, t0 + 2.0 * math.pi * laps, label, yaw,
+                      {"kind": "lemniscate", "center": [cx, cy], "a": a,
+                       "cw": cw, "laps": laps},
+                      samples=2000 * laps)
+
+
 class PathMission:
     """Continuous path follower: a carrot crawls along a concatenated parametric
     path (line + arc segments) at `cruise` m/s — leashed to the drone exactly like
@@ -617,50 +683,38 @@ def build_figure8_mission(launch):
     back at the origin, land. Structurally the circle's twin — same PathMission,
     same carrot/feedforward/leash/dwell machinery — just a different path.
 
-    The figure-8 is two circles tangent at the launch origin, long axis along WORLD
-    X: a RIGHT loop (centre (x0+R, y0)) and a LEFT loop (centre (x0-R, y0)), each of
-    radius R = FIG8_END_X_M/2, so the far ends pass through (x0±FIG8_END_X_M, y0).
-    The loops are traced in OPPOSITE senses (right CCW, left CW for FIG8_CW=False),
-    which makes the path tangent CONTINUOUS at the crossover (both point world -Y),
-    so the carrot FLOWS straight through at cruise (PathMission._exit_speed) — one
-    smooth ∞, no stop at the centre. Only the first loop ramps up from the takeoff
-    hover and only the last brakes into the home-settle dwell.
+    The path is a single smooth lemniscate of Bernoulli (see _lemniscate_seg), long
+    axis along WORLD X, half-span FIG8_END_X_M (far ends at (x0±FIG8_END_X_M, y0)),
+    crossover at the launch origin. It replaces the old two-tangent-circles ∞, whose
+    curvature flipped sign (+1/R → -1/R) at the crossover — an instant lateral-accel
+    reversal the drone couldn't track. The lemniscate's curvature is CONTINUOUS:
+    zero at the crossover, peaking at 3/FIG8_END_X_M at the far ends. The whole ∞ is
+    ONE move segment, so the carrot ramps up once at takeoff, flows through the
+    crossover at cruise, and brakes once into the home-settle dwell.
 
     Heading: with FIG8_FACE_TANGENT the nose follows the travel direction — the
-    takeoff dwell pre-rotates to the first loop's start tangent and GATES on the
-    nose getting there, the home dwell rotates back to the launch heading. Default
-    OFF: at the default speed/radius the figure-8's yaw rate (v/R) is double the
-    circle's and exceeds the yaw authority (see config) — so the whole figure-8 is
-    strafed at the launch heading, the drone translating along the ∞.
+    takeoff dwell pre-rotates to the path's start tangent and GATES on the nose
+    getting there, the home dwell rotates back to the launch heading. Default OFF
+    (strafe at the launch heading): see config for the yaw-rate budget.
 
     Unlike the circle there is NO forward approach leg: the crossover is the launch
     point, so the drone is already on the path at takeoff."""
     x0, y0, z0, yaw0 = launch
-    r = 0.5 * config.FIG8_END_X_M            # loop radius (half the centre→end span)
-    c_right, c_left = (x0 + r, y0), (x0 - r, y0)   # loop centres, on the world-X axis
+    a = config.FIG8_END_X_M                  # half-span: far ends at (x0±a, y0)
     laps = max(1, int(config.FIG8_LAPS))
-    sweep = 2.0 * math.pi
-    # First (right) loop sense: CCW (+) departs the crossover heading world -Y; CW
-    # (-) departs +Y. The left loop always takes the OPPOSITE sense so its start
-    # tangent matches the right loop's exit and the carrot flows through unbroken.
-    d_right = -sweep if config.FIG8_CW else sweep
-    d_left = sweep if config.FIG8_CW else -sweep
-    th_right, th_left = math.pi, 0.0         # the crossover's angle on each loop
     face = config.FIG8_FACE_TANGENT
     yaw_arc = "tangent" if face else None
-    arcs = []
-    for k in range(laps):
-        arcs.append(_arc_seg(c_right, r, th_right, d_right,
-                             f"R-loop {k + 1}/{laps}", yaw=yaw_arc))
-        arcs.append(_arc_seg(c_left, r, th_left, d_left,
-                             f"L-loop {k + 1}/{laps}", yaw=yaw_arc))
-    # Tangent-facing: pre-rotate to the first loop's start tangent during takeoff,
-    # rotate back to the launch heading during the home settle (None = hold heading).
-    yaw_start = arcs[0]["heading"](0.0) if face else None
+    lem = _lemniscate_seg((x0, y0), a, f"figure-8 x{laps}",
+                          yaw=yaw_arc, cw=config.FIG8_CW, laps=laps)
+    # Tangent-facing: pre-rotate to the path's start tangent during takeoff, rotate
+    # back to the launch heading during the home settle (None = hold heading).
+    yaw_start = lem["heading"](0.0) if face else None
     yaw_home = yaw0 if face else None
-    segs = [_dwell_seg((x0, y0), config.INITIAL_HOVER_S, "takeoff/hover", yaw=yaw_start)]
-    segs += arcs
-    segs.append(_dwell_seg((x0, y0), config.SETTLE_S, "home/settle", yaw=yaw_home))
+    segs = [
+        _dwell_seg((x0, y0), config.INITIAL_HOVER_S, "takeoff/hover", yaw=yaw_start),
+        lem,
+        _dwell_seg((x0, y0), config.SETTLE_S, "home/settle", yaw=yaw_home),
+    ]
     return PathMission(
         launch, segs,
         cruise_mps=config.FIG8_SPEED_MPS, leash_m=config.LEASH_M,
