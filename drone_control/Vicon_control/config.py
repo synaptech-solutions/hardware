@@ -46,6 +46,37 @@ FC_ANGLE_LIMIT_DEG = 60.0
 STICK_FULL_DEFLECTION_US = 511.5
 STICK_US_PER_DEG = STICK_FULL_DEFLECTION_US / FC_ANGLE_LIMIT_DEG   # 8.525
 
+# ============ ACRO mode (ADDITIVE — ANGLE is the default + the fallback) ========
+# With ACRO_MODE True the FC is put in ACRO (MODE_CH → MODE_ACRO_US): Betaflight
+# stops self-leveling and reads the roll/pitch sticks as RATE setpoints, still
+# closing its own 8 kHz inner rate PID. We then close the ATTITUDE (leveling) loop
+# ourselves on Vicon roll/pitch — the controller's angle→rate P stage replaces
+# Angle mode's outer P. Yaw + throttle are UNCHANGED (yaw is a rate command in BOTH
+# modes; throttle is direct). With ACRO_MODE False all of this is dead code and the
+# flight is the proven Angle-mode behavior, byte-for-byte.
+#
+# Rate curve (Air75 `dump all`, rateprofile 0, ACTIVE): rates_type=ACTUAL, roll/
+# pitch srate=7, expo=0 → LINEAR, full stick (±511.5us) = 70°/s. So a commanded body
+# rate → us at 511.5/70 = 7.307 us per °/s. (70°/s is low — it was set to linearize
+# Angle mode, not for aerobatic ACRO — but it's ample for a hover leveling loop;
+# raise srate later for a faster envelope, then cut KP_ANGLE_RATE proportionally.)
+#
+# THE VICON ATTITUDE MAP is empirically verified (2026-06-16, acro_attitude_check.py,
+# 3-pose bench test) and lives in vicon_source.drone_roll_pitch (heading-invariant;
+# the 90° mount swaps std roll/pitch vs the drone's axes). Still DRY_RUN the restoring
+# direction before arming: tilt nose-down → pitch us must drop BELOW 1500 (commands
+# nose-up); roll right → roll us BELOW 1500. That's the gate (defense in depth).
+ACRO_MODE = False              # master switch; flip True only after the DRY_RUN check
+KP_ANGLE_RATE = 5.0            # °/s of commanded body rate per ° of attitude error
+                               # (≈ Angle mode's outer P; 1/KP ≈ 0.2 s leveling time
+                               # constant). START LOW: Vicon attitude is ~100 Hz but
+                               # transport-delayed and there is NO FC self-level net
+                               # under this loop — if it wobbles FAST, LOWER this; if
+                               # it's sluggish to level, raise it.
+ACRO_MAX_RATE_DPS = 70.0       # clamp on the commanded rate = the FC ACTUAL-rate
+                               # ceiling (srate=7 → 70°/s); full stick at the clamp.
+ACRO_RATE_US_PER_DPS = STICK_FULL_DEFLECTION_US / ACRO_MAX_RATE_DPS   # 7.307
+
 # ============ stick signs (Air75, verified via test_stick_directions.py) ========
 # us > 1500 ⇒ roll RIGHT / pitch FORWARD (nose down) / yaw RIGHT (CW).
 # These are the knobs to flip if DRY_RUN shows a corrective direction inverted.
@@ -415,7 +446,7 @@ FIG8_FACE_TANGENT = True      # nose follows the travel direction. KEEP FALSE at
                                # FIG8_END_X_M (206°/s at 1.2 m/s) — over the ~147°/s yaw
                                # authority. Only enable if FIG8_SPEED_MPS is low enough
                                # that v·3/FIG8_END_X_M < YAW_SLEW_DPS.
-FIG8_SPEED_MPS = 3.0           # carrot speed. LOWER than the circle's cruise on purpose:
+FIG8_SPEED_MPS = 2.0           # carrot speed. LOWER than the circle's cruise on purpose:
                                # the lemniscate's peak curvature is 3/FIG8_END_X_M at the
                                # ends, so peak bank ∝ v²; 1.2 m/s keeps it ~4.3 m/s² (24°,
                                # like the circle). Raise toward ~1.5 m/s max (see DYNAMICS).

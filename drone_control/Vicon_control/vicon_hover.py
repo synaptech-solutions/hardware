@@ -12,8 +12,10 @@ manual triggers only:
                         blackbox + video + Vicon + commands + telemetry). Flip it
                         back to land gently. (Same switch, same recording, as the
                         data logger — these flights merge + render identically.)
-The controller owns roll/pitch/throttle/yaw while flying and forces AUX4 = ANGLE
-(it commands angle setpoints). The TX12 gimbals are ignored.
+The controller owns roll/pitch/throttle/yaw while flying and forces AUX4 to the
+configured flight mode: ANGLE by default (it commands angle setpoints), or ACRO when
+config.ACRO_MODE is set — it then closes the attitude loop itself on Vicon roll/pitch
+via the controller's angle→rate stage. The TX12 gimbals are ignored.
 
 State machine (SINGLE FLIGHT — it arms, flies once, lands, and the program EXITS):
   DISARMED   — arm switch low. Idle + disarm. (Edge-gated: must see DISARMED once.)
@@ -91,6 +93,11 @@ def clamp(v, lo, hi):
 def render(state, ch, pose, ctl, tx_armed, fc_armed, record_on, pose_age,
            flight_mode, pack_v, vic_samples, recording, dry, mission_lbl=""):
     mode_lbl = "DRY-RUN" if dry else "LIVE"
+    # Prominent ANGLE/ACRO badge — which control mode the controller is COMMANDING
+    # (derived from config, not telemetry, so it's always correct). ACRO is bold
+    # yellow (the new, no-FC-safety-net mode); ANGLE is plain.
+    fmode_badge = (f"{CSI}1;33mMODE:ACRO{CSI}0m" if config.ACRO_MODE
+                   else f"{CSI}36mMODE:ANGLE{CSI}0m")
     col = {"DISARMED": "0", "ARMED_IDLE": "33", "FLYING": "32", "LANDING": "36"}.get(state, "0")
     arm_txt = (f"{CSI}32mARM{CSI}0m" if tx_armed else "safe")
     fc_txt = "fcARM" if fc_armed else "fc-"
@@ -101,12 +108,17 @@ def render(state, ch, pose, ctl, tx_armed, fc_armed, record_on, pose_age,
               (f"vic{pose_age*1000:.0f}ms" if pose_age < 9e8 else f"{CSI}1;31mVIC?{CSI}0m")
     else:
         p, vic = "xyz=(--)", f"{CSI}1;31mVICON:OFF{CSI}0m"
-    c = (f"des(R{ctl['desired_roll_deg']:+.1f} P{ctl['desired_pitch_deg']:+.1f})deg "
-         f"hov={ctl['hover_us']:.0f}" if ctl else "")
+    if ctl:
+        c = (f"des(R{ctl['desired_roll_deg']:+.1f} P{ctl['desired_pitch_deg']:+.1f})deg "
+             f"hov={ctl['hover_us']:.0f}")
+        if config.ACRO_MODE and ctl.get("meas_pitch_deg") is not None:
+            c += (f" meas(R{ctl['meas_roll_deg']:+.1f} P{ctl['meas_pitch_deg']:+.1f})")
+    else:
+        c = ""
     v = f"{pack_v:.2f}V" if pack_v is not None else "—"
     ms = f"{CSI}35m{mission_lbl}{CSI}0m " if mission_lbl else ""
     sys.stdout.write(
-        f"\r{CSI}K[{mode_lbl}] {CSI}{col}m{state:10s}{CSI}0m {arm_txt} {fc_txt} "
+        f"\r{CSI}K[{mode_lbl}] {fmode_badge} {CSI}{col}m{state:10s}{CSI}0m {arm_txt} {fc_txt} "
         f"rec{'ON' if record_on else '--'} {ms}| "
         f"R{ch[channels.CH_ROLL]:4d} P{ch[channels.CH_PITCH]:4d} "
         f"T{ch[channels.CH_THR]:4d} Y{ch[channels.CH_YAW]:4d} | {p} {c} | "
@@ -168,6 +180,13 @@ def run(args, make_mission=None):
         print(f"{CSI}33mRanger:   DRY-RUN — no serial, never transmits, never arms. "
               f"Move the drone by hand and check the des(R,P)/throttle directions."
               f"{CSI}0m")
+
+    if config.ACRO_MODE:
+        print(f"{CSI}1;33mFlight mode: ACRO{CSI}0m — FC self-leveling OFF; the laptop "
+              f"closes the attitude loop on Vicon (KP_ANGLE_RATE={config.KP_ANGLE_RATE}). "
+              f"DRY_RUN-verify the restoring tilt directions first.")
+    else:
+        print(f"{CSI}36mFlight mode: ANGLE{CSI}0m — FC closes the attitude loop (proven path).")
 
     print(f"\nArm is edge-gated (flip DISARMED once to enable). Climb target = "
           f"{config.CLIMB_M:.2f} m. Ctrl-C to stop.\n")
@@ -435,7 +454,8 @@ def run(args, make_mission=None):
             ch = [channels.NEUTRAL_US] * 16
             ch[channels.CH_THR] = channels.IDLE_THR_US
             ch[channels.ARM_CH] = channels.ARM_ARMED_US if tx_armed else channels.ARM_DISARMED_US
-            ch[channels.MODE_CH] = channels.MODE_ANGLE_US                 # controller needs ANGLE
+            ch[channels.MODE_CH] = (channels.MODE_ACRO_US if config.ACRO_MODE
+                                    else channels.MODE_ANGLE_US)          # ACRO closes attitude on the laptop; ANGLE on the FC
             # AUX2: force HIGH while flying (FC blackbox covers the whole flight);
             # otherwise relay the switch so HIGH=start / LOW=erase still work on the ground.
             ch[channels.AUX2_CH] = (channels.AUX2_HIGH_US if state in ("FLYING", "LANDING")

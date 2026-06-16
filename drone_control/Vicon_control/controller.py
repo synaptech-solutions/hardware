@@ -8,6 +8,13 @@ The FC is in Angle mode, so it interprets roll/pitch us as TARGET ANGLES; we
 convert our desired angles to us via config.STICK_US_PER_DEG and the FC's attitude
 PID closes the inner loop.
 
+ACRO option (config.ACRO_MODE, default OFF — see config.py): the FC is put in ACRO
+and the roll/pitch us become RATE commands. The FC's 8 kHz inner RATE PID still runs
+untouched; we close the ATTITUDE loop ourselves with a small angle→rate P stage
+(_angle_to_rate_us) fed by Vicon body roll/pitch. Everything else (position, altitude,
+yaw, throttle) is identical — yaw is a rate command in both modes. ANGLE stays the
+default + fallback; with ACRO_MODE off this file behaves exactly as before.
+
 Reuses common.pid.PID. The altitude loop is the same self-learning-hover design
 proven in apriltag_control (the integrator IS the hover throttle), but with clean
 DRONE-frame altitude signs — z is the drone's own altitude (no tag inversion).
@@ -215,6 +222,21 @@ class ViconHoverController:
         deg = _clamp(deg, -config.MAX_TILT_DEG, config.MAX_TILT_DEG)
         return int(round(channels.NEUTRAL_US + sign * deg * config.STICK_US_PER_DEG))
 
+    def _angle_to_rate_us(self, desired_deg, measured_deg, sign):
+        """ACRO output: the outer angle→rate P loop — exactly Betaflight Angle mode's
+        leveling P, run here on the laptop instead of on the FC. Both angles are in
+        the controller convention (deg; pitch>0 nose-down, roll>0 right). The rate
+        error is clamped to the FC's linear ACTUAL-rate ceiling and converted to us
+        through that curve (ACRO_RATE_US_PER_DPS). The FC's 8 kHz inner rate PID still
+        closes the fast loop — we only swap the angle setpoint for a rate setpoint.
+        The restoring SIGN is the SAME SIGN_* as Angle mode (the rate-stick and
+        angle-stick directions are identical), so this needs no new sign constant —
+        but DRY_RUN-verify it anyway (tilt → us moves to oppose the tilt)."""
+        rate_dps = _clamp(config.KP_ANGLE_RATE * (desired_deg - measured_deg),
+                          -config.ACRO_MAX_RATE_DPS, config.ACRO_MAX_RATE_DPS)
+        return int(round(channels.NEUTRAL_US
+                         + sign * rate_dps * config.ACRO_RATE_US_PER_DPS))
+
     def step(self, pose, dt, descent_rate=None, level_only=False):
         """One control step.
 
@@ -274,8 +296,22 @@ class ViconHoverController:
             desired_roll_deg = aff_roll_deg + self.pid_lat.update(
                 err_lat, dt, derivative=tv_lat - v_lat)
 
-        pitch_us = self._angle_to_us(desired_pitch_deg, config.SIGN_PITCH)
-        roll_us = self._angle_to_us(desired_roll_deg, config.SIGN_ROLL)
+        # Measured body attitude (controller convention) from Vicon — drives the
+        # ACRO angle→rate loop and is logged to cross-check the FC attitude telemetry.
+        # Verified, heading-invariant map: vicon_source.drone_roll_pitch.
+        meas_roll_deg = math.degrees(pose.get("roll", 0.0))
+        meas_pitch_deg = math.degrees(pose.get("pitch", 0.0))
+        if config.ACRO_MODE:
+            # FC in ACRO: WE close the attitude loop (Vicon roll/pitch → rate cmd).
+            # level_only feeds desired=0, so the same call actively LEVELS on takeoff.
+            pitch_us = self._angle_to_rate_us(desired_pitch_deg, meas_pitch_deg,
+                                              config.SIGN_PITCH)
+            roll_us = self._angle_to_rate_us(desired_roll_deg, meas_roll_deg,
+                                             config.SIGN_ROLL)
+        else:
+            # FC in Angle mode: send the desired angle as a setpoint (unchanged).
+            pitch_us = self._angle_to_us(desired_pitch_deg, config.SIGN_PITCH)
+            roll_us = self._angle_to_us(desired_roll_deg, config.SIGN_ROLL)
 
         # Tilt compensation from the COMMANDED (clamped) angles — what the FC is
         # being asked to fly right now; instant, unlike waiting for the dip.
@@ -297,6 +333,7 @@ class ViconHoverController:
             "throttle_us": int(thr_us),
             "desired_roll_deg": desired_roll_deg,
             "desired_pitch_deg": desired_pitch_deg,
+            "meas_roll_deg": meas_roll_deg, "meas_pitch_deg": meas_pitch_deg,
             "err_fwd": err_fwd, "err_lat": err_lat,
             "v_fwd": v_fwd, "v_lat": v_lat,
             "tv_fwd": tv_fwd, "tv_lat": tv_lat,
