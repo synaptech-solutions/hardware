@@ -292,22 +292,17 @@ CELLS = 1
 # launch yaw throughout (the legs are strafes, not turns). vicon_hover.py ignores all
 # of this (it flies a static HoldMission); only square_flight.py reads these.
 LEG_M = 2.0                    # square side length (forward/right/back/left distance)
-CRUISE_SPEED_MPS = 3.0         # moving-setpoint ("carrot") speed between waypoints —
-                               # 3.0 is ~the fastest the CURRENT 1 m circle sustains:
-                               # bank 43° (g-limited, 17° under FC limit) is comfy, but
-                               # the yaw FF hits 293us at ω=172°/s against the 300°/s
-                               # FC linear yaw curve — yaw authority is the real wall
-                               # here. Go faster only on a LARGER radius (bank ∝ v²/r,
-                               # yaw rate ∝ v/r — both ease with r).
-                               # the horizontal analog of VMAX_UP_MPS. (History: pure
-                               # D-on-measurement made the drone trail the carrot by
-                               # ~KD*v/KP — measured 0.83-0.98 m / 55° of circle phase
-                               # lag at 0.8 m/s in flight 20260612_121316. FIXED by the
-                               # velocity feedforward: missions now report the carrot
-                               # velocity and the D term acts on (v_carrot - v_drone),
-                               # so the residual lag is just the FC response delay.
-                               # LEASH_M keeps its margin anyway as a stall backstop.)
-CARROT_ACCEL_MPS2 = 2.0        # carrot speed-ramp accel (trapezoidal profile): the
+CRUISE_SPEED_MPS = 0.8         # SQUARE carrot speed (moving-setpoint speed between
+                               # waypoints) — the horizontal analog of VMAX_UP_MPS.
+                               # The circle has its OWN speed (CIRCLE_SPEED_MPS); this
+                               # is square_flight.py only. (History: pure D-on-
+                               # measurement once made the drone trail the carrot by
+                               # ~KD*v/KP — 0.83-0.98 m / 55° phase lag at 0.8 m/s,
+                               # flight 20260612_121316; FIXED by the velocity FF, so
+                               # the residual lag is now just the FC response delay.
+                               # LEASH_M is the stall backstop on top of that.)
+CARROT_ACCEL_MPS2 = 2.0        # carrot speed-ramp accel (trapezoidal profile, SHARED
+                               # by all carrot missions): the
                                # carrot speeds 0→cruise over cruise/a s and BRAKES to
                                # arrive at every move-segment end with ZERO speed.
                                # Raised 1→2 (2026-06-15) for 3 m/s: at a=1 the ramp
@@ -342,7 +337,15 @@ LEASH_M = 1.2                  # the carrot never gets more than this far ahead 
 # one full circle, return to the origin, settle, land. The forward distance and the
 # radius are the SAME value by construction (the origin is the centre). Heading is
 # held at the launch yaw the whole time (the circle is flown by translating). Reuses
-# CRUISE_SPEED_MPS / LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / INITIAL_HOVER_S.
+# LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / INITIAL_HOVER_S / CARROT_ACCEL_MPS2;
+# has its OWN speed (CIRCLE_SPEED_MPS) — the circle banks/yaws far harder than the
+# square's strafes, so they're tuned independently.
+CIRCLE_SPEED_MPS = 3.0         # CIRCLE carrot speed. 3.0 is ~the fastest the CURRENT
+                               # 1 m circle sustains: bank 43° (g-limited, 17° under
+                               # the FC limit) is comfy, but the yaw FF hits 293us at
+                               # ω=172°/s against the 300°/s FC linear yaw curve — yaw
+                               # authority is the real wall. Go faster only on a LARGER
+                               # radius (bank ∝ v²/r, yaw rate ∝ v/r — both ease with r).
 CIRCLE_RADIUS_M = 1.0          # circle radius AND the forward approach distance
 CIRCLE_LAPS = 3                # consecutive laps of the circle (one continuous arc —
                                # no dwells between laps; entry/exit dwells unchanged)

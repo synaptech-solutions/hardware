@@ -672,7 +672,7 @@ def build_circle_mission(launch):
     ]
     return PathMission(
         launch, segs,
-        cruise_mps=config.CRUISE_SPEED_MPS, leash_m=config.LEASH_M,
+        cruise_mps=config.CIRCLE_SPEED_MPS, leash_m=config.LEASH_M,
         arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S)
 
 
