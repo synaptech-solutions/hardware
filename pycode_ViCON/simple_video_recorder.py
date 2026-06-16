@@ -18,6 +18,8 @@ Run with the cv2 venv (ffmpeg must also be on PATH):
   ../.venv/bin/python simple_video_recorder.py
   ../.venv/bin/python simple_video_recorder.py --device 5 --crf 20 --out-dir /some/where
 """
+from __future__ import annotations
+
 import os
 import shutil
 import argparse
@@ -30,7 +32,9 @@ from ffmpeg_writer import FfmpegWriter
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
-def open_camera(device, width, height, fps):
+def open_camera(
+    device: int, width: int, height: int, fps: int
+) -> tuple[cv2.VideoCapture | None, int | None]:
     """Open /dev/video<device>, falling back to device+1 (Cam Link 4<->5 shift).
 
     The encoder is sized from the actual frames later, so we only need the cap +
@@ -52,7 +56,7 @@ def open_camera(device, width, height, fps):
     return None, None
 
 
-def main():
+def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--device", type=int, default=4, help="camera /dev/videoN (default 4)")
@@ -80,9 +84,9 @@ def main():
     WIN = "drone feed  [SPACE]=record/stop  [Q]=quit"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
 
-    writer = None
-    path = None
-    start_t = None
+    writer: FfmpegWriter | None = None
+    path: str | None = None
+    start_t: float | None = None
     frames = 0
     print("SPACE = start/stop recording   Q/ESC = quit")
     try:

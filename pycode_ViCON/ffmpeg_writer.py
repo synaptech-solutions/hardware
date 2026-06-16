@@ -2,16 +2,29 @@
 Drop-in for the cv2.VideoWriter calls in the recorders: same
 write(bgr_frame) / release() / isOpened() surface.
 """
+from __future__ import annotations
+
 import shutil
 import subprocess
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 
 class FfmpegWriter:
     """Encode raw BGR frames to H.264/mp4 via an ffmpeg subprocess pipe."""
 
-    def __init__(self, path, width, height, fps, crf=23):
+    def __init__(
+        self,
+        path: str,
+        width: int,
+        height: int,
+        fps: float,
+        crf: int = 23,
+    ) -> None:
         self.path = path
-        self.proc = None
+        self.proc: subprocess.Popen[bytes] | None = None
         if shutil.which("ffmpeg") is None:
             print("ffmpeg not found on PATH — cannot record video.")
             return
@@ -28,10 +41,10 @@ class FfmpegWriter:
             print(f"failed to start ffmpeg ({e}) — no video will be recorded.")
             self.proc = None
 
-    def isOpened(self):
+    def isOpened(self) -> bool:
         return self.proc is not None and self.proc.poll() is None
 
-    def write(self, frame):
+    def write(self, frame: np.ndarray) -> None:
         if self.proc is None or self.proc.stdin is None:
             return
         try:
@@ -39,11 +52,12 @@ class FfmpegWriter:
         except (BrokenPipeError, ValueError):
             self.proc = None       # ffmpeg died (bad args / disk full); stop feeding it
 
-    def release(self):
+    def release(self) -> None:
         if self.proc is None:
             return
         try:
-            self.proc.stdin.close()
+            if self.proc.stdin is not None:
+                self.proc.stdin.close()
             self.proc.wait(timeout=30)
         except (BrokenPipeError, subprocess.TimeoutExpired):
             self.proc.kill()
