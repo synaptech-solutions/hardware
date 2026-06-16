@@ -4,7 +4,7 @@ Extracted verbatim from data_logging/joystick_flight.py so the manual data logge
 AND the autonomous Vicon controller record EVERY flight the same way, all stamped
 on one clock (t_rel = wall - t0) so they merge deterministically via
 combine_flight.py:
-  - VideoRecorder    drone feed → video.mkv (lossless FFV1; + video_frames.csv real capture times)
+  - VideoRecorder    drone feed → video.mkv (H.264/libx264 crf18; + video_frames.csv real capture times)
   - ViconRecorder    Vicon pose @100 Hz → vicon.mat
   - CommandLogger    every outgoing RC frame → commands.csv (16 ch + full joystick)
   - TelemetryLogger  incoming CRSF telemetry → telemetry.csv (+ telemetry_raw.csv)
@@ -41,7 +41,7 @@ except Exception:
     cv2 = None
     CV2_OK = False
 
-# We encode with an external ffmpeg subprocess (FFV1/MKV — see VideoRecorder), so
+# We encode with an external ffmpeg subprocess (H.264/MKV — see VideoRecorder), so
 # its presence gates video recording just like cv2 does. shutil.which resolves it
 # from PATH once at import; None → video recording disables itself, flight runs on.
 FFMPEG_BIN = shutil.which("ffmpeg")
@@ -80,27 +80,27 @@ CSI = "\033["
 
 
 class VideoRecorder:
-    """Records the drone's video feed to a LOSSLESS file in a background thread.
+    """Records the drone's video feed to an H.264 file in a background thread.
 
     Frames are captured with cv2.VideoCapture (camera-native MJPG) and piped raw
-    to an ffmpeg subprocess that encodes FFV1 inside an MKV — mathematically
-    lossless (bit-exact vs the captured BGR frame), intra-only (-g 1: every frame
-    an independent keyframe), with per-frame CRCs (-slicecrc 1) so silent storage
-    corruption is detectable years later. We pipe to ffmpeg rather than use
-    cv2.VideoWriter because OpenCV can't emit FFV1/MKV and writes a fake
-    constant-rate clock (opencv #23403) — here the container PTS is irrelevant on
-    read anyway: recover any frame BY INTEGER INDEX, then look up its true capture
-    time in video_frames.csv (file frame N <-> csv row N, written in lockstep).
+    to an ffmpeg subprocess that encodes H.264 (libx264, CRF ~18 — visually
+    transparent but a fraction of lossless FFV1's size) inside an MKV. MKV (not
+    mp4) so a hard-killed flight still leaves a playable file. We pipe to ffmpeg
+    rather than use cv2.VideoWriter because OpenCV writes a fake constant-rate
+    clock (opencv #23403) — here the container PTS is irrelevant on read anyway:
+    recover any frame BY INTEGER INDEX, then look up its true capture time in
+    video_frames.csv (file frame N <-> csv row N, written in lockstep).
 
     Camera open + per-frame read/encode happen off the main loop so they can
     never stall the 50 Hz RC stream. start()/stop() are called from the main
     loop on switch edges; start() returns immediately (the thread opens the
     camera, ~0.5-1 s, so the first second of footage may be missed)."""
 
-    def __init__(self, device_index, width, height):
+    def __init__(self, device_index, width, height, crf=18):
         self.device_index = device_index
         self.width = width
         self.height = height
+        self.crf = crf          # libx264 quality: 18 ≈ visually transparent, lower=bigger
         self._thread = None
         self._stop = threading.Event()
         self.recording = False
@@ -157,19 +157,20 @@ class VideoRecorder:
         self.recording = False
 
     def _spawn_ffmpeg(self, w, h):
-        """Start the FFV1/MKV encoder. Raw BGR24 frames are piped to its stdin;
-        '-pix_fmt gbrp' on the output keeps it bit-exact (planar RGB — no YUV
-        chroma subsampling or color-conversion rounding), '-g 1' makes every
-        frame an independent keyframe, '-slicecrc 1' stamps a CRC on each so
-        corruption is detectable. The '-framerate' only sets the container's
-        nominal playback rate; it is NOT the real timing (see video_frames.csv).
-        Returns the Popen, or None if launch failed."""
+        """Start the H.264/MKV encoder. Raw BGR24 frames are piped to its stdin and
+        encoded with libx264 at CRF self.crf (18 ≈ visually transparent — you can't
+        tell it from the source — at a fraction of FFV1's size). yuv420p for
+        universal playback; '-g 60' puts a keyframe every ~2 s so training can seek
+        frames cheaply. We keep the MKV container (not mp4) so a hard-killed flight
+        still leaves a playable file — mp4 needs a clean finalize to write its moov.
+        '-framerate' only sets the container's nominal rate; real per-frame timing
+        is in video_frames.csv. Returns the Popen, or None if launch failed."""
         cmd = [
             FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-video_size", f"{w}x{h}", "-framerate", f"{self.fps:g}", "-i", "-",
-            "-an", "-c:v", "ffv1", "-level", "3", "-coder", "1", "-context", "1",
-            "-g", "1", "-slicecrc", "1", "-pix_fmt", "gbrp", self.path,
+            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(self.crf),
+            "-pix_fmt", "yuv420p", "-g", "60", self.path,
         ]
         try:
             return subprocess.Popen(cmd, stdin=subprocess.PIPE,
@@ -207,8 +208,8 @@ class VideoRecorder:
                     if proc is None:
                         self.status = "ffmpeg launch FAILED"
                         return
-                    self.status = (f"REC {name} (FFV1 {self.enc_w}x{self.enc_h} "
-                                   f"@ {self.fps:.0f}fps)")
+                    self.status = (f"REC {name} (H.264 crf{self.crf} "
+                                   f"{self.enc_w}x{self.enc_h} @ {self.fps:.0f}fps)")
                 if self.first_frame_wall is None:
                     self.first_frame_wall = cap_t
                 # Drop any odd-sized frame WITHOUT logging it, so file frame N

@@ -32,7 +32,7 @@ stamped on one clock (t_rel = wall - t0) so they merge deterministically:
                       link stats, flight mode, device info) + live IMU accel/gyro
                       (MSP_RAW_IMU, actively polled at 10 Hz)
   - telemetry_raw.csv every incoming frame as hex (lossless safety net)
-  - video.mkv + video_frames.csv   drone feed (lossless FFV1) + per-frame capture timestamps
+  - video.mkv + video_frames.csv   drone feed (H.264/libx264 crf18) + per-frame capture timestamps
   - vicon.mat         Vicon pose @ 100 Hz
 Recording runs while the drone is ARMED and the switch is ON; everything is saved
 when either drops (disarm or switch off). Video/vicon need cv2/scipy — run with

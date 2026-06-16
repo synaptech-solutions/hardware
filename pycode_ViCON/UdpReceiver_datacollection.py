@@ -17,6 +17,8 @@ import math
 from collections import deque
 import scipy.io as sio  # save data as a .mat file
 
+from ffmpeg_writer import FfmpegWriter  # OpenCV captures/previews; ffmpeg encodes H.264
+
 
 class DataSaver(object):
     def __init__(self, *args):
@@ -414,12 +416,14 @@ if __name__ == '__main__':
         description='The DataExchange ViCON logger, but SPACE-triggered and with '
                     'synced video. Saves <stamp>.mat (+ <stamp>.mp4) into '
                     'DataExchange/ for post-flight yaw-maneuver sync (sync_log.py).')
-    # Camera defaults mirror drone_control/controller_v2/config.py (DEVICE_INDEX=4,
-    # 1280x720 — must match camera_calibration.npz). The Cam Link can re-enumerate
-    # 4<->5, so we auto-try the next index when the first fails to open.
+    # The C03 is an analog NTSC camera, so we capture at its native 720x480 (4:3) —
+    # 1280x720 just upscales SD and bloats files. DEVICE_INDEX=4; the Cam Link can
+    # re-enumerate 4<->5, so we auto-try the next index when the first fails to open.
     ap.add_argument('--device', type=int, default=4, help='camera /dev/videoN (default 4)')
-    ap.add_argument('--width', type=int, default=1280)
-    ap.add_argument('--height', type=int, default=720)
+    ap.add_argument('--width', type=int, default=720)
+    ap.add_argument('--height', type=int, default=480)
+    ap.add_argument('--crf', type=int, default=23,
+                    help='H.264 quality, lower=better/bigger (default 23)')
     ap.add_argument('--port', type=int, default=51001, help='ViCON UDP port (default 51001)')
     ap.add_argument('--no-video', action='store_true', help='ViCON-only, no camera')
     ap.add_argument('--out-dir', default=os.path.join(_HERE, 'DataExchange'),
@@ -440,7 +444,7 @@ if __name__ == '__main__':
                     c.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
                     c.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
                     c.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-                    c.set(cv2.CAP_PROP_FPS, 60)
+                    c.set(cv2.CAP_PROP_FPS, 30) 
                     c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                     cap = c
                     print(f'Camera: /dev/video{dev} {args.width}x{args.height}')
@@ -503,9 +507,15 @@ if __name__ == '__main__':
         if HAS_VIDEO:
             fps = cap.get(cv2.CAP_PROP_FPS)
             fps = fps if fps and fps > 1 else 30.0
-            writer_holder['w'] = cv2.VideoWriter(
-                os.path.join(args.out_dir, rec['stamp'] + '.mp4'),
-                cv2.VideoWriter_fourcc(*'mp4v'), fps, (args.width, args.height))
+            with frame_lock:                         # size the encoder from a real frame
+                f0 = latest['frame']
+            fh, fw = f0.shape[:2] if f0 is not None else (args.height, args.width)
+            video_path = os.path.join(args.out_dir, rec['stamp'] + '.mp4')
+            w = FfmpegWriter(video_path, fw, fh, fps, crf=args.crf)
+            if not w.isOpened():
+                print('WARN: ffmpeg encoder failed to start — recording ViCON only.')
+                w = None
+            writer_holder['w'] = w
         RTS.init()
         rec['t0'] = time.time()
         rec['on'] = True
