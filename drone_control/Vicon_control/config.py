@@ -412,7 +412,7 @@ FIG8_FACE_TANGENT = True      # nose follows the travel direction. KEEP FALSE at
                                # FIG8_END_X_M (206°/s at 1.2 m/s) — over the ~147°/s yaw
                                # authority. Only enable if FIG8_SPEED_MPS is low enough
                                # that v·3/FIG8_END_X_M < YAW_SLEW_DPS.
-FIG8_SPEED_MPS = 3.6           # carrot speed. LOWER than the circle's cruise on purpose:
+FIG8_SPEED_MPS = 3.0           # carrot speed. LOWER than the circle's cruise on purpose:
                                # the lemniscate's peak curvature is 3/FIG8_END_X_M at the
                                # ends, so peak bank ∝ v²; 1.2 m/s keeps it ~4.3 m/s² (24°,
                                # like the circle). Raise toward ~1.5 m/s max (see DYNAMICS).
