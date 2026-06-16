@@ -336,76 +336,69 @@ def _dwell_seg(point, dur, label, yaw=None):
             "geom": {"kind": "dwell", "point": [point[0], point[1]]}}
 
 
-def _param_seg(fn, t0, t1, label, yaw=None, geom=None, n=1000):
-    """A general smooth parametric curve — fn(t)->(x, y) for t in [t0, t1] — as a
-    MOVE segment, RE-PARAMETRIZED BY ARC LENGTH so the carrot holds a constant
-    ground speed along it (a curve's natural parameter usually isn't arc length).
-    Densely samples the curve ONCE at build time, builds a cumulative-length table,
-    and serves at(s) by interpolation and heading(s) as the smooth path tangent
-    (central difference) — so the nose can follow the direction of travel on an
-    arbitrary curve, not just lines/arcs. `geom` is the lossless spec the dashboard
-    re-traces from (see planned_path). Lines and circles still use _line_seg/_arc_seg
-    (closed-form, exact); this is for curves with no closed-form arc length (the
-    figure-8 lemniscate)."""
-    ts = [t0 + (t1 - t0) * k / n for k in range(n + 1)]
-    pts = [fn(t) for t in ts]
+def _param_seg(p, u0, u1, label, yaw, geom, samples=2000):
+    """Arc-length-parameterized segment for an arbitrary smooth planar curve p(u),
+    u in [u0, u1]. Densely samples the curve once to build a cumulative arc-length
+    table, so at(s) advances the carrot at UNIT speed in arc length (like the line
+    and arc segs — the trapezoid speed profile assumes that) and heading(s) is the
+    local travel direction. No analytic derivative needed: heading comes from the
+    sample spacing, which is plenty smooth at the default density."""
+    n = max(2, int(samples))
+    us = [u0 + (u1 - u0) * k / n for k in range(n + 1)]
+    pts = [p(u) for u in us]
     cum = [0.0] * (n + 1)
-    for i in range(1, n + 1):
-        cum[i] = cum[i - 1] + math.hypot(pts[i][0] - pts[i - 1][0],
-                                         pts[i][1] - pts[i - 1][1])
+    for k in range(1, n + 1):
+        cum[k] = cum[k - 1] + math.hypot(pts[k][0] - pts[k - 1][0],
+                                         pts[k][1] - pts[k - 1][1])
     length = cum[n]
 
     def _idx(s):
-        """Sample interval (i) + fraction (f) for arc length s, clamped to the span."""
+        # bracketing sample index i and fraction f into [pts[i], pts[i+1]]
         if s <= 0.0:
             return 0, 0.0
         if s >= length:
             return n - 1, 1.0
         i = bisect.bisect_right(cum, s) - 1
         span = cum[i + 1] - cum[i]
-        return i, ((s - cum[i]) / span if span > 1e-12 else 0.0)
+        return i, (0.0 if span < 1e-12 else (s - cum[i]) / span)
 
     def at(s):
         i, f = _idx(s)
-        return (pts[i][0] + (pts[i + 1][0] - pts[i][0]) * f,
-                pts[i][1] + (pts[i + 1][1] - pts[i][1]) * f)
-
-    def _tan(j):                             # travel tangent at sample j (central chord)
-        lo, hi = max(0, j - 1), min(n, j + 1)
-        return pts[hi][0] - pts[lo][0], pts[hi][1] - pts[lo][1]
+        (x0, y0), (x1, y1) = pts[i], pts[i + 1]
+        return (x0 + (x1 - x0) * f, y0 + (y1 - y0) * f)
 
     def heading(s):
-        # Interpolate the tangent ACROSS the interval (not piecewise-constant per
-        # sample) so the heading is continuous — else the yaw setpoint sees a 1-cm
-        # staircase and jitters. Central-chord tangent at each end, blended by f.
-        i, f = _idx(s)
-        ax, ay = _tan(i)
-        bx, by = _tan(i + 1)
-        return math.atan2(ay + (by - ay) * f, ax + (bx - ax) * f)
+        i, _ = _idx(s)                       # forward diff = travel direction
+        (x0, y0), (x1, y1) = pts[i], pts[i + 1]
+        return math.atan2(y1 - y0, x1 - x0)
 
     return {"type": "move", "at": at, "len": length, "label": label,
             "yaw": yaw, "heading": heading, "geom": geom}
 
 
-def _lemniscate_seg(center, scale, t0, t1, label, yaw=None):
-    """Bernoulli lemniscate (the classic ∞) centred at `center`, peaks at
-    center ± (scale, 0) on world X, self-crossing at the centre. Its CURVATURE is
-    CONTINUOUS — zero at the crossing (the path runs straight through the centre)
-    and greatest at the peak tips (radius ≈ scale/3) — so there is no instantaneous
-    bank/yaw reversal at the middle the way two tangent circles have. Parametrized
-    x = cos t/(1+sin²t), y = sin t cos t/(1+sin²t) (crossing at t=π/2, 3π/2; peaks at
-    t=0, π); wrapped in _param_seg for constant-speed arc-length travel + tangent
-    heading."""
+def _lemniscate_seg(center, a, label, yaw=None, cw=False, laps=1):
+    """Smooth figure-8 — the lemniscate of BERNOULLI — centred at `center`, long
+    axis along world X, half-span `a` (the far ends sit at center ± (a, 0)). Started
+    at the CROSSOVER (parameter t0 = π/2) so the carrot begins and ends at `center`,
+    and traced for `laps` full loops.
+
+    Unlike two tangent circles (whose curvature FLIPS sign +1/R → -1/R at the
+    crossover — an instant lateral-accel reversal the drone can't track), this is a
+    single C-∞ curve: curvature is CONTINUOUS, zero at the crossover and peaking at
+    3/a at the far ends. cw flips the loop sense (sign of y)."""
     cx, cy = center
+    sgn = -1.0 if cw else 1.0
 
-    def fn(t):
+    def p(t):
         d = 1.0 + math.sin(t) ** 2
-        return (cx + scale * math.cos(t) / d,
-                cy + scale * math.sin(t) * math.cos(t) / d)
+        return (cx + a * math.cos(t) / d, cy + sgn * a * math.sin(t) * math.cos(t) / d)
 
-    geom = {"kind": "lemniscate", "center": [cx, cy], "scale": scale,
-            "t0": t0, "t1": t1}
-    return _param_seg(fn, t0, t1, label, yaw=yaw, geom=geom)
+    laps = max(1, int(laps))
+    t0 = 0.5 * math.pi
+    return _param_seg(p, t0, t0 + 2.0 * math.pi * laps, label, yaw,
+                      {"kind": "lemniscate", "center": [cx, cy], "a": a,
+                       "cw": cw, "laps": laps},
+                      samples=2000 * laps)
 
 
 class PathMission:
@@ -691,34 +684,29 @@ def build_figure8_mission(launch):
     carrot/feedforward/leash/dwell machinery, nose following the travel direction —
     just a different path.
 
-    The path is a BERNOULLI LEMNISCATE (_lemniscate_seg) centred at the launch
-    origin, peaks at (x0±FIG8_PEAK_M, y0) on world X, crossing at the origin. Its
-    curvature is CONTINUOUS (zero at the crossing → straight through the centre,
-    greatest at the peak tips), so there's no instantaneous bank/yaw reversal at the
-    middle — that reversal was the awkward, untrackable transition of the old
-    two-tangent-circles design (flight 20260615_160611, which lapped the drone at
-    2 m/s). It's ONE continuous move segment, so the carrot ramps up once from the
-    takeoff hover and brakes once into the home-settle dwell; mid-path (including the
-    centre crossing) it flows at cruise.
+    The path is a single smooth lemniscate of Bernoulli (see _lemniscate_seg), long
+    axis along WORLD X, half-span FIG8_END_X_M (far ends at (x0±FIG8_END_X_M, y0)),
+    crossover at the launch origin. It replaces the old two-tangent-circles ∞, whose
+    curvature flipped sign (+1/R → -1/R) at the crossover — an instant lateral-accel
+    reversal the drone couldn't track. The lemniscate's curvature is CONTINUOUS:
+    zero at the crossover, peaking at 3/FIG8_END_X_M at the far ends. The whole ∞ is
+    ONE move segment, so the carrot ramps up once at takeoff, flows through the
+    crossover at cruise, and brakes once into the home-settle dwell.
 
-    Heading: with FIG8_FACE_TANGENT (default ON, like the circle) the nose follows
-    the travel direction — the takeoff dwell pre-rotates to the path's start tangent
-    and GATES on the nose getting there; the home dwell rotates back to the launch
-    heading. The lemniscate + the modest FIG8_SPEED_MPS keep the peak yaw rate within
-    authority (see config), which is what makes tangent-facing feasible here.
+    Heading: with FIG8_FACE_TANGENT the nose follows the travel direction — the
+    takeoff dwell pre-rotates to the path's start tangent and GATES on the nose
+    getting there, the home dwell rotates back to the launch heading. Default OFF
+    (strafe at the launch heading): see config for the yaw-rate budget.
 
     Like the old figure-8 there is NO forward approach leg: the crossing is the
     launch point, so the drone is already on the path at takeoff."""
     x0, y0, z0, yaw0 = launch
+    a = config.FIG8_END_X_M                  # half-span: far ends at (x0±a, y0)
     laps = max(1, int(config.FIG8_LAPS))
-    # The lemniscate parametrization crosses the centre at t=π/2; start there so the
-    # course begins at the launch origin. Sweep ±2π·laps — sign = traversal direction
-    # (which lobe is flown first / the nose's sweep sense); the two mirror in time.
-    t0 = math.pi / 2.0
-    span = (-1.0 if config.FIG8_CW else 1.0) * 2.0 * math.pi * laps
     face = config.FIG8_FACE_TANGENT
-    lem = _lemniscate_seg((x0, y0), config.FIG8_PEAK_M, t0, t0 + span,
-                          f"figure-8 x{laps}", yaw=("tangent" if face else None))
+    yaw_arc = "tangent" if face else None
+    lem = _lemniscate_seg((x0, y0), a, f"figure-8 x{laps}",
+                          yaw=yaw_arc, cw=config.FIG8_CW, laps=laps)
     # Tangent-facing: pre-rotate to the path's start tangent during takeoff, rotate
     # back to the launch heading during the home settle (None = hold heading).
     yaw_start = lem["heading"](0.0) if face else None

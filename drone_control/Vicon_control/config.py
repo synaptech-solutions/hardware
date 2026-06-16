@@ -376,50 +376,46 @@ YAW_ARRIVE_TOL_DEG = 5.0       # a dwell with a heading target waits (same arriv
                                # linearized so small commands actually turn the drone
 
 # ============ figure-8 mission (figure8_flight.py only) ========================
-# figure8_flight.py: take off + hover AT the figure-8's crossing (the launch origin),
-# trace one smooth figure-8, settle back at the origin, land — the circle's twin
-# (same PathMission / carrot / feedforward / leash / dwell machinery, nose following
-# the direction of travel). Reuses LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S /
-# INITIAL_HOVER_S / SETTLE_S / CARROT_ACCEL_MPS2, exactly like the circle. Held at
-# CLIMB_M above launch.
+# figure8_flight.py: take off + hover AT the figure-8's crossover (the launch
+# origin), trace one full figure-8, settle back at the origin, land — the circle's
+# twin (same PathMission / carrot / feedforward / leash / dwell machinery). The
+# path is a single smooth LEMNISCATE OF BERNOULLI (mission._lemniscate_seg), long
+# axis along WORLD X, half-span FIG8_END_X_M, so the far ends pass through
+# (x0±FIG8_END_X_M, y0) and the crossover is the launch origin. Reuses LEASH_M /
+# ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / INITIAL_HOVER_S / SETTLE_S / CARROT_ACCEL_MPS2,
+# exactly like the circle. Held at CLIMB_M above launch (set CLIMB_M=1.0 for the
+# spec'd flat 1 m height).
 #
-# The path is a BERNOULLI LEMNISCATE (the classic ∞), centred at the launch origin,
-# peaks at (±FIG8_PEAK_M, 0) on world X, crossing at the origin. Unlike the previous
-# two-tangent-circles design, its curvature is CONTINUOUS — zero at the crossing
-# (the carrot flies STRAIGHT through the centre) and greatest at the peak tips — so
-# there is no instantaneous bank/yaw reversal at the middle. That reversal, on R=0.5
-# circles at 2 m/s, is what saturated the tilt clamp and lapped the drone in flight
-# 20260615_160611; this replaces it. It is ONE continuous segment: the carrot ramps
-# up once at the start and brakes once into the home dwell, flowing at cruise through
-# the middle.
-#
-# SPEED is yaw-rate-limited for tangent-facing: the lemniscate's tip turn radius is
-# ≈FIG8_PEAK_M/3 (0.67 m at PEAK=2), so the peak yaw rate is v/0.67 and the peak bank
-# is atan(v²/0.67/g). FIG8_SPEED_MPS=1.3 → 112°/s yaw (under the 130°/s YAW_SLEW_DPS
-# and 147°/s authority) and 14° bank — gentle and trackable. Keep ≤1.4 m/s for
-# tangent-facing at PEAK=2; to go faster, enlarge FIG8_PEAK_M (the tip radius grows
-# ∝ peak) or raise the yaw authority (MAX_YAW_US / YAW_SLEW_DPS). DRY-RUN first.
-FIG8_PEAK_M = 2.0              # figure-8 half-length: the peaks (tips) are at
-                               # (±FIG8_PEAK_M, 0). Tip turn radius ≈ FIG8_PEAK_M/3.
-FIG8_LAPS = 1                  # smooth figure-8 traversals (one ∞ = crossing → lobe →
-                               # crossing → other lobe → crossing). Continuous; the
-                               # carrot only ramps at the very start / brakes at the end.
-FIG8_CW = True                 # traversal direction (which lobe is flown first / the
-                               # nose's sweep sense). False vs True just mirror in time;
-                               # True starts toward +45° (a 45° pre-rotation from the +Y
-                               # launch heading) vs False's -135° (135°) — True is the
-                               # gentler takeoff turn, so it's the default.
-FIG8_FACE_TANGENT = True       # nose follows the direction of travel (like the circle):
-                               # pre-rotate to the start tangent during takeoff, sweep
-                               # with the path, rotate back to the launch heading at home.
-                               # Feasible here (unlike the old tight two-circle design)
-                               # because the lemniscate + low speed cap the yaw rate at
-                               # ~112°/s. Set False to strafe at the launch heading.
-FIG8_SPEED_MPS = 1.3           # carrot speed. Yaw-limited for tangent-facing (see above):
-                               # 1.3 is gentle (112°/s yaw, 14° bank at PEAK=2). NOT the
-                               # circle's 2 m/s — that lapped the drone on the old tight
-                               # figure-8 (flight 20260615_160611). Raise toward 1.4 only
-                               # after a clean flight; >1.4 needs more yaw authority.
+# !!! DYNAMICS — READ BEFORE FLYING !!! This replaces the old two-tangent-circles ∞,
+# whose curvature flipped sign (+1/R → -1/R) at the crossover — an INSTANT lateral-
+# accel reversal (±8 m/s² at 2 m/s, a 16 m/s² step) the drone couldn't track, which
+# is why the loops deviated at the centre. The lemniscate's curvature is CONTINUOUS:
+# ZERO at the crossover (the drone flies nearly straight through) and peaking at
+# κ = 3/FIG8_END_X_M at the FAR ENDS. So the worst-case bank is now at the ends, not
+# the centre: centripetal v²·κ = v²·3/FIG8_END_X_M. At FIG8_END_X_M=1.0 that is
+# 3·v² m/s² → keep it under the 9 m/s² accel-FF cap (g·tan45°≈9.8 tilt clamp) with
+# PID headroom, i.e. v ≲ 1.5 m/s; the default below is 1.2 m/s (peak ≈ 4.3 m/s² →
+# 24° bank, like the circle). The tangent yaw rate also peaks at v·3/FIG8_END_X_M
+# (206°/s at 1.2 m/s) > the ~147°/s yaw authority, so FIG8_FACE_TANGENT must stay
+# False unless you slow down further. DRY-RUN and preview.py first.
+FIG8_END_X_M = 2.0             # centre→end distance along world X; loop radius R is
+                               # half this. Far ends pass through (±FIG8_END_X_M, 0).
+FIG8_LAPS = 2                  # full figure-8 traversals (each = right loop + left
+                               # loop). The whole run flows at cruise; only the first
+                               # loop ramps up and only the last brakes to the home dwell.
+FIG8_CW = False                # sense of the lemniscate (which loop is traced first,
+                               # viewed from above): False = left loop first; True =
+                               # right loop first (flips the sign of y). Both are one
+                               # continuous smooth ∞ through the crossover.
+FIG8_FACE_TANGENT = True      # nose follows the travel direction. KEEP FALSE at the
+                               # default speed/size: the yaw rate peaks at v·3/
+                               # FIG8_END_X_M (206°/s at 1.2 m/s) — over the ~147°/s yaw
+                               # authority. Only enable if FIG8_SPEED_MPS is low enough
+                               # that v·3/FIG8_END_X_M < YAW_SLEW_DPS.
+FIG8_SPEED_MPS = 3.6           # carrot speed. LOWER than the circle's cruise on purpose:
+                               # the lemniscate's peak curvature is 3/FIG8_END_X_M at the
+                               # ends, so peak bank ∝ v²; 1.2 m/s keeps it ~4.3 m/s² (24°,
+                               # like the circle). Raise toward ~1.5 m/s max (see DYNAMICS).
 
 # ============ loop rate (shared) ============
 TX_HZ = channels.TX_HZ         # 50 Hz, same as the data logger

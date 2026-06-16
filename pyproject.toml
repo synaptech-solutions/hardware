@@ -1,0 +1,21 @@
+[project]
+name = "hardware"
+version = "0.1.0"
+description = "Drone control, data logging, and Vicon tracking for hardware flight experiments"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "opencv-python==4.13.0.92",  # video capture/recording (joystick_flight, *video_recorder, camera_setup, tag_hover)
+    "numpy==2.4.6",              # .mat I/O, sync math, geometry (everything)
+    "scipy==1.17.1",            # .mat I/O, sync math, geometry (everything)
+    "pyserial==3.5",            # CRSF over the Ranger USB serial
+    "pupil-apriltags==1.0.4.post11",  # tag detection (tag_hover, drone_detect)
+    "tqdm==4.68.1",             # Vicon sample-rate progress (lab parser)
+    "matplotlib==3.10.9",       # plot_flight.py / plot_synced.py (static PNGs)
+    "PyQt6==6.11.0",            # interactive 3D plot windows (matplotlib --3d)
+    "dash==4.2.0",              # interactive browser dashboards (dashboard_flight.py / dashboard_synced.py)
+    "plotly==6.8.0",            # interactive browser dashboards (dashboard_flight.py / dashboard_synced.py)
+]
+
+[tool.uv]
+package = false
