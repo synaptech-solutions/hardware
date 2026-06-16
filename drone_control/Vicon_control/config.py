@@ -346,7 +346,7 @@ CIRCLE_SPEED_MPS = 3.0         # CIRCLE carrot speed. 3.0 is ~the fastest the CU
                                # ω=172°/s against the 300°/s FC linear yaw curve — yaw
                                # authority is the real wall. Go faster only on a LARGER
                                # radius (bank ∝ v²/r, yaw rate ∝ v/r — both ease with r).
-CIRCLE_RADIUS_M = 1.0          # circle radius AND the forward approach distance
+CIRCLE_RADIUS_M = 2.0          # circle radius AND the forward approach distance
 CIRCLE_LAPS = 3                # consecutive laps of the circle (one continuous arc —
                                # no dwells between laps; entry/exit dwells unchanged)
 CIRCLE_CW = False              # True = clockwise viewed from above (the carrot goes
