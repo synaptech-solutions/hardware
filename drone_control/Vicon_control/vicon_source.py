@@ -114,7 +114,10 @@ class ViconPoseSource:
         """Latest world-frame pose for the body. Returns a dict or None if no
         packet has arrived yet. Velocities are stepped on the packet timestamp.
 
-        keys: x, y, z, yaw (rad), vx, vy, vz, t_packet (wall), age_s (since packet)
+        keys: x, y, z, yaw (rad), vx, vy, vz, t_packet (wall), age_s (since packet),
+              qx, qy, qz, qw (the RAW Vicon rigid-body quaternion — full orientation,
+              for consumers that need roll/pitch too, e.g. an RL policy's body frame;
+              the PID controller uses only x/y/z/yaw + velocities).
         """
         if self.udp is None:
             return None
@@ -137,6 +140,7 @@ class ViconPoseSource:
             self._last_udp_time = udp_time
         return {
             "x": x, "y": y, "z": z, "yaw": yaw,
+            "qx": b["qx"], "qy": b["qy"], "qz": b["qz"], "qw": b["qw"],
             "vx": self._diff_x.data_rate,
             "vy": self._diff_y.data_rate,
             "vz": self._diff_z.data_rate,
