@@ -441,8 +441,9 @@ def build_parser():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("port", nargs="?", default=None, help="Ranger serial port (default: autodetect)")
     ap.add_argument("baud", nargs="?", type=int, default=420000, help="Ranger baud (default: 420000)")
-    ap.add_argument("--policy", required=True,
-                    help="trained policy.npz exported by betaflight-gym rl/export.py")
+    ap.add_argument("--policy", default=os.path.join(HERE, "models", "hover_acro.npz"),
+                    help="trained policy.npz exported by betaflight-gym rl/export.py "
+                         "(default: the bundled models/hover_acro.npz)")
     ap.add_argument("--target-alt", type=float, default=None,
                     help="hover altitude above launch (m); default = the policy's trained target_alt")
     ap.add_argument("--js", default="/dev/input/js0", help="joystick device")
