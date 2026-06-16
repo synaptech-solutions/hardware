@@ -387,21 +387,21 @@ YAW_ARRIVE_TOL_DEG = 5.0       # a dwell with a heading target waits (same arriv
 # 24° bank, like the circle). The tangent yaw rate also peaks at v·3/FIG8_END_X_M
 # (206°/s at 1.2 m/s) > the ~147°/s yaw authority, so FIG8_FACE_TANGENT must stay
 # False unless you slow down further. DRY-RUN and preview.py first.
-FIG8_END_X_M = 1.0             # centre→end distance along world X; loop radius R is
+FIG8_END_X_M = 2.0             # centre→end distance along world X; loop radius R is
                                # half this. Far ends pass through (±FIG8_END_X_M, 0).
-FIG8_LAPS = 1                  # full figure-8 traversals (each = right loop + left
+FIG8_LAPS = 2                  # full figure-8 traversals (each = right loop + left
                                # loop). The whole run flows at cruise; only the first
                                # loop ramps up and only the last brakes to the home dwell.
 FIG8_CW = False                # sense of the lemniscate (which loop is traced first,
                                # viewed from above): False = left loop first; True =
                                # right loop first (flips the sign of y). Both are one
                                # continuous smooth ∞ through the crossover.
-FIG8_FACE_TANGENT = False      # nose follows the travel direction. KEEP FALSE at the
+FIG8_FACE_TANGENT = True      # nose follows the travel direction. KEEP FALSE at the
                                # default speed/size: the yaw rate peaks at v·3/
                                # FIG8_END_X_M (206°/s at 1.2 m/s) — over the ~147°/s yaw
                                # authority. Only enable if FIG8_SPEED_MPS is low enough
                                # that v·3/FIG8_END_X_M < YAW_SLEW_DPS.
-FIG8_SPEED_MPS = 1.2           # carrot speed. LOWER than the circle's cruise on purpose:
+FIG8_SPEED_MPS = 3.6           # carrot speed. LOWER than the circle's cruise on purpose:
                                # the lemniscate's peak curvature is 3/FIG8_END_X_M at the
                                # ends, so peak bank ∝ v²; 1.2 m/s keeps it ~4.3 m/s² (24°,
                                # like the circle). Raise toward ~1.5 m/s max (see DYNAMICS).
