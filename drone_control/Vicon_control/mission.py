@@ -19,7 +19,8 @@ failsafe still wraps the flight.
                     behavior byte-for-byte (vicon_hover.run uses it by default).
   WaypointMission — walk a list of FIXED world waypoints with a moving setpoint
                     ("carrot") at cruise speed and a per-waypoint dwell; done after
-                    the final hold. build_square_mission() builds the course.
+                    the final hold. build_waypoint_mission() builds it from the
+                    absolute-world-coordinate course in config.WAYPOINTS.
 
 WHY A MOVING SETPOINT (not a step): the position PID is KP≈15 deg/m, so stepping
 the target 2 m would command 30° → clamp to MAX_TILT → the drone slams to max tilt,
@@ -278,7 +279,8 @@ class WaypointMission:
     """
 
     def __init__(self, launch, waypoints, *, cruise_mps, leash_m,
-                 arrive_tol_m, arrive_timeout_s, labels=None):
+                 arrive_tol_m, arrive_timeout_s, labels=None, face_path=False,
+                 yaw_slew_dps=None, yaw_tol_deg=None):
         if not waypoints:
             raise ValueError("WaypointMission needs at least one waypoint")
         self.wps = list(waypoints)
@@ -298,6 +300,16 @@ class WaypointMission:
         self.t_in_phase = 0.0
         self.dwell_elapsed = 0.0
         self.done = False
+        # Heading: hold the launch yaw (strafe), OR follow the path — nose points
+        # along the leg of travel, pre-rotating to the next leg during each dwell
+        # (same slew + arrival-gate machinery PathMission uses for the circle).
+        self.launch_x, self.launch_y, self.launch_yaw = launch[0], launch[1], launch[3]
+        self.face_path = bool(face_path)
+        self.yaw_sp = launch[3]                       # commanded heading (slewed, never stepped)
+        self.yaw_slew = math.radians(yaw_slew_dps if yaw_slew_dps is not None
+                                     else config.YAW_SLEW_DPS)
+        self.yaw_tol = math.radians(yaw_tol_deg if yaw_tol_deg is not None
+                                    else config.YAW_ARRIVE_TOL_DEG)
 
     def _advance_carrot(self, wx, wy, pose, dt):
         """Crawl the carrot toward (wx, wy), leashed to the drone. Trapezoid speed:
@@ -323,16 +335,58 @@ class WaypointMission:
         self.sx, self.sy = nx, ny
         self.v = v_next
 
+    def _slew_yaw(self, target, dt):
+        """Move the commanded heading toward `target` (shortest way), rate-capped."""
+        if target is None:
+            return
+        err = _wrap_pi(target - self.yaw_sp)
+        step = max(-self.yaw_slew * dt, min(self.yaw_slew * dt, err))
+        self.yaw_sp = _wrap_pi(self.yaw_sp + step)
+
+    def _yaw_arrived(self, pose, target):
+        """Heading setpoint finished slewing AND the drone's nose followed it."""
+        if target is None:
+            return True
+        if abs(_wrap_pi(target - self.yaw_sp)) > 1e-3:
+            return False
+        pyaw = pose.get("yaw")
+        return pyaw is None or abs(_wrap_pi(pyaw - target)) < self.yaw_tol
+
+    def _heading_target(self):
+        """The world heading the nose should hold. Strafe → launch yaw. Face-path →
+        the current leg's travel direction while moving; while holding at a vertex,
+        PRE-ROTATE to the next leg's direction (so the next leg starts nose-aligned).
+        Returns None (= hold current yaw_sp) when there's no leg to face."""
+        if not self.face_path:
+            return self.launch_yaw
+        i = self.idx
+        here = (self.wps[i][0], self.wps[i][1])
+        if self.phase == "GOTO":
+            prev = ((self.wps[i - 1][0], self.wps[i - 1][1]) if i >= 1
+                    else (self.launch_x, self.launch_y))
+            if math.hypot(here[0] - prev[0], here[1] - prev[1]) > 1e-6:
+                return math.atan2(here[1] - prev[1], here[0] - prev[0])
+        # HOLD, or a zero-length GOTO (e.g. takeoff at the launch point): face the
+        # NEXT leg if there is one, else just hold the current heading.
+        if i + 1 < len(self.wps):
+            nxt = (self.wps[i + 1][0], self.wps[i + 1][1])
+            if math.hypot(nxt[0] - here[0], nxt[1] - here[1]) > 1e-6:
+                return math.atan2(nxt[1] - here[1], nxt[0] - here[0])
+        return None
+
     def update(self, pose, dt, airborne, land_requested=False):
-        """One tick. Returns (x, y, z, yaw, svx, svy, done): the (x, y) is the
-        moving carrot, (svx, svy) its velocity (for the controller's velocity
-        feedforward); z + yaw are the active waypoint's."""
+        """One tick. Returns (x, y, z, yaw, svx, svy, sax, say, done): the (x, y) is
+        the moving carrot, (svx, svy) its velocity (controller D feedforward); z is
+        the active waypoint's; yaw is the held launch heading (strafe) or the slewed
+        path-following heading (face_path)."""
         if land_requested:
             self.done = True                   # SPACEBAR → abandon the course, land
         wx, wy, wz, wyaw, dwell = self.wps[self.idx]
         px, py = self.sx, self.sy
         if not self.done:
             self.t_in_phase += dt
+            tgt = self._heading_target()       # launch yaw (strafe) or the leg/next-leg dir
+            self._slew_yaw(tgt, dt)
             if self.phase == "GOTO":
                 if airborne:
                     self._advance_carrot(wx, wy, pose, dt)
@@ -342,11 +396,17 @@ class WaypointMission:
                     and abs(wz - pose["z"]) < self.arrive_tol)
                 timed_out = airborne and self.t_in_phase > self.arrive_timeout
                 if (carrot_at_wp and drone_close) or timed_out:
-                    self.phase, self.dwell_elapsed = "HOLD", 0.0
+                    self.phase, self.dwell_elapsed, self.t_in_phase = "HOLD", 0.0, 0.0
             elif self.phase == "HOLD":
                 self.sx, self.sy = wx, wy          # park the carrot on the vertex
                 self.v = 0.0
-                self.dwell_elapsed += dt
+                # Face-path: count the dwell only once the nose has pre-rotated to the
+                # next leg (same gate PathMission uses); timeout backstop so a never-
+                # quite-aligned nose can't hang the course. Strafe: yaw_ok is always
+                # True, so this is byte-identical to the old behavior.
+                yaw_ok = (not self.face_path) or self._yaw_arrived(pose, tgt)
+                if self.dwell_elapsed > 0.0 or yaw_ok or self.t_in_phase > self.arrive_timeout:
+                    self.dwell_elapsed += dt
                 if self.dwell_elapsed >= dwell:
                     if self.idx + 1 < len(self.wps):
                         self.idx += 1
@@ -356,31 +416,39 @@ class WaypointMission:
         svx, svy = _carrot_vel(px, py, self.sx, self.sy, dt, self.cruise)
         sax, say = _carrot_acc(self.svx, self.svy, svx, svy, dt)
         self.svx, self.svy = svx, svy
-        return self.sx, self.sy, wz, wyaw, svx, svy, sax, say, self.done
+        return self.sx, self.sy, wz, self.yaw_sp, svx, svy, sax, say, self.done
 
     def status(self):
         if self.done:
             return "MISSION done"
         wp = self.wps[self.idx]
+        head = f" hd{math.degrees(self.yaw_sp):+.0f}°" if self.face_path else ""
         if self.phase == "GOTO":
             d = math.hypot(wp[0] - self.sx, wp[1] - self.sy)
-            return f"WP{self.idx}/{len(self.wps) - 1} goto carrot{d:.2f}m"
+            return f"WP{self.idx}/{len(self.wps) - 1} goto carrot{d:.2f}m{head}"
         return (f"WP{self.idx}/{len(self.wps) - 1} hold "
-                f"{self.dwell_elapsed:.1f}/{wp[4]:.0f}s")
+                f"{self.dwell_elapsed:.1f}/{wp[4]:.0f}s{head}")
 
     def describe(self):
+        mode = ("nose follows path" if self.face_path
+                else f"heading held at launch yaw {math.degrees(self.launch_yaw):+.0f}°")
         lines = [f"  Mission: {len(self.wps)}-waypoint course "
                  f"(cruise {self.cruise:.2f} m/s, leash {self.leash:.2f} m, "
-                 f"arrive tol {self.arrive_tol:.2f} m):"]
+                 f"arrive tol {self.arrive_tol:.2f} m; {mode}):"]
         for i, w in enumerate(self.wps):
             lbl = self.labels[i] if self.labels else f"WP{i}"
+            tail = f"  yaw {math.degrees(w[3]):+.0f}°"
+            if self.face_path and i + 1 < len(self.wps):
+                nxt = self.wps[i + 1]
+                if math.hypot(nxt[0] - w[0], nxt[1] - w[1]) > 1e-6:
+                    tail = f"  → leg head {math.degrees(math.atan2(nxt[1]-w[1], nxt[0]-w[0])):+.0f}°"
             lines.append(f"    WP{i} {lbl:13s} world=({w[0]:+.2f},{w[1]:+.2f},"
-                         f"{w[2]:+.2f}) yaw={math.degrees(w[3]):+.0f}°  hold {w[4]:.0f}s")
+                         f"{w[2]:+.2f})  hold {w[4]:.0f}s{tail}")
         return lines
 
     def summary(self):
         return {
-            "kind": "waypoint",
+            "kind": "waypoint", "face_path": self.face_path,
             "cruise_mps": self.cruise, "leash_m": self.leash,
             "arrive_tol_m": self.arrive_tol, "arrive_timeout_s": self.arrive_timeout,
             "waypoints_world": [
@@ -391,35 +459,26 @@ class WaypointMission:
 
 
 # ----------------------------------------------------------------------------- #
-def build_square_mission(launch):
-    """Build the default course from config: take off + hover, then a LEG_M square
-    (forward → right → back → left, holding DWELL_S at each vertex) returning over
-    the origin, then land. Body-frame spec → fixed world waypoints via the launch
-    yaw (see module docstring for the transform)."""
+def build_waypoint_mission(launch):
+    """Build a WaypointMission from config.WAYPOINTS — points in ABSOLUTE VICON WORLD
+    coordinates (x, y, z), used AS-IS (no launch rotation or offset), so a waypoint at
+    world (−2, 0) is exactly there regardless of where/which-way the drone launched.
+    Per-point z (meters); z=None → CLIMB_M above the launch altitude. Heading is HELD
+    at the captured launch yaw throughout (the drone strafes, nose fixed). The carrot
+    starts at the launch position and crawls to WP0 first (make WP0 the takeoff point)."""
     x0, y0, z0, yaw0 = launch
-    z = z0 + config.CLIMB_M
-    c, s = math.cos(yaw0), math.sin(yaw0)
-    leg = config.LEG_M
-    # Cumulative (forward, right) vertex positions in the LAUNCH BODY FRAME, with
-    # the dwell at each: takeoff hover, then the four square corners.
-    body = [
-        ("takeoff/hover", 0.0, 0.0, config.INITIAL_HOVER_S),
-        ("forward",       leg, 0.0, config.DWELL_S),
-        ("right",         leg, leg, config.DWELL_S),
-        ("back",          0.0, leg, config.DWELL_S),
-        ("left/home",     0.0, 0.0, config.DWELL_S),
-    ]
+    if not config.WAYPOINTS:
+        raise ValueError("config.WAYPOINTS is empty — define at least the WP0 takeoff point")
     wps, labels = [], []
-    for label, fwd, right, dwell in body:
-        dx = c * fwd + s * right
-        dy = s * fwd - c * right
-        wps.append((x0 + dx, y0 + dy, z, yaw0, dwell))
+    for x, y, z, dwell, label in config.WAYPOINTS:
+        zw = z0 + config.CLIMB_M if z is None else float(z)
+        wps.append((float(x), float(y), zw, yaw0, float(dwell)))
         labels.append(label)
     return WaypointMission(
         launch, wps,
         cruise_mps=config.CRUISE_SPEED_MPS, leash_m=config.LEASH_M,
         arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S,
-        labels=labels)
+        labels=labels, face_path=config.WAYPOINT_FACE_PATH)
 
 
 # ----------------------------------------------------------------------------- #

@@ -341,19 +341,55 @@ BATT_PRESENT_V = 2.5           # below this = no/!valid pack reading, ignore
 MIN_CELL_V = 3.3
 CELLS = 1
 
-# ============ waypoint mission (square_flight.py only) ==========================
-# square_flight.py flies a course built in the LAUNCH BODY FRAME (forward/right
-# relative to the nose at takeoff) and converted to FIXED world waypoints ONCE, at
-# launch, using the captured launch yaw (mission.build_square_mission). The default
-# course: take off + hover, then forward → right → back → left by LEG_M with DWELL_S
-# holds at each vertex, returning over the origin, then land. Heading is HELD at the
-# launch yaw throughout (the legs are strafes, not turns). vicon_hover.py ignores all
-# of this (it flies a static HoldMission); only square_flight.py reads these.
-LEG_M = 2.0                    # square side length (forward/right/back/left distance)
-CRUISE_SPEED_MPS = 0.8         # SQUARE carrot speed (moving-setpoint speed between
-                               # waypoints) — the horizontal analog of VMAX_UP_MPS.
+# ============ waypoint mission (waypoint_flight.py) =============================
+# waypoint_flight.py flies the course you define in WAYPOINTS below. Points are in
+# ABSOLUTE VICON WORLD coordinates — the SAME (x, y, z) you read in Vicon Tracker for
+# your gates/obstacles — NOT relative to the drone. They are NOT rotated or offset by
+# the launch pose, so a gate at world x=-2 is exactly x=-2 here. Heading is HELD at
+# the launch yaw the whole time (the drone strafes between points, nose fixed). The
+# setpoint is a crawling "carrot" at CRUISE_SPEED_MPS, so each leg is a smooth
+# translation; the hold at a point begins only once the drone has ARRIVED
+# (ARRIVE_TOL_M). vicon_hover.py and circle/figure-8 ignore WAYPOINTS.
+#
+# Each entry: (x_m, y_m, z_m, dwell_s, "label")
+#     x_m, y_m   world position (Vicon frame), meters
+#     z_m        world height (meters); None → CLIMB_M above the launch altitude
+#     dwell_s    hold time once arrived (carrot parks + drone settles)
+#     label      shown in the dry-run table + status line
+# The carrot starts at the drone's actual launch position and crawls to WP0 first, so
+# make WP0 your takeoff/hover point (near where you launch) for a clean straight climb.
+# DRY-RUN first — it prints the world point table so you can check it matches your gates.
+#
+# Example below: an hourglass through gates at world x=±2, y=0, flown at z=1.0 m.
+WAYPOINTS = [
+    ( 0.0,  0.0, 1.0, 3.0, "takeoff/hover"),   # start/center
+    (-2.0,  1.0, 1.0, 3.0, "left-top"),        # ┐ down the left edge → through the
+    (-2.0, -1.0, 1.0, 3.0, "left-bottom"),     # ┘   left gate at (-2, 0)
+    ( 2.0,  1.0, 1.0, 3.0, "right-top"),        # diagonal across → through center (0,0)
+    ( 2.0, -1.0, 1.0, 3.0, "right-bottom"),    #   then down the right edge → right gate (2,0)
+    ( 0.0,  0.0, 1.0, 3.0, "home"),            # back to center, settle, then land
+
+    (-2.0,  1.0, 1.0, 3.0, "left-top"),        # ┐ down the left edge → through the
+    (-2.0, -1.0, 1.0, 3.0, "left-bottom"),     # ┘   left gate at (-2, 0)
+    ( 2.0,  1.0, 1.0, 3.0, "right-top"),        # diagonal across → through center (0,0)
+    ( 2.0, -1.0, 1.0, 3.0, "right-bottom"),    #   then down the right edge → right gate (2,0)
+    ( 0.0,  0.0, 1.0, 3.0, "home"),            # back to center, settle, then land
+
+    (-2.0,  1.0, 1.0, 3.0, "left-top"),        # ┐ down the left edge → through the
+    (-2.0, -1.0, 1.0, 3.0, "left-bottom"),     # ┘   left gate at (-2, 0)
+    ( 2.0,  1.0, 1.0, 3.0, "right-top"),        # diagonal across → through center (0,0)
+    ( 2.0, -1.0, 1.0, 3.0, "right-bottom"),    #   then down the right edge → right gate (2,0)
+    ( 0.0,  0.0, 1.0, 3.0, "home"),            # back to center, settle, then land
+]
+WAYPOINT_FACE_PATH = True      # True: NOSE FOLLOWS THE PATH — the drone yaws to point
+                               # along each leg's direction of travel and pre-rotates to
+                               # the next leg during each dwell (slewed at YAW_SLEW_DPS,
+                               # gated by YAW_ARRIVE_TOL_DEG, same as the circle). False:
+                               # hold the launch heading the whole time (pure strafing).
+CRUISE_SPEED_MPS = 3.0         # WAYPOINT carrot speed (moving-setpoint speed between
+                               # points) — the horizontal analog of VMAX_UP_MPS.
                                # The circle has its OWN speed (CIRCLE_SPEED_MPS); this
-                               # is square_flight.py only. (History: pure D-on-
+                               # is waypoint_flight.py only. (History: pure D-on-
                                # measurement once made the drone trail the carrot by
                                # ~KD*v/KP — 0.83-0.98 m / 55° phase lag at 0.8 m/s,
                                # flight 20260612_121316; FIXED by the velocity FF, so
@@ -374,8 +410,10 @@ CARROT_ACCEL_MPS2 = 2.0        # carrot speed-ramp accel (trapezoidal profile, S
                                # overswung the drone to 1.4 m/s (flight 20260612_132718).
                                # Also makes the carrot acceleration finite, so accel
                                # feedforward becomes possible later.
-DWELL_S = 5.0                  # hold time at each square vertex
-INITIAL_HOVER_S = 3.0          # settle time at the takeoff hover before leg 1
+# (Waypoint dwells are per-point in WAYPOINTS above.) INITIAL_HOVER_S is the
+# takeoff-hover settle for the circle/figure-8 missions (the waypoint mission uses
+# WP0's own dwell instead).
+INITIAL_HOVER_S = 3.0          # circle/figure-8 takeoff-hover settle before the first leg
 ARRIVE_TOL_M = 0.25            # carrot AT the WP and drone within this (horiz + vert)
                                # → start the hold
 ARRIVE_TIMEOUT_S = 12.0        # backstop (counted only while airborne): proceed to the

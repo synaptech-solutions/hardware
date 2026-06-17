@@ -245,10 +245,16 @@ def run(args, make_mission=None):
                 "kind": "vicon_hover", "climb_m": config.CLIMB_M,
                 "target": ({"x": launch[0], "y": launch[1], "z": launch[2] + config.CLIMB_M,
                             "yaw_rad": launch[3]} if launch else None),
+                # Flight mode + ACRO leveling gain, logged so analysis can compare
+                # flights by KP_ANGLE_RATE without the pilot having to remember it.
+                "acro": {"enabled": config.ACRO_MODE,
+                         "kp_angle_rate": config.KP_ANGLE_RATE,
+                         "max_rate_dps": config.ACRO_MAX_RATE_DPS},
                 "gains": {"kp_fwd": config.KP_FWD_DEG_PER_M, "kd_fwd": config.KD_FWD_DEG_PER_MPS,
                           "kp_lat": config.KP_LAT_DEG_PER_M, "kd_lat": config.KD_LAT_DEG_PER_MPS,
                           "kp_up": config.KP_UP, "kv_up": config.KV_UP_US_PER_MPS,
-                          "ki_up": config.KI_UP_US_PER_M, "kp_yaw": config.KP_YAW_US_PER_RAD}},
+                          "ki_up": config.KI_UP_US_PER_M, "kp_yaw": config.KP_YAW_US_PER_RAD,
+                          "kp_angle_rate": config.KP_ANGLE_RATE}},
                 "mission": (mission.summary() if mission is not None else None),
                 # Sync-spin windows (s, relative to the session t0 clock = Abs_time) so
                 # combine.py can window each spin and fit the FC<->laptop clock drift.

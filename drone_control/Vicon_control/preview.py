@@ -46,7 +46,7 @@ G = 9.81
 BUILDERS = {
     "figure8": (mission.build_figure8_mission, "FIG8_SPEED_MPS"),
     "circle":  (mission.build_circle_mission,  "CRUISE_SPEED_MPS"),
-    "square":  (mission.build_square_mission,  "CRUISE_SPEED_MPS"),
+    "waypoint": (mission.build_waypoint_mission, "CRUISE_SPEED_MPS"),
 }
 
 
