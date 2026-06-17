@@ -110,12 +110,23 @@ class HoverPolicyController:
 
     def __init__(self, policy, *, axis_map=None, target_alt=None, control_dt=0.01,
                  sign_roll=1, sign_pitch=1, sign_yaw=1,
-                 rate_lpf_s=0.03, land_speed_mps=0.25, land_cut_m=0.30):
+                 rate_lpf_s=0.03, land_speed_mps=0.25, land_cut_m=0.30,
+                 mass_kg=None):
         self.policy = policy
         self.axis = axis_map or AxisMap()
         self.target_alt = (policy.meta.get("target_alt", 1.0)
                            if target_alt is None else target_alt)
         self.control_dt = control_dt
+        # Mass-conditioned policy: training appends the (domain-randomized) mass
+        # to the obs (layout term "mass"); here we feed the MEASURED real mass so
+        # the policy picks the right hover throttle for this airframe. Defaults
+        # to the nominal the policy was centred on (exported as meta mass_kg).
+        self._obs_has_mass = "mass" in str(policy.meta.get("obs_layout", ""))
+        self.mass_kg = (mass_kg if mass_kg is not None
+                        else policy.meta.get("mass_kg"))
+        if self._obs_has_mass and self.mass_kg is None:
+            raise ValueError("policy obs includes a 'mass' term but no mass_kg "
+                             "given and none in policy meta — pass mass_kg=<measured kg>.")
         # AETR output signs — a last-resort flip if the link/airframe wiring
         # inverts a channel vs the sim (normally all +1; verify in DRY-RUN).
         self.sign = np.array([sign_roll, sign_pitch, 1.0, sign_yaw])  # T never flips
@@ -160,7 +171,8 @@ class HoverPolicyController:
     # -- observation --------------------------------------------------------
 
     def build_obs(self, pose, dt):
-        """The 22-dim egocentric obs (body FRD), matching tasks/hover.py."""
+        """The egocentric obs (body FRD), matching tasks/hover.py — 22 dims, or
+        23 with a trailing measured-mass term for a mass-conditioned policy."""
         R = quat_to_matrix(pose["qx"], pose["qy"], pose["qz"], pose["qw"])
         Rfrd = self.axis.frd_world_axes(R)        # cols = forward/right/down (world)
         # project a world vector onto the body FRD axes
@@ -182,7 +194,10 @@ class HoverPolicyController:
             self._rate_f += (omega - self._rate_f) * a
         self._prev_Rfrd = Rfrd
 
-        return np.concatenate([pos_err, vel_b, rot, self._rate_f, self.last_action])
+        obs = np.concatenate([pos_err, vel_b, rot, self._rate_f, self.last_action])
+        if self._obs_has_mass:
+            obs = np.concatenate([obs, [self.mass_kg]])   # measured real mass (kg)
+        return obs
 
     # -- one control step ---------------------------------------------------
 

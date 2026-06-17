@@ -88,9 +88,9 @@ def run(args):
                  f"(scripts/train.py writes <run>/policy.npz).")
     policy = MLPPolicy(args.policy)
     print(f"Policy:   {policy.describe()}")
-    if policy.obs_dim != 22:
-        print(f"{CSI}1;33mWARNING obs_dim={policy.obs_dim} (expected 22 for the "
-              f"hover task) — frames/layout may not match.{CSI}0m")
+    if policy.obs_dim not in (22, 23):
+        print(f"{CSI}1;33mWARNING obs_dim={policy.obs_dim} (expected 22, or 23 "
+              f"for the mass-conditioned hover task) — frames/layout may not match.{CSI}0m")
 
     if not VICON_OK:
         sys.exit(f"Vicon deps missing ({_VICON_ERR}) — run with the repo .venv.")
