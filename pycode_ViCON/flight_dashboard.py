@@ -197,9 +197,12 @@ def _load_synced_csv(path):
     meta_path = os.path.splitext(path)[0] + ".meta.json"
     if os.path.isfile(meta_path):
         with open(meta_path) as f:
-            for k, v in json.load(f).items():
-                if isinstance(v, (str, int, float)):   # skip lists (e.g. columns)
-                    m[k] = v
+            mj = json.load(f)
+        for k, v in mj.items():
+            if isinstance(v, (str, int, float)):       # skip lists (e.g. columns)
+                m[k] = v
+        if isinstance(mj.get("sync_quality"), dict):   # the gated yaw-witness block
+            m["sync_quality"] = mj["sync_quality"]
     return m
 
 
@@ -462,6 +465,8 @@ def load_channels(path):
               "sync_yaw_sign", "motor_poles"):
         if k in m and np.asarray(m[k]).ravel().size:
             meta[k] = float(np.asarray(m[k]).ravel()[0])
+    if isinstance(m.get("sync_quality"), dict):     # gated yaw-witness latency block
+        meta["sync_quality"] = m["sync_quality"]
 
     quat = ({q: col("b1_" + q) for q in ("qx", "qy", "qz", "qw")}
             if has("b1_qx", "b1_qy", "b1_qz", "b1_qw") else None)
@@ -735,6 +740,53 @@ def _header(meta, path):
     return "   |   ".join(bits)
 
 
+def _sync_banner(meta):
+    """Top 'Sync & Latency' strip: the gated Vicon-yaw-witness results (laptop↔drone
+    uplink, FC-internal control latency, residual clock offset, and clock drift from
+    the bookend spins) listed for at-a-glance review. The master timeline is the
+    deterministic shared trigger — these are the SECOND, independent witness, shown
+    with a trust badge so a weak-signal flight is obvious. Returns None for older
+    flights with no witness block (the layout then skips the strip)."""
+    sq = meta.get("sync_quality")
+    if not isinstance(sq, dict) or not sq.get("available"):
+        return None
+
+    def fld(label, val, unit="", fmt="{:+.1f}"):
+        if val is None:
+            return None
+        return html.Span([html.Span(label + ": ", style={"color": "#789"}),
+                          html.B(fmt.format(val) + unit)], style={"marginRight": "18px"})
+
+    items = [it for it in (
+        fld("uplink laptop→drone", sq.get("uplink_ms"), " ms"),
+        fld("FC-internal", sq.get("fc_internal_ms"), " ms"),
+        fld("clock offset", sq.get("clock_offset_ms"), " ms"),
+        fld("clock drift", sq.get("drift_ms_per_s"), " ms/s", "{:+.3f}"),
+        fld("witness corr", sq.get("witness_corr"), "", "{:.2f}"),
+    ) if it is not None]
+    if sq.get("n_spins_used"):
+        items.append(html.Span(f"({sq['n_spins_used']} sync spins)",
+                               style={"color": "#789", "marginRight": "18px"}))
+
+    trust = bool(sq.get("trustworthy"))
+    bcol = "#1a7f37" if trust else "#b00"
+    btxt = "TRUSTWORTHY" if trust else f"LOW CONFIDENCE (corr<{sq.get('min_corr_gate', 0.5)})"
+    head = html.Span([html.B("Sync & Latency  "),
+                      html.Span(btxt, style={"color": bcol, "fontWeight": "600",
+                                             "fontSize": "11px", "border": f"1px solid {bcol}",
+                                             "borderRadius": "3px", "padding": "1px 5px",
+                                             "marginRight": "14px"})])
+    children = [head] + items
+    if not trust:
+        children.append(html.Div(
+            "yaw witness signal weak — fly the bookend 360° spins for a clean uplink/drift estimate",
+            style={"color": "#b00", "fontSize": "11px", "marginTop": "3px"}))
+    return html.Div(style={"background": "#f3f7ff", "border": "1px solid #cdd9ee",
+                           "borderRadius": "6px", "padding": "7px 12px",
+                           "marginBottom": "10px", "fontSize": "13px"},
+                    children=children)
+
+
 # Fullscreen a pattern-matching wrapper Div (its DOM id is the sorted-key JSON).
 _FS_MATCH_JS = """function(n, id){
   if(n){ var domid = JSON.stringify({index:id.index, type:'pgwrap'});
@@ -858,6 +910,8 @@ def make_app(data, title):
         html.H3(title, style={"marginBottom": "2px"}),
         html.Div(_header(data["meta"], data["path"]),
                  style={"color": "#555", "fontSize": "13px", "marginBottom": "8px"}),
+        # Sync & Latency strip (gated Vicon-yaw witness) — skipped for older flights.
+        *([_sync_banner(data["meta"])] if _sync_banner(data["meta"]) is not None else []),
 
         # ---------- 2D SECTION ----------
         _section_head("2D plots"),

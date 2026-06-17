@@ -131,6 +131,95 @@ def _fmt(lag, corr):
     return f"{lag*1000:6.1f} ms   (corr {corr:.2f})"
 
 
+def analyze(csv_path, spin_windows=None):
+    """Headless sync/latency witness for combine_flight.py → a JSON-friendly dict.
+
+    Cross-correlates signals to recover, WITHOUT touching the master timeline:
+      - fc_internal_ms  : rcCommand→gyro (PID+actuate+body), single FC clock — clean.
+      - clock_offset_ms : gyro vs Vicon yaw-rate — the residual the master sync left
+                          in (these two are the SAME motion on DIFFERENT clocks, with
+                          no RC link between them, so the lag is pure clock offset).
+      - uplink_ms       : (cmd→Vicon-motion) − fc_internal = the laptop→drone uplink,
+                          since Vicon witnesses the motion outside the RC link.
+      - drift_ms_per_s  : if ≥2 spin_windows [(t0,t1) s on Abs_time] clear the corr
+                          gate, the clock offset is measured in each and a slope fit
+                          across them gives the FC↔laptop crystal drift.
+
+    Gated on corr ≥ MIN_CORR so it never reports noise as a latency. Never raises;
+    returns {"available": False, "reason": ...} when it can't compute.
+    """
+    names = ["Abs_time", "cmd_ch03_us", "bb_rcCommand_2", "bb_gyroADC_2",
+             "b1_qx", "b1_qy", "b1_qz", "b1_qw"]
+    try:
+        d = load_synced(csv_path, names)
+    except Exception as e:
+        return {"available": False, "reason": f"read error: {e}"}
+    if "Abs_time" not in d or d["Abs_time"].size < 50:
+        return {"available": False, "reason": "no/short Abs_time column"}
+    t = d["Abs_time"]
+    if not all(k in d and np.isfinite(d[k]).any()
+               for k in ("cmd_ch03_us", "bb_rcCommand_2", "bb_gyroADC_2")):
+        return {"available": False, "reason": "missing cmd/rcCommand/gyro columns "
+                "(no blackbox merged?)"}
+    finite = np.isfinite(d["cmd_ch03_us"]) & np.isfinite(d["bb_gyroADC_2"])
+    if int(finite.sum()) < 50:
+        return {"available": False, "reason": "too little cmd/gyro overlap"}
+    t0, t1 = t[finite][0], t[finite][-1]
+    g = np.arange(t0, t1, 1.0 / FS)
+
+    def rs(name):
+        y = d[name]
+        m = np.isfinite(y)
+        return _lowpass(np.interp(g, t[m], y[m]))
+
+    rc_yaw, gyro_z, cmd_yaw = rs("bb_rcCommand_2"), rs("bb_gyroADC_2"), rs("cmd_ch03_us")
+    tau_resp, cB, _ = find_lag(rc_yaw, gyro_z)
+    out = {"available": True, "min_corr_gate": MIN_CORR,
+           "fc_internal_ms": round(tau_resp * 1000, 2), "fc_internal_corr": round(cB, 3),
+           "witness_corr": None, "clock_offset_ms": None,
+           "cmd_to_motion_ms": None, "cmd_to_motion_corr": None, "uplink_ms": None,
+           "drift_ms_per_s": None, "spin_offsets": [], "n_spins_used": 0,
+           "trustworthy": False}
+
+    have_vicon = all(k in d and np.isfinite(d[k]).any()
+                     for k in ("b1_qx", "b1_qy", "b1_qz", "b1_qw"))
+    if not have_vicon:
+        out["reason"] = "no Vicon yaw — uplink not isolable from this flight"
+        return out
+
+    vic = vicon_body_yawrate(d["b1_qx"], d["b1_qy"], d["b1_qz"], d["b1_qw"])
+    vic_rate = _lowpass(np.interp(g, t, vic))
+    witness, cW, _ = find_lag(gyro_z, vic_rate)        # same yaw, two clocks → offset
+    out["witness_corr"] = round(cW, 3)
+    out["clock_offset_ms"] = round(witness * 1000, 2)
+    out["trustworthy"] = bool(cW >= MIN_CORR)
+    if cW >= MIN_CORR:
+        cmd_to_motion, cA, _ = find_lag(cmd_yaw, vic_rate)
+        out["cmd_to_motion_ms"] = round(cmd_to_motion * 1000, 2)
+        out["cmd_to_motion_corr"] = round(cA, 3)
+        if cA >= MIN_CORR:
+            out["uplink_ms"] = round((cmd_to_motion - tau_resp) * 1000, 2)
+
+    # Per-spin clock offset → drift slope (the payoff of the bookend spins).
+    if spin_windows:
+        offs = []
+        for w in spin_windows:
+            w0, w1 = float(w[0]), float(w[1])
+            sel = (g >= w0 - 0.5) & (g <= w1 + 0.5)
+            if int(sel.sum()) < 20:
+                continue
+            lag, c, _ = find_lag(gyro_z[sel], vic_rate[sel])
+            if c >= MIN_CORR:
+                offs.append((0.5 * (w0 + w1), lag, c))
+        out["spin_offsets"] = [{"t_mid_s": round(tm, 2), "offset_ms": round(l * 1000, 2),
+                                "corr": round(c, 3)} for tm, l, c in offs]
+        out["n_spins_used"] = len(offs)
+        if len(offs) >= 2 and offs[-1][0] > offs[0][0]:
+            (ta, la, _), (tb, lb, _) = offs[0], offs[-1]
+            out["drift_ms_per_s"] = round((lb - la) * 1000 / (tb - ta), 4)
+    return out
+
+
 def main():
     sess = _resolve(sys.argv[1]) if len(sys.argv) > 1 else _newest_session()
     csvp = os.path.join(sess, "flight_synced.csv")

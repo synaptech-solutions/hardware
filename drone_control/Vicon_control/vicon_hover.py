@@ -73,7 +73,7 @@ from common.recorders import (                           # noqa: E402
 from Vicon_control import config                         # noqa: E402
 from Vicon_control.vicon_source import ViconPoseSource   # noqa: E402
 from Vicon_control.controller import ViconHoverController  # noqa: E402
-from Vicon_control.mission import HoldMission              # noqa: E402
+from Vicon_control.mission import HoldMission, SyncSpinMission  # noqa: E402
 
 CSI = "\033["
 REC_DIR = os.path.join(HERE, "flight_logs")
@@ -200,9 +200,14 @@ def run(args, make_mission=None):
 
     state = "DISARMED"
     seen_disarmed = False
-    land_requested = False         # set by SPACEBAR (or low batt) → controlled land + exit
+    land_requested = False         # SPACEBAR → CONTROLLED land: routed to the mission so
+                                   # the sync-spin bookend runs before the descent.
+    emergency_land = False         # low battery → land NOW, skip the exit spin.
+    mission_done = False           # mission (incl. exit bookend) finished → descend.
     launch = None                  # (x0, y0, z0, yaw0) captured at takeoff
-    mission = None                 # target provider (HoldMission, or a WaypointMission)
+    mission = None                 # target provider (HoldMission / SyncSpinMission / course)
+    spin_events = []               # [{which,t0_rel,t1_rel}] sync-spin windows (Abs_time)
+    prev_phase = None              # mission.phase last tick, for spin-window edges
     fly_t0 = None
     land_t0 = None
 
@@ -244,7 +249,10 @@ def run(args, make_mission=None):
                           "kp_lat": config.KP_LAT_DEG_PER_M, "kd_lat": config.KD_LAT_DEG_PER_MPS,
                           "kp_up": config.KP_UP, "kv_up": config.KV_UP_US_PER_MPS,
                           "ki_up": config.KI_UP_US_PER_M, "kp_yaw": config.KP_YAW_US_PER_RAD}},
-                "mission": (mission.summary() if mission is not None else None)}
+                "mission": (mission.summary() if mission is not None else None),
+                # Sync-spin windows (s, relative to the session t0 clock = Abs_time) so
+                # combine.py can window each spin and fit the FC<->laptop clock drift.
+                "sync_spin_events": [e for e in spin_events if e["t1_rel"] is not None]}
             write_session_json(session, recorder, vicon_rec, cmd_log, telem, cal,
                                ranger_port, args.baud, extra=extra)
             sys.stdout.write(f"\n{CSI}33m■ SESSION SAVED{CSI}0m {session['stamp']}  "
@@ -379,9 +387,10 @@ def run(args, make_mission=None):
             # Single flight: any ending event descends/cuts, disarms, saves, EXITS.
             # Low battery in the air → request the same controlled landing as SPACEBAR.
             if batt_low and state in ("FLYING", "LANDING"):
-                if not land_requested:
-                    sys.stdout.write(f"\n{CSI}1;31mBATTERY LOW ({pack_v:.2f}V) — landing.{CSI}0m\n")
-                land_requested = True
+                if not emergency_land:
+                    sys.stdout.write(f"\n{CSI}1;31mBATTERY LOW ({pack_v:.2f}V) — landing now "
+                                     f"(skipping sync spin).{CSI}0m\n")
+                emergency_land = True
 
             if not tx_armed:
                 # Manual disarm: in the air = instant kill + EXIT; on the ground =
@@ -396,6 +405,8 @@ def run(args, make_mission=None):
                     end_session()
                 state, launch, mission, fly_t0, land_t0 = \
                     "DISARMED", None, None, None, None
+                land_requested = emergency_land = mission_done = False
+                spin_events, prev_phase = [], None
                 controller.reset()
             elif state == "DISARMED":
                 state = "ARMED_IDLE"
@@ -407,8 +418,13 @@ def run(args, make_mission=None):
                     break
                 if fc_armed and record_on and pose_fresh:
                     launch = (pose["x"], pose["y"], pose["z"], pose["yaw"])
-                    mission = (make_mission(launch) if make_mission is not None
-                               else HoldMission(launch))
+                    inner = (make_mission(launch) if make_mission is not None
+                             else HoldMission(launch))
+                    # Bookend the flight with sync spins (settle→360°→settle, before
+                    # the program and before landing) unless disabled. Composes with
+                    # any inner mission; reports done only after the closing spin.
+                    mission = (SyncSpinMission(launch, inner)
+                               if config.SYNC_SPIN_ENABLED else inner)
                     controller.set_target(launch[0], launch[1],
                                           launch[2] + config.CLIMB_M, launch[3])
                     begin_session()
@@ -426,7 +442,10 @@ def run(args, make_mission=None):
                         end_session()
                     send_disarm()
                     break
-                elif land_requested:
+                elif emergency_land or mission_done:
+                    # Controlled land (SPACEBAR) is NOT here: it's passed to the mission,
+                    # which runs the exit sync-spin and then reports done (mission_done).
+                    # Only an emergency (low batt) or the finished mission descends.
                     state, land_t0 = "LANDING", now_mono
                     sys.stdout.write(
                         f"\n{CSI}36m▼ LANDING — descend to {config.LAND_CUT_M:.2f} m, "
@@ -474,13 +493,24 @@ def run(args, make_mission=None):
                 # (set_target would wipe them). done → land via the SAME path as
                 # SPACEBAR.
                 (tx, ty, tz, tyaw, tvx, tvy,
-                 tax, tay, done) = mission.update(pose, dt, airborne)
+                 tax, tay, done) = mission.update(pose, dt, airborne, land_requested)
                 controller.set_setpoint(tx, ty, tz, tyaw, tvx, tvy, tax, tay)
                 setpoint = (tx, ty, tz, tyaw, tvx, tvy)   # logged → dashboard overlay
                 ctl_out = controller.step(pose, dt, level_only=not airborne)
-                if done and not land_requested:
-                    land_requested = True
-                    sys.stdout.write(f"\n{CSI}32m✔ MISSION COMPLETE — landing.{CSI}0m\n")
+                # Mark each sync-spin's start/end on the session clock (= Abs_time), so
+                # combine.py can window each spin for the latency/drift witness.
+                cur_phase = getattr(mission, "phase", None)
+                if cur_phase != prev_phase:
+                    t_rel = now_wall - session["t0"]
+                    if prev_phase in ("spin_entry", "spin_exit") and spin_events:
+                        spin_events[-1]["t1_rel"] = t_rel
+                    if cur_phase in ("spin_entry", "spin_exit"):
+                        spin_events.append({"which": cur_phase.split("_")[1],
+                                            "t0_rel": t_rel, "t1_rel": None})
+                    prev_phase = cur_phase
+                if done and not mission_done:
+                    mission_done = True
+                    sys.stdout.write(f"\n{CSI}32m✔ FLIGHT COMPLETE — landing.{CSI}0m\n")
             elif state == "LANDING" and pose is not None:
                 ctl_out = controller.step(pose, dt, descent_rate=config.LAND_SPEED_MPS)
             elif state == "FLYING" and pose is not None:

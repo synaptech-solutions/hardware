@@ -66,8 +66,8 @@ STICK_US_PER_DEG = STICK_FULL_DEFLECTION_US / FC_ANGLE_LIMIT_DEG   # 8.525
 # the 90° mount swaps std roll/pitch vs the drone's axes). Still DRY_RUN the restoring
 # direction before arming: tilt nose-down → pitch us must drop BELOW 1500 (commands
 # nose-up); roll right → roll us BELOW 1500. That's the gate (defense in depth).
-ACRO_MODE = False              # master switch; flip True only after the DRY_RUN check
-KP_ANGLE_RATE = 5.0            # °/s of commanded body rate per ° of attitude error
+ACRO_MODE = True              # master switch; flip True only after the DRY_RUN check
+KP_ANGLE_RATE = 10.0            # °/s of commanded body rate per ° of attitude error
                                # (≈ Angle mode's outer P; 1/KP ≈ 0.2 s leveling time
                                # constant). START LOW: Vicon attitude is ~100 Hz but
                                # transport-delayed and there is NO FC self-level net
@@ -302,6 +302,33 @@ MAX_YAW_US = 450               # 450us = 264°/s authority (450/1.705). The 3 m/
                                # too-low clamp, NOT the drone's limit.)
 YAW_DEADBAND_RAD = math.radians(2.0)   # zeroes the error fed to P+I (no twitching at
                                # rest); FF and D always run
+
+# ============ sync-spin maneuver (clock + latency witness) ======================
+# Bookends every flight with a deliberate, crisp 360° flat yaw spin (settle → spin
+# → settle) BEFORE the program and again BEFORE landing. The spin is the loud, clean
+# yaw event the post-flight sync needs: combine.py cross-correlates Vicon yaw-rate
+# (laptop clock) against the FC gyro (FC clock) to recover the laptop↔drone uplink
+# latency (~42 ms measured 2026-06-17) and, from the start-vs-end spins, the clock
+# DRIFT. The master timeline stays the deterministic shared-trigger; this only adds
+# a second, gated witness. See [[project_latency_analysis]].
+#
+# Drive: CLOSED-LOOP — the mission slews the heading setpoint at SPIN_RATE_DPS and
+# the controller's existing yaw-rate FF tracks it while still holding x/y/z. Keep
+# SPIN_RATE_DPS at/under the FF's ±180°/s clamp (controller.step) so the spin is a
+# clean constant rate fed entirely by the FF, not a PID catch-up. DRY_RUN-verify the
+# spin direction + that position holds before flying.
+SYNC_SPIN_ENABLED = True        # master switch for the bookend spins
+SPIN_RATE_DPS = 160.0           # spin yaw rate (°/s). 160 → ~2.25 s/turn; stays under
+                                # the ±180°/s yaw-rate FF clamp for a clean constant rate.
+SPIN_TURNS = 1.0                # full turns per spin (1.0 = one 360°, returns to start heading)
+SPIN_SETTLE_S = 1.0             # hover-settle before AND after each spin (per the flight plan)
+SPIN_DIR = +1                   # +1 = CCW (yaw-setpoint increasing); -1 = CW. Sync works
+                                # either way — DRY_RUN just confirms it actually rotates.
+# The ENTRY spin waits until the climb is (near-)complete — gating on "airborne"
+# (0.3 m) alone spun it at 0.6 m mid-climb (flight 20260617_131652). Start once the
+# drone is within SPIN_CLIMB_TOL_M of the CLIMB_M target, or after the timeout backstop.
+SPIN_CLIMB_TOL_M = 0.15         # consider the climb done within this of CLIMB_M
+SPIN_CLIMB_TIMEOUT_S = 8.0      # backstop: spin anyway if it never quite settles to height
 
 # ============ safety ============
 # The flight ends ONLY on: SPACEBAR (laptop), low battery, manual disarm (TX12),
