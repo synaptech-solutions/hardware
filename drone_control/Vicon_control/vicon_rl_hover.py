@@ -110,7 +110,7 @@ def run(args):
         sign_roll=args.sign_roll, sign_pitch=args.sign_pitch, sign_yaw=args.sign_yaw,
         land_speed_mps=config.LAND_SPEED_MPS, land_cut_m=config.LAND_CUT_M)
     print(f"Hover:    target_alt={controller.target_alt:.2f} m above launch  "
-          f"(sim control_dt={control_dt*1000:.0f} ms)")
+          f"(loop @ trained control_dt={control_dt*1000:.0f} ms = {1.0/control_dt:.0f} Hz)")
 
     cmd_log = CommandLogger()
     telem = TelemetryLogger()
@@ -146,7 +146,7 @@ def run(args):
     fly_t0 = land_t0 = None
     last_ch = None
 
-    period = 1.0 / config.TX_HZ
+    period = control_dt
     nxt = time.monotonic()
     prev_mono = time.monotonic()
     last_ping = last_render = 0.0
