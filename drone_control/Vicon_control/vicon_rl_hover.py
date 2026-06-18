@@ -142,9 +142,9 @@ def run(args):
     seen_disarmed = False
     land_requested = False
     launch_z = None
-    airborne = False
     fly_t0 = land_t0 = None
     last_ch = None
+    ood_t0 = None                 # OOD runaway-climb debounce: when the kill condition first held
 
     period = control_dt
     nxt = time.monotonic()
@@ -301,8 +301,8 @@ def run(args):
                     break
                 if sess_active:
                     end_session()
-                state, launch_z, airborne, fly_t0, land_t0 = \
-                    "DISARMED", None, False, None, None
+                state, launch_z, fly_t0, land_t0 = \
+                    "DISARMED", None, None, None
                 land_requested = False
                 controller.reset()
             elif state == "DISARMED":
@@ -316,7 +316,6 @@ def run(args):
                 if fc_armed and record_on and pose_fresh:
                     controller.capture_launch(pose)
                     launch_z = pose["z"]
-                    airborne = False
                     begin_session()
                     fly_t0, state = now_mono, "FLYING"
                     sys.stdout.write(
@@ -364,14 +363,30 @@ def run(args):
             ctl_out = None
             if state in ("FLYING", "LANDING"):
                 if pose_fresh:
-                    if launch_z is not None and (pose["z"] - launch_z) > config.TAKEOFF_AIRBORNE_M:
-                        airborne = True
                     ctl_out = controller.step(pose, dt)
                     us = ctl_out["us"]
                     ch[channels.CH_ROLL] = int(us[0])
                     ch[channels.CH_PITCH] = int(us[1])
                     ch[channels.CH_THR] = int(us[2])
                     ch[channels.CH_YAW] = int(us[3])
+
+                    # OOD runaway kill: the policy has driven the drone well above
+                    # its own altitude target — it's left the trained envelope.
+                    above_target = (pose["z"] - controller.target_w[2]
+                                    if controller.target_w is not None else 0.0)
+                    if config.OOD_KILL_ENABLED and above_target > config.OOD_CEILING_M:
+                        if ood_t0 is None:
+                            ood_t0 = now_mono
+                        if (now_mono - ood_t0) >= config.OOD_KILL_S:
+                            sys.stdout.write(
+                                f"\n{CSI}1;31m✖ OOD RUNAWAY — {above_target:.2f} m above "
+                                f"target — kill + exit.{CSI}0m\n")
+                            if sess_active:
+                                end_session()
+                            send_disarm()
+                            break
+                    else:
+                        ood_t0 = None
                 elif last_ch is not None:
                     # brief stale Vicon (STALE < age < KILL): repeat the last good
                     # command rather than act on a stale pose; KILL above cuts it.

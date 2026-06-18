@@ -341,6 +341,12 @@ BATT_PRESENT_V = 2.5           # below this = no/!valid pack reading, ignore
 MIN_CELL_V = 3.3
 CELLS = 1
 
+# ---- OOD runaway-climb kill (RL policy deployment) ----
+OOD_KILL_ENABLED = True
+OOD_CEILING_M = 0.5            # this far ABOVE the policy's altitude target = kill
+OOD_KILL_S = 0.0              # the overshoot must persist this long before the cut
+                              # (0 = kill on the first tick over the ceiling; raise
+
 # ============ waypoint mission (square_flight.py only) ==========================
 # square_flight.py flies a course built in the LAUNCH BODY FRAME (forward/right
 # relative to the nose at takeoff) and converted to FIXED world waypoints ONCE, at
