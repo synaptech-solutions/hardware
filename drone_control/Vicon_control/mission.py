@@ -92,9 +92,11 @@ class HoldMission:
         x0, y0, z0, yaw0 = launch
         self._t = (x0, y0, z0 + config.CLIMB_M, yaw0)
 
-    def update(self, pose, dt, airborne):
+    def update(self, pose, dt, airborne, land_requested=False):
         x, y, z, yaw = self._t
-        return x, y, z, yaw, 0.0, 0.0, 0.0, 0.0, False
+        # A static hover never finishes on its own; a controlled-land request
+        # (SPACEBAR) winds it down immediately by reporting done.
+        return x, y, z, yaw, 0.0, 0.0, 0.0, 0.0, bool(land_requested)
 
     def status(self):
         return "hold"
@@ -108,6 +110,153 @@ class HoldMission:
         x, y, z, yaw = self._t
         return {"kind": "hold",
                 "target": {"x": x, "y": y, "z": z, "yaw_rad": yaw}}
+
+
+# ----------------------------------------------------------------------------- #
+class SyncSpinMission:
+    """Bookend any inner Mission with a deliberate 360° flat yaw SPIN for post-flight
+    clock + latency sync. Sequence (all at the launch-hover height):
+
+        settle → SPIN → settle → [inner mission] → settle → SPIN → settle → done
+
+    Each spin slews the heading setpoint at config.SPIN_RATE_DPS while holding x/y/z,
+    so the controller's yaw-rate FF turns it into a clean constant-rate rotation that
+    BOTH Vicon (laptop clock) and the FC gyro (FC clock) record — the loud, sharp
+    event combine.py cross-correlates to recover the laptop↔drone uplink latency and,
+    from the start-vs-end spins, the FC↔laptop clock drift. See config's sync-spin
+    section and the latency analysis notes.
+
+    The EXIT bookend runs on a CONTROLLED land (inner done, or SPACEBAR via
+    land_requested) — never on an emergency (low batt / Vicon loss / disarm), which
+    the flight loop services immediately and bypasses this. `done` goes True only
+    after the exit bookend, so the loop's land-on-done path wraps the whole thing.
+
+    Disabled (config.SYNC_SPIN_ENABLED=False) → the loop flies the inner mission
+    directly, so this composes transparently with hover / waypoint / path flights.
+    The exit bookend spins where the inner mission FINISHED (its last setpoint), not
+    back at launch, so a course that ends downrange doesn't fly home first.
+    """
+
+    def __init__(self, launch, inner):
+        x0, y0, z0, yaw0 = launch
+        self.inner = inner
+        self.settle = config.SPIN_SETTLE_S
+        self.sweep = 2.0 * math.pi * config.SPIN_TURNS
+        self.rate = math.radians(config.SPIN_RATE_DPS) * (1.0 if config.SPIN_DIR >= 0 else -1.0)
+        self.hold = (x0, y0, z0 + config.CLIMB_M)   # hold point for the current bookend
+        self.yaw_base = yaw0          # heading the active spin rotates about / settles on
+        self.yaw_sp = yaw0            # commanded heading (slewed during a spin)
+        self.last_inner = None        # inner's last (x, y, z, yaw) → the exit hold point
+        self.phase = "settle_entry"
+        self.t_in_phase = 0.0
+        self.spun = 0.0               # |rad| swept in the active spin
+        self.climb_done = False       # entry spin waits for the climb to finish
+        self.t_climb = 0.0            # time spent waiting to reach climb height
+        self.done = False
+
+    def _hover(self):
+        hx, hy, hz = self.hold
+        return hx, hy, hz, self.yaw_sp, 0.0, 0.0, 0.0, 0.0, self.done
+
+    def _begin_spin(self):
+        self.t_in_phase, self.spun = 0.0, 0.0
+        self.yaw_base = self.yaw_sp                  # spin about the currently-held heading
+
+    def _to_exit(self):
+        """Enter the exit bookend, holding where the inner mission left off."""
+        if self.last_inner is not None:
+            x, y, z, yaw = self.last_inner
+            self.hold, self.yaw_sp = (x, y, z), yaw
+        self.phase, self.t_in_phase, self.spun = "settle_exit", 0.0, 0.0
+
+    def _advance_spin(self, dt):
+        """Slew the heading at the spin rate; True when the full sweep is done,
+        snapping the setpoint exactly onto the start heading (whole turns) so no
+        fractional overshoot remains and the FF rate drops cleanly to zero."""
+        self.spun += abs(self.rate) * dt
+        if self.spun >= self.sweep:
+            self.yaw_base += math.copysign(self.sweep, self.rate)   # ≡ start heading (mod 2π)
+            self.yaw_sp = self.yaw_base
+            return True
+        self.yaw_sp = self.yaw_base + math.copysign(self.spun, self.rate)
+        return False
+
+    def update(self, pose, dt, airborne, land_requested=False):
+        if self.done:
+            return self._hover()
+        # Hold level hover through the straight-up takeoff; the entry spin only starts
+        # once airborne at the climb height.
+        if not airborne:
+            return self._hover()
+        # Wait for the climb to (near-)complete before the entry bookend — spinning
+        # mid-climb (flight 20260617_131652: spun at 0.6 m of a 1.0 m target) tilts
+        # the still-rising drone. Hold the climb target until within tol (or timeout).
+        if self.phase == "settle_entry" and not self.climb_done:
+            if abs(pose["z"] - self.hold[2]) <= config.SPIN_CLIMB_TOL_M:
+                self.climb_done = True
+            else:
+                self.t_climb += dt
+                if self.t_climb >= config.SPIN_CLIMB_TIMEOUT_S:
+                    self.climb_done = True       # backstop: proceed anyway
+                else:
+                    return self._hover()         # keep climbing; don't start the spin
+        # A controlled land before/while the inner mission runs → jump to the exit
+        # bookend, so even an aborted course still gets a closing spin to sync on.
+        if land_requested and self.phase in ("settle_entry", "spin_entry",
+                                             "settle_mid", "inner"):
+            self._to_exit()
+
+        self.t_in_phase += dt
+        if self.phase == "settle_entry":
+            if self.t_in_phase >= self.settle:
+                self.phase = "spin_entry"
+                self._begin_spin()
+        elif self.phase == "spin_entry":
+            if self._advance_spin(dt):
+                self.phase, self.t_in_phase = "settle_mid", 0.0
+        elif self.phase == "settle_mid":
+            if self.t_in_phase >= self.settle:
+                self.phase, self.t_in_phase = "inner", 0.0
+        elif self.phase == "inner":
+            r = self.inner.update(pose, dt, airborne)
+            self.last_inner = (r[0], r[1], r[2], r[3])
+            if r[8]:                                  # inner finished → exit bookend
+                self._to_exit()
+            else:
+                return r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], False
+        elif self.phase == "settle_exit":
+            if self.t_in_phase >= self.settle:
+                self.phase = "spin_exit"
+                self._begin_spin()
+        elif self.phase == "spin_exit":
+            if self._advance_spin(dt):
+                self.phase, self.t_in_phase = "settle_end", 0.0
+        elif self.phase == "settle_end":
+            if self.t_in_phase >= self.settle:
+                self.done = True
+        return self._hover()
+
+    def status(self):
+        if self.done:
+            return "sync-spin done"
+        if self.phase == "inner":
+            return f"inner:{self.inner.status()}"
+        if self.phase in ("spin_entry", "spin_exit"):
+            return f"{self.phase} {math.degrees(self.spun):.0f}/{math.degrees(self.sweep):.0f}°"
+        return self.phase
+
+    def describe(self):
+        lines = [f"  Sync-spin bookends: settle {self.settle:.0f}s → "
+                 f"{config.SPIN_TURNS:.0f}×360° @ {config.SPIN_RATE_DPS:.0f}°/s "
+                 f"({'CCW' if self.rate >= 0 else 'CW'}) → settle, before AND after."]
+        lines += self.inner.describe()
+        return lines
+
+    def summary(self):
+        return {"kind": "sync_spin",
+                "rate_dps": config.SPIN_RATE_DPS, "turns": config.SPIN_TURNS,
+                "settle_s": self.settle, "dir": "ccw" if self.rate >= 0 else "cw",
+                "inner": self.inner.summary()}
 
 
 # ----------------------------------------------------------------------------- #
@@ -174,10 +323,12 @@ class WaypointMission:
         self.sx, self.sy = nx, ny
         self.v = v_next
 
-    def update(self, pose, dt, airborne):
+    def update(self, pose, dt, airborne, land_requested=False):
         """One tick. Returns (x, y, z, yaw, svx, svy, done): the (x, y) is the
         moving carrot, (svx, svy) its velocity (for the controller's velocity
         feedforward); z + yaw are the active waypoint's."""
+        if land_requested:
+            self.done = True                   # SPACEBAR → abandon the course, land
         wx, wy, wz, wyaw, dwell = self.wps[self.idx]
         px, py = self.sx, self.sy
         if not self.done:
@@ -513,7 +664,9 @@ class PathMission:
             return self.cruise
         return 0.0
 
-    def update(self, pose, dt, airborne):
+    def update(self, pose, dt, airborne, land_requested=False):
+        if land_requested:
+            self.done = True                   # SPACEBAR → abandon the path, land
         if self.done or self.i >= len(self.segs):
             self.done = True
             return self.cx, self.cy, self.z, self.yaw_sp, 0.0, 0.0, 0.0, 0.0, True

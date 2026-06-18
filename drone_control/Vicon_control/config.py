@@ -46,6 +46,37 @@ FC_ANGLE_LIMIT_DEG = 60.0
 STICK_FULL_DEFLECTION_US = 511.5
 STICK_US_PER_DEG = STICK_FULL_DEFLECTION_US / FC_ANGLE_LIMIT_DEG   # 8.525
 
+# ============ ACRO mode (ADDITIVE — ANGLE is the default + the fallback) ========
+# With ACRO_MODE True the FC is put in ACRO (MODE_CH → MODE_ACRO_US): Betaflight
+# stops self-leveling and reads the roll/pitch sticks as RATE setpoints, still
+# closing its own 8 kHz inner rate PID. We then close the ATTITUDE (leveling) loop
+# ourselves on Vicon roll/pitch — the controller's angle→rate P stage replaces
+# Angle mode's outer P. Yaw + throttle are UNCHANGED (yaw is a rate command in BOTH
+# modes; throttle is direct). With ACRO_MODE False all of this is dead code and the
+# flight is the proven Angle-mode behavior, byte-for-byte.
+#
+# Rate curve (Air75 `dump all`, rateprofile 0, ACTIVE): rates_type=ACTUAL, roll/
+# pitch srate=7, expo=0 → LINEAR, full stick (±511.5us) = 70°/s. So a commanded body
+# rate → us at 511.5/70 = 7.307 us per °/s. (70°/s is low — it was set to linearize
+# Angle mode, not for aerobatic ACRO — but it's ample for a hover leveling loop;
+# raise srate later for a faster envelope, then cut KP_ANGLE_RATE proportionally.)
+#
+# THE VICON ATTITUDE MAP is empirically verified (2026-06-16, acro_attitude_check.py,
+# 3-pose bench test) and lives in vicon_source.drone_roll_pitch (heading-invariant;
+# the 90° mount swaps std roll/pitch vs the drone's axes). Still DRY_RUN the restoring
+# direction before arming: tilt nose-down → pitch us must drop BELOW 1500 (commands
+# nose-up); roll right → roll us BELOW 1500. That's the gate (defense in depth).
+ACRO_MODE = True              # master switch; flip True only after the DRY_RUN check
+KP_ANGLE_RATE = 10.0            # °/s of commanded body rate per ° of attitude error
+                               # (≈ Angle mode's outer P; 1/KP ≈ 0.2 s leveling time
+                               # constant). START LOW: Vicon attitude is ~100 Hz but
+                               # transport-delayed and there is NO FC self-level net
+                               # under this loop — if it wobbles FAST, LOWER this; if
+                               # it's sluggish to level, raise it.
+ACRO_MAX_RATE_DPS = 70.0       # clamp on the commanded rate = the FC ACTUAL-rate
+                               # ceiling (srate=7 → 70°/s); full stick at the clamp.
+ACRO_RATE_US_PER_DPS = STICK_FULL_DEFLECTION_US / ACRO_MAX_RATE_DPS   # 7.307
+
 # ============ stick signs (Air75, verified via test_stick_directions.py) ========
 # us > 1500 ⇒ roll RIGHT / pitch FORWARD (nose down) / yaw RIGHT (CW).
 # These are the knobs to flip if DRY_RUN shows a corrective direction inverted.
@@ -272,6 +303,33 @@ MAX_YAW_US = 450               # 450us = 264°/s authority (450/1.705). The 3 m/
 YAW_DEADBAND_RAD = math.radians(2.0)   # zeroes the error fed to P+I (no twitching at
                                # rest); FF and D always run
 
+# ============ sync-spin maneuver (clock + latency witness) ======================
+# Bookends every flight with a deliberate, crisp 360° flat yaw spin (settle → spin
+# → settle) BEFORE the program and again BEFORE landing. The spin is the loud, clean
+# yaw event the post-flight sync needs: combine.py cross-correlates Vicon yaw-rate
+# (laptop clock) against the FC gyro (FC clock) to recover the laptop↔drone uplink
+# latency (~42 ms measured 2026-06-17) and, from the start-vs-end spins, the clock
+# DRIFT. The master timeline stays the deterministic shared-trigger; this only adds
+# a second, gated witness. See [[project_latency_analysis]].
+#
+# Drive: CLOSED-LOOP — the mission slews the heading setpoint at SPIN_RATE_DPS and
+# the controller's existing yaw-rate FF tracks it while still holding x/y/z. Keep
+# SPIN_RATE_DPS at/under the FF's ±180°/s clamp (controller.step) so the spin is a
+# clean constant rate fed entirely by the FF, not a PID catch-up. DRY_RUN-verify the
+# spin direction + that position holds before flying.
+SYNC_SPIN_ENABLED = True        # master switch for the bookend spins
+SPIN_RATE_DPS = 160.0           # spin yaw rate (°/s). 160 → ~2.25 s/turn; stays under
+                                # the ±180°/s yaw-rate FF clamp for a clean constant rate.
+SPIN_TURNS = 1.0                # full turns per spin (1.0 = one 360°, returns to start heading)
+SPIN_SETTLE_S = 1.0             # hover-settle before AND after each spin (per the flight plan)
+SPIN_DIR = +1                   # +1 = CCW (yaw-setpoint increasing); -1 = CW. Sync works
+                                # either way — DRY_RUN just confirms it actually rotates.
+# The ENTRY spin waits until the climb is (near-)complete — gating on "airborne"
+# (0.3 m) alone spun it at 0.6 m mid-climb (flight 20260617_131652). Start once the
+# drone is within SPIN_CLIMB_TOL_M of the CLIMB_M target, or after the timeout backstop.
+SPIN_CLIMB_TOL_M = 0.15         # consider the climb done within this of CLIMB_M
+SPIN_CLIMB_TIMEOUT_S = 8.0      # backstop: spin anyway if it never quite settles to height
+
 # ============ safety ============
 # The flight ends ONLY on: SPACEBAR (laptop), low battery, manual disarm (TX12),
 # or Vicon loss — each descends/cuts and EXITS the program (no time cap, no
@@ -346,7 +404,7 @@ CIRCLE_SPEED_MPS = 3.0         # CIRCLE carrot speed. 3.0 is ~the fastest the CU
                                # ω=172°/s against the 300°/s FC linear yaw curve — yaw
                                # authority is the real wall. Go faster only on a LARGER
                                # radius (bank ∝ v²/r, yaw rate ∝ v/r — both ease with r).
-CIRCLE_RADIUS_M = 1.0          # circle radius AND the forward approach distance
+CIRCLE_RADIUS_M = 2.0          # circle radius AND the forward approach distance
 CIRCLE_LAPS = 3                # consecutive laps of the circle (one continuous arc —
                                # no dwells between laps; entry/exit dwells unchanged)
 CIRCLE_CW = False              # True = clockwise viewed from above (the carrot goes
@@ -415,7 +473,7 @@ FIG8_FACE_TANGENT = True      # nose follows the travel direction. KEEP FALSE at
                                # FIG8_END_X_M (206°/s at 1.2 m/s) — over the ~147°/s yaw
                                # authority. Only enable if FIG8_SPEED_MPS is low enough
                                # that v·3/FIG8_END_X_M < YAW_SLEW_DPS.
-FIG8_SPEED_MPS = 3.0           # carrot speed. LOWER than the circle's cruise on purpose:
+FIG8_SPEED_MPS = 2.0           # carrot speed. LOWER than the circle's cruise on purpose:
                                # the lemniscate's peak curvature is 3/FIG8_END_X_M at the
                                # ends, so peak bank ∝ v²; 1.2 m/s keeps it ~4.3 m/s² (24°,
                                # like the circle). Raise toward ~1.5 m/s max (see DYNAMICS).

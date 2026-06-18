@@ -43,6 +43,33 @@ def quat_to_yaw(qx, qy, qz, qw):
                       1.0 - 2.0 * (qy * qy + qz * qz))
 
 
+def drone_roll_pitch(qx, qy, qz, qw):
+    """Drone-body roll & pitch (rad) from the Vicon quaternion, in the CONTROLLER's
+    sign convention (roll>0 = rolled RIGHT, pitch>0 = nose DOWN) so the ACRO
+    angle→rate loop can difference them directly against desired_roll/desired_pitch.
+
+    EMPIRICALLY VERIFIED 2026-06-16 (acro_attitude_check.py, 3-pose bench test): the
+    Vicon rigid body is mounted ~90° rotated from the drone's roll/pitch axes (same
+    root cause as VICON_YAW_OFFSET_DEG=90), so the STANDARD aerospace roll/pitch
+    extracted from the quaternion come out SWAPPED relative to the drone:
+        standard roll  (about quat X)  →  drone PITCH  (nose-down measured NEGATIVE)
+        standard pitch (about quat Y)  →  drone ROLL   (right-down measured POSITIVE)
+    The extraction is also HEADING-INVARIANT (nose-down read the same facing +Y and
+    facing +X after a 90° turn), so NO yaw rotation is applied here. Bench data:
+    pose1 (face+Y, nose-down) std[R-37 P~0]; pose2 (roll-right) std[R~-1.5 P+35];
+    pose3 (face+X, nose-down) std[R-38 P~0] == pose1 → heading-invariance confirmed."""
+    # standard aerospace ZYX extraction
+    sinr_cosp = 2.0 * (qw * qx + qy * qz)
+    cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+    std_roll = math.atan2(sinr_cosp, cosr_cosp)
+    sinp = max(-1.0, min(1.0, 2.0 * (qw * qy - qz * qx)))
+    std_pitch = math.asin(sinp)
+    # 90° mount swap + sign into the controller convention (see docstring / bench data)
+    drone_pitch = -std_roll     # nose-down POSITIVE (matches desired_pitch>0)
+    drone_roll = std_pitch      # roll-right POSITIVE (matches desired_roll>0)
+    return drone_roll, drone_pitch
+
+
 class ViconPoseSource:
     """Single Vicon receiver + per-tick pose read for the controller.
 
@@ -114,10 +141,11 @@ class ViconPoseSource:
         """Latest world-frame pose for the body. Returns a dict or None if no
         packet has arrived yet. Velocities are stepped on the packet timestamp.
 
-        keys: x, y, z, yaw (rad), vx, vy, vz, t_packet (wall), age_s (since packet),
-              qx, qy, qz, qw (the RAW Vicon rigid-body quaternion — full orientation,
-              for consumers that need roll/pitch too, e.g. an RL policy's body frame;
-              the PID controller uses only x/y/z/yaw + velocities).
+        keys: x, y, z, yaw (rad), roll, pitch (rad — drone body, controller
+        convention: roll>0 right / pitch>0 nose-down), vx, vy, vz, t_packet (wall),
+        age_s (since packet), qx, qy, qz, qw (the RAW Vicon rigid-body quaternion —
+        full orientation, for consumers that need the body frame, e.g. an RL policy;
+        the PID controller uses only x/y/z/yaw + velocities).
         """
         if self.udp is None:
             return None
@@ -131,6 +159,9 @@ class ViconPoseSource:
             return None
         x, y, z = b["x"], b["y"], b["z"]
         yaw = quat_to_yaw(b["qx"], b["qy"], b["qz"], b["qw"]) + self.yaw_offset
+        # Body roll/pitch for the ACRO leveling loop (no yaw offset — the extraction
+        # is heading-invariant; see drone_roll_pitch). Harmless in Angle mode.
+        roll, pitch = drone_roll_pitch(b["qx"], b["qy"], b["qz"], b["qw"])
         # Step velocities only on a genuinely new packet so a stalled stream
         # doesn't inject dt-driven noise (Differentiator no-ops when dt==0).
         if udp_time != self._last_udp_time:
@@ -140,6 +171,7 @@ class ViconPoseSource:
             self._last_udp_time = udp_time
         return {
             "x": x, "y": y, "z": z, "yaw": yaw,
+            "roll": roll, "pitch": pitch,
             "qx": b["qx"], "qy": b["qy"], "qz": b["qz"], "qw": b["qw"],
             "vx": self._diff_x.data_rate,
             "vy": self._diff_y.data_rate,

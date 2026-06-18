@@ -570,6 +570,41 @@ def main():
         "n_telemetry_channels": n_tlm_ch,
         "columns": list(cols.keys()),
     }
+
+    # --- second, GATED sync witness (does NOT touch the master timeline above) ----
+    # The merge above aligns everything to the deterministic shared trigger. This adds
+    # an INDEPENDENT estimate by cross-correlating Vicon yaw-rate (laptop clock) vs the
+    # FC gyro (FC clock) — same physical motion, no RC link between them, so the lag is
+    # a real clock offset / transport delay, not the cmd↔rcCommand clock-glue. Gated on
+    # correlation so it refuses to report noise. Recovers the laptop→drone uplink and,
+    # from the bookend yaw spins (sync_spin_events), the FC↔laptop clock drift.
+    spin_windows = [(e["t0_rel"], e["t1_rel"]) for e in meta.get("sync_spin_events", [])
+                    if isinstance(e, dict) and e.get("t1_rel") is not None]
+    try:
+        if os.path.join(HERE, "latency") not in sys.path:
+            sys.path.insert(0, os.path.join(HERE, "latency"))
+        from roundtrip_latency import analyze as _latency_analyze
+        sync_q = _latency_analyze(out, spin_windows or None)
+    except Exception as e:                                    # never block the merge
+        sync_q = {"available": False, "reason": f"witness error: {e}"}
+    meta_out_data["sync_quality"] = sync_q
+
+    if sync_q.get("available") and sync_q.get("trustworthy") and sync_q.get("uplink_ms") is not None:
+        drift = sync_q.get("drift_ms_per_s")
+        msg = (f"Sync witness: laptop→drone uplink ≈ {sync_q['uplink_ms']:+.1f} ms  "
+               f"(Vicon-yaw witness corr {sync_q['witness_corr']:.2f}); "
+               f"FC-internal {sync_q['fc_internal_ms']:+.1f} ms (corr {sync_q['fc_internal_corr']:.2f}"
+               + (" — low, expect clean once bookend spins fly)"
+                  if sync_q['fc_internal_corr'] < sync_q.get('min_corr_gate', 0.5) else ")"))
+        if drift is not None:
+            msg += f"\n              clock drift {drift:+.3f} ms/s (fit over {sync_q['n_spins_used']} spins)"
+        print(msg)
+    elif sync_q.get("available"):
+        print(f"Sync witness: yaw too weak (witness corr {sync_q.get('witness_corr')}) — "
+              "uplink not recovered. Fly the bookend yaw spins for a clean witness.")
+    else:
+        print(f"Sync witness: n/a ({sync_q.get('reason', '')}).")
+
     with open(meta_out, "w") as f:
         json.dump(meta_out_data, f, indent=2)
 

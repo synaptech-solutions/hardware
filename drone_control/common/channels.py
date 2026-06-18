@@ -50,11 +50,17 @@ MODE_ANGLE_US = 1500
 MODE_HORIZON_US = 1900
 
 # --- camera (Cam Link 4K) ---
-# WIDTH/HEIGHT must match apriltag_control/camera_setup/camera_calibration.npz for
-# the AprilTag controller; the data logger + Vicon controller use the camera only
-# for raw video capture. The Cam Link can re-enumerate 4<->5.
+# The data logger + Vicon controller use the camera ONLY for raw video capture (RL
+# training footage), so the resolution is a free choice: pick any mode the Cam Link
+# enumerates (v4l2-ctl --device=/dev/video4 --list-formats-ext → 1920x1080, 1280x720,
+# 720x576, 720x480, 640x480). 720x480 keeps the files small for RL; verified the
+# device delivers it natively (MJPG @30/60fps), so this is purely a code knob.
+# NOTE: this no longer matches apriltag_control/camera_setup/camera_calibration.npz
+# (calibrated at 1280x720) — the (archived) AprilTag controller would need a rescaled
+# K / recalibration; the Vicon controller doesn't use the camera intrinsics at all.
+# The Cam Link can re-enumerate 4<->5.
 DEVICE_INDEX = 4
-WIDTH, HEIGHT = 1280, 720
+WIDTH, HEIGHT = 720, 480
 
 # --- loop rate ---
 # 100 Hz (was 50, raised 2026-06-12). Within the link budget: the ELRS link runs
