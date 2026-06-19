@@ -516,7 +516,7 @@ def single_panel_fig(panel, window):
 ORIENT_COLOR = "#000000"       # distinct from the Viridis trajectory
 
 
-def _orientation_traces(data, mask, arm_len=None):
+def _orientation_traces(data, mask, arm_len=None, width=2):
     """A small weather-flag 'L' on EVERY shown point: long arm = body forward
     (×2), short arm = body up (×1), perpendicular. One trace (disconnected
     segments via None breaks), one distinct color. Each L is sized to the local
@@ -555,7 +555,7 @@ def _orientation_traces(data, mask, arm_len=None):
     seg[0::6], seg[1::6], seg[2::6] = P, F, np.nan
     seg[3::6], seg[4::6], seg[5::6] = F, U, np.nan
     return go.Scatter3d(x=seg[:, 0], y=seg[:, 1], z=seg[:, 2], mode="lines",
-                        line=dict(color=ORIENT_COLOR, width=2),
+                        line=dict(color=ORIENT_COLOR, width=width),
                         name="orientation (long=facing, short=up)")
 
 
@@ -690,14 +690,18 @@ def _build_3d_playback(data, color_by, playhead, show_orient, carrot):
                 z=[data["z"][cur], cz[cur]], mode="lines",
                 line=dict(color="rgba(214,39,40,0.85)", width=2, dash="dot"),
                 name="tracking error", hoverinfo="skip"))
-    # orientation flag at the current pose (sized to the trajectory spacing)
-    if show_orient and data.get("quat"):
-        P = np.column_stack([data["x"], data["y"], data["z"]])
-        dd = np.linalg.norm(np.diff(P, axis=0), axis=1); dd = dd[dd > 0]
-        arm = 2.0 * (float(np.median(dd)) if dd.size else 1e-3)
+    # Drone POSE ICON at the "now" point — the SAME L marker as window mode (long arm
+    # = nose/forward, short arm = up), but sized to ~13% of the scene (not the tiny
+    # inter-sample spacing) and drawn thick, so the live attitude is clearly visible as
+    # the flight replays. ALWAYS on in playback — it IS the drone marker (needs quats).
+    if data.get("quat"):
+        span = max(float(np.ptp(data["x"])), float(np.ptp(data["y"])),
+                   float(np.ptp(data["z"])), 0.1)
+        arm = max(0.13 * span, 0.15)
         cmask = np.zeros(N, bool); cmask[cur] = True
-        ot = _orientation_traces(data, cmask, arm_len=arm)
+        ot = _orientation_traces(data, cmask, arm_len=arm, width=5)
         if ot is not None:
+            ot.name = "drone pose (long=nose · short=up)"
             fig.add_trace(ot)
     fig.update_layout(
         autosize=True, margin=dict(l=0, r=0, t=36, b=0),
