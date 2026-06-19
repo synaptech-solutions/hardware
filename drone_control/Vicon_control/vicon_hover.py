@@ -154,7 +154,8 @@ def run(args, make_mission=None):
     # recorder shares the control receiver (one socket on :51001).
     cmd_log = CommandLogger()
     telem = TelemetryLogger()
-    recorder = (VideoRecorder(channels.DEVICE_INDEX, channels.WIDTH, channels.HEIGHT)
+    recorder = (VideoRecorder(channels.DEVICE_INDEX, channels.WIDTH, channels.HEIGHT,
+                              out_height=getattr(channels, "VIDEO_OUT_HEIGHT", None))
                 if (CV2_OK and config.RECORD_VIDEO) else None)
     vicon_rec = ViconRecorder()
     vicon_rec.prepare(external_udp=source.udp)     # share the control receiver

@@ -51,16 +51,23 @@ MODE_HORIZON_US = 1900
 
 # --- camera (Cam Link 4K) ---
 # The data logger + Vicon controller use the camera ONLY for raw video capture (RL
-# training footage), so the resolution is a free choice: pick any mode the Cam Link
-# enumerates (v4l2-ctl --device=/dev/video4 --list-formats-ext → 1920x1080, 1280x720,
-# 720x576, 720x480, 640x480). 720x480 keeps the files small for RL; verified the
-# device delivers it natively (MJPG @30/60fps), so this is purely a code knob.
-# NOTE: this no longer matches apriltag_control/camera_setup/camera_calibration.npz
-# (calibrated at 1280x720) — the (archived) AprilTag controller would need a rescaled
-# K / recalibration; the Vicon controller doesn't use the camera intrinsics at all.
-# The Cam Link can re-enumerate 4<->5.
+# training footage). We CAPTURE at the HDZero feed's native shape and let the
+# recorder downscale UNIFORMLY at encode time (VIDEO_OUT_HEIGHT below) so the saved
+# file is the EXACT incoming aspect ratio, just smaller — never cropped or squished.
+#
+# WHY capture at 1280x720 (not a small mode): the Cam Link only enumerates small
+# modes that are SD/4:3 (720x480, 720x576, 640x480 — see `v4l2-ctl --device=
+# /dev/video4 --list-formats-ext`), so requesting one FORCES a 16:9 HDZero feed into
+# 3:2 (a horizontal squish). The HDZero outputs 720p/16:9 over HDMI, so 1280x720 is
+# a faithful 1:1 capture (verified: the feed fills the frame, no bars, OSD undistorted).
+# NOTE: 1280x720 matches apriltag_control/camera_setup/camera_calibration.npz again,
+# but the Vicon controller never uses the camera intrinsics anyway. Cam Link re-enums 4<->5.
 DEVICE_INDEX = 4
-WIDTH, HEIGHT = 720, 480
+WIDTH, HEIGHT = 1280, 720       # CAPTURE resolution (faithful 1:1 of the 16:9 feed)
+# Encode-time downscale: fix the output HEIGHT, width auto-follows the captured
+# aspect (ffmpeg `scale=-2:H`) → small file, exact aspect. 720p→480 gives ~854x480.
+# Set to 0/None to record at full capture resolution (no downscale).
+VIDEO_OUT_HEIGHT = 480
 
 # --- loop rate ---
 # 100 Hz (was 50, raised 2026-06-12). Within the link budget: the ELRS link runs

@@ -96,10 +96,13 @@ class VideoRecorder:
     loop on switch edges; start() returns immediately (the thread opens the
     camera, ~0.5-1 s, so the first second of footage may be missed)."""
 
-    def __init__(self, device_index, width, height, crf=18):
+    def __init__(self, device_index, width, height, crf=18, out_height=None):
         self.device_index = device_index
         self.width = width
         self.height = height
+        # Optional encode-time downscale: output height (width auto, aspect preserved).
+        # None/0 or >= captured height → record at the captured resolution unchanged.
+        self.out_height = out_height
         self.crf = crf          # libx264 quality: 18 ≈ visually transparent, lower=bigger
         self._thread = None
         self._stop = threading.Event()
@@ -156,6 +159,15 @@ class VideoRecorder:
             self._thread.join(timeout=3.0)
         self.recording = False
 
+    def _out_size(self, w, h):
+        """Encoded (width, height): a UNIFORM downscale to self.out_height with width
+        following the captured aspect (so the saved video is the exact incoming shape,
+        never cropped/squished), or the captured size if no/too-large out_height."""
+        if not self.out_height or self.out_height >= h:
+            return w, h
+        ow = int(round(w * self.out_height / h / 2)) * 2   # even width (yuv420p needs it)
+        return max(ow, 2), int(self.out_height)
+
     def _spawn_ffmpeg(self, w, h):
         """Start the H.264/MKV encoder. Raw BGR24 frames are piped to its stdin and
         encoded with libx264 at CRF self.crf (18 ≈ visually transparent — you can't
@@ -164,12 +176,15 @@ class VideoRecorder:
         frames cheaply. We keep the MKV container (not mp4) so a hard-killed flight
         still leaves a playable file — mp4 needs a clean finalize to write its moov.
         '-framerate' only sets the container's nominal rate; real per-frame timing
-        is in video_frames.csv. Returns the Popen, or None if launch failed."""
+        is in video_frames.csv. An optional `-vf scale` downscales uniformly to
+        VIDEO_OUT_HEIGHT (aspect preserved). Returns the Popen, or None if launch failed."""
+        ow, oh = self._out_size(w, h)
+        scale = [] if (ow, oh) == (w, h) else ["-vf", f"scale={ow}:{oh}:flags=area"]
         cmd = [
             FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-y",
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-video_size", f"{w}x{h}", "-framerate", f"{self.fps:g}", "-i", "-",
-            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", str(self.crf),
+            "-an", *scale, "-c:v", "libx264", "-preset", "veryfast", "-crf", str(self.crf),
             "-pix_fmt", "yuv420p", "-g", "60", self.path,
         ]
         try:
@@ -208,8 +223,11 @@ class VideoRecorder:
                     if proc is None:
                         self.status = "ffmpeg launch FAILED"
                         return
+                    ow, oh = self._out_size(self.enc_w, self.enc_h)
+                    dims = (f"{ow}x{oh}" if (ow, oh) == (self.enc_w, self.enc_h)
+                            else f"{self.enc_w}x{self.enc_h}->{ow}x{oh}")
                     self.status = (f"REC {name} (H.264 crf{self.crf} "
-                                   f"{self.enc_w}x{self.enc_h} @ {self.fps:.0f}fps)")
+                                   f"{dims} @ {self.fps:.0f}fps)")
                 if self.first_frame_wall is None:
                     self.first_frame_wall = cap_t
                 # Drop any odd-sized frame WITHOUT logging it, so file frame N
@@ -589,7 +607,8 @@ def write_session_json(session, recorder, vicon, cmd_log, telem, cal, port, baud
             "tx_hz": channels.TX_HZ,
             "ranger_port": port, "ranger_baud": baud,
             "camera": {"device_index": channels.DEVICE_INDEX,
-                       "width": channels.WIDTH, "height": channels.HEIGHT},
+                       "width": channels.WIDTH, "height": channels.HEIGHT,
+                       "out_height": getattr(channels, "VIDEO_OUT_HEIGHT", None)},
         },
         "streams": {
             "commands": "commands.csv", "telemetry": "telemetry.csv",
