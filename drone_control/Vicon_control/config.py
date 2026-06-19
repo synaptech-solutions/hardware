@@ -29,7 +29,7 @@ RECORD_VIDEO = True             # record the drone-feed video alongside the othe
 # FIRST FLIGHTS: set CLIMB_M = 0.3 and confirm a stable low hover before 1.0 m.
 # SHARED by hover / circle / square / figure-8 (all fly CLIMB_M above launch). Set
 # to 1.0 for the figure-8's spec'd flat 1 m height (z=1); the circle last flew 0.8.
-CLIMB_M = 1.0
+CLIMB_M = 2.5
 
 # ============ FC angle-mode stick → angle scaling (from the Air75 measurement) ===
 # Measured 2026-05-29: full deflection ≈ ±511.5us reaches angle_limit (60°), so
@@ -541,6 +541,31 @@ HELIX_FACE_TANGENT = True      # nose follows travel direction (yaw rate = v/R =
                                # ~264°/s yaw authority). False = strafe at launch yaw.
 HELIX_SPEED_MPS = 2.5          # carrot ground speed along the spiral (its OWN knob,
                                # like CIRCLE_SPEED_MPS). Bank ∝ v²/R, yaw rate ∝ v/R.
+
+# ============ sine-circle mission (sine_circle_flight.py only) =================
+# sine_circle_flight.py: the CIRCLE, but the HEIGHT oscillates like a sine wave while
+# it laps. Take off + hover at CLIMB_M, fly forward SINE_RADIUS_M to the circle
+# (centred on the launch origin), trace SINE_LAPS laps while z rides
+# z_mid + SINE_AMP_M·sin(2π·SINE_CYCLES_PER_LAP·lap_fraction), settle, return, land.
+# Bird's-eye it IS the circle (same machinery / FACE_TANGENT / CW); only z bobs.
+# Reuses SETTLE_S / INITIAL_HOVER_S / LEASH_M / ARRIVE_TOL_M / CARROT_ACCEL_MPS2 / etc.
+#
+# ALTITUDE: z oscillates about z_mid = launch + CLIMB_M with amplitude SINE_AMP_M →
+# spans [z_mid - SINE_AMP_M, z_mid + SINE_AMP_M]. KEEP SINE_AMP_M < CLIMB_M so the
+# trough stays above the ground (with CLIMB_M=1.0 the default 0.3 → z in [0.7, 1.3]).
+# Peak vertical speed = SINE_AMP_M·SINE_CYCLES_PER_LAP·SINE_SPEED_MPS / SINE_RADIUS_M
+# — keep it under VMAX_UP_MPS (0.50) or the drone lags the bob (default 0.3·1·2/2 =
+# 0.3 m/s, fine). DRY-RUN + preview.py first.
+SINE_RADIUS_M = 2.0            # circle radius AND the forward approach distance
+SINE_LAPS = 5                 # laps flown while the height oscillates (you asked for 5)
+SINE_AMP_M = 1.0              # height-oscillation amplitude (peak above/below z_mid).
+                               # MUST be < CLIMB_M (keeps the trough above ground)
+SINE_CYCLES_PER_LAP = 3.0     # sine humps (full up-down periods) per lap. 1 = one
+                               # rise+dip per revolution; 2 = two, etc.
+SINE_CW = False               # True = clockwise from above; False = CCW (like CIRCLE_CW)
+SINE_FACE_TANGENT = True      # nose follows travel direction (like the circle); False
+                               # = strafe at the launch yaw
+SINE_SPEED_MPS = 2.0          # carrot ground speed along the circle (its OWN knob)
 
 # ============ loop rate (shared) ============
 TX_HZ = channels.TX_HZ         # 50 Hz, same as the data logger

@@ -517,15 +517,19 @@ def _line_seg(p0, p1, label, yaw=None):
             "geom": {"kind": "line", "p0": [p0[0], p0[1]], "p1": [p1[0], p1[1]]}}
 
 
-def _arc_seg(center, radius, theta0, dtheta, label, yaw=None, z0=None, z1=None):
+def _arc_seg(center, radius, theta0, dtheta, label, yaw=None, z0=None, z1=None,
+             z_sine=None):
     """Arc of `radius` about `center`, from angle theta0 sweeping dtheta (signed;
     negative = clockwise viewed from above, since world yaw is CCW-positive about
     +Z and the bird's-eye view looks down -Z). Length = radius*|dtheta|.
 
-    z0/z1 (optional): linear altitude ramp along the arc length — the carrot climbs
-    from z0 at s=0 to z1 at s=len. This is what turns the circle into a HELIX (the
-    (x,y) spiral is identical to the circle; only z varies). Omit both → flat arc
-    (the circle/figure-8 path, unchanged)."""
+    Optional VERTICAL profile along the arc length s (turns the flat circle into a
+    3D path; the (x,y) is unchanged either way). At most one of:
+      z0/z1   linear ramp z0→z1 over the arc — a HELIX.
+      z_sine  (z_mid, amp, cycles, phase): z = z_mid + amp·sin(2π·cycles·(s/len)+phase)
+              — the height oscillates `cycles` full sine periods over the whole arc
+              (so the carrot rides up and down while it laps the circle).
+    Omit both → flat arc (the plain circle/figure-8, unchanged)."""
     length = radius * abs(dtheta)
     sgn = 1.0 if dtheta >= 0.0 else -1.0
 
@@ -539,14 +543,21 @@ def _arc_seg(center, radius, theta0, dtheta, label, yaw=None, z0=None, z1=None):
         th = theta0 + sgn * (s / radius)
         return math.atan2(sgn * math.cos(th), -sgn * math.sin(th))
 
+    def _u(s):                                  # normalized arc position in [0, 1]
+        return (min(s, length) / length) if length > 1e-9 else 0.0
+
     geom = {"kind": "arc", "center": [center[0], center[1]],
             "radius": radius, "theta0": theta0, "dtheta": dtheta}
     seg = {"type": "move", "at": at, "len": length, "label": label,
            "yaw": yaw, "heading": heading, "geom": geom}
-    if z0 is not None and z1 is not None:
+    if z_sine is not None:
+        z_mid, amp, cycles, phase = z_sine
+        geom["z_sine"] = {"z_mid": z_mid, "amp": amp, "cycles": cycles, "phase": phase}
+        seg["z_at"] = lambda s: z_mid + amp * math.sin(
+            2.0 * math.pi * cycles * _u(s) + phase)
+    elif z0 is not None and z1 is not None:
         geom["z0"], geom["z1"] = z0, z1
-        seg["z_at"] = lambda s: z0 + (z1 - z0) * (min(s, length) / length
-                                                  if length > 1e-9 else 1.0)
+        seg["z_at"] = lambda s: z0 + (z1 - z0) * _u(s)
     return seg
 
 
@@ -825,8 +836,10 @@ class PathMission:
                              f"for {seg['dur']:.0f}s  [{self._yaw_label(seg)}]")
             else:
                 end = seg["at"](seg["len"])
-                zr = (f"  z {seg['z_at'](0.0):+.2f}→{seg['z_at'](seg['len']):+.2f}m"
-                      if "z_at" in seg else "")
+                zr = ""
+                if "z_at" in seg:              # helix ramp / sine bob: show the z span
+                    zv = [seg["z_at"](seg["len"] * j / 24.0) for j in range(25)]
+                    zr = f"  z[{min(zv):+.2f},{max(zv):+.2f}]m"
                 lines.append(f"    [{k}] move  {seg['label']:11s} "
                              f"len={seg['len']:.2f}m → ({end[0]:+.2f},{end[1]:+.2f})"
                              f"{zr}  [{self._yaw_label(seg)}]")
@@ -953,6 +966,54 @@ def build_helix_mission(launch):
     return PathMission(
         launch, segs,
         cruise_mps=config.HELIX_SPEED_MPS, leash_m=config.LEASH_M,
+        arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S)
+
+
+# ----------------------------------------------------------------------------- #
+def build_sine_circle_mission(launch):
+    """Build the SINE-CIRCLE course: a circle whose ALTITUDE oscillates like a sine
+    wave while it laps. Take off + hover at CLIMB_M, fly forward SINE_RADIUS_M to the
+    circle (centred on the launch origin), trace SINE_LAPS laps while z rides
+    z_mid + SINE_AMP_M·sin(...) with SINE_CYCLES_PER_LAP humps per lap, settle, return,
+    land. SAME PathMission / carrot / leash / dwell machinery as the circle and helix
+    — the ONLY difference is the arc's z-profile is a sine instead of flat (circle) or
+    a ramp (helix); the bird's-eye (x,y) is the plain circle.
+
+    Altitude: z oscillates about z_mid = launch + CLIMB_M with amplitude SINE_AMP_M,
+    so it spans [z_mid - SINE_AMP_M, z_mid + SINE_AMP_M]. KEEP SINE_AMP_M < CLIMB_M so
+    the trough stays well above the ground. The sine starts at z_mid (phase 0, rising)
+    and — because cycles = SINE_CYCLES_PER_LAP·SINE_LAPS is a whole/half number — ends
+    back at z_mid, so the exit/return/landing are at the hover height. Peak vertical
+    speed is SINE_AMP_M·SINE_CYCLES_PER_LAP·SINE_SPEED_MPS / SINE_RADIUS_M; keep it
+    under the altitude loop's VMAX_UP_MPS or the drone lags the bobbing carrot.
+    Heading + direction behave exactly like the circle. DRY-RUN + preview.py first."""
+    x0, y0, z0, yaw0 = launch
+    c, s = math.cos(yaw0), math.sin(yaw0)
+    r = config.SINE_RADIUS_M
+    start = (x0 + c * r, y0 + s * r)          # forward r in the launch body frame
+    center = (x0, y0)                          # circle centered on the launch origin
+    th0 = math.atan2(start[1] - center[1], start[0] - center[0])
+    laps = max(1, int(config.SINE_LAPS))
+    dtheta = (-1.0 if config.SINE_CW else 1.0) * 2.0 * math.pi * laps
+    z_mid = z0 + config.CLIMB_M               # == PathMission's self.z (hover height)
+    cycles = config.SINE_CYCLES_PER_LAP * laps    # total sine periods over the arc
+    arc = _arc_seg(center, r, th0, dtheta, f"sine-circle x{laps}",
+                   yaw=("tangent" if config.SINE_FACE_TANGENT else None),
+                   z_sine=(z_mid, config.SINE_AMP_M, cycles, 0.0))
+    yaw_entry = arc["heading"](0.0) if config.SINE_FACE_TANGENT else None
+    yaw_exit = yaw0 if config.SINE_FACE_TANGENT else None
+    segs = [
+        _dwell_seg((x0, y0), config.INITIAL_HOVER_S, "takeoff/hover"),
+        _line_seg((x0, y0), start, "forward"),
+        _dwell_seg(start, config.SETTLE_S, "sine-entry", yaw=yaw_entry),
+        arc,
+        _dwell_seg(start, config.SETTLE_S, "sine-exit", yaw=yaw_exit),
+        _line_seg(start, (x0, y0), "return"),
+        _dwell_seg((x0, y0), config.SETTLE_S, "home/settle"),
+    ]
+    return PathMission(
+        launch, segs,
+        cruise_mps=config.SINE_SPEED_MPS, leash_m=config.LEASH_M,
         arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S)
 
 
