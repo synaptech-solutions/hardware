@@ -29,7 +29,7 @@ RECORD_VIDEO = True             # record the drone-feed video alongside the othe
 # FIRST FLIGHTS: set CLIMB_M = 0.3 and confirm a stable low hover before 1.0 m.
 # SHARED by hover / circle / square / figure-8 (all fly CLIMB_M above launch). Set
 # to 1.0 for the figure-8's spec'd flat 1 m height (z=1); the circle last flew 0.8.
-CLIMB_M = 2.5
+CLIMB_M = 3.0
 
 # ============ FC angle-mode stick → angle scaling (from the Air75 measurement) ===
 # Measured 2026-05-29: full deflection ≈ ±511.5us reaches angle_limit (60°), so
@@ -55,11 +55,17 @@ STICK_US_PER_DEG = STICK_FULL_DEFLECTION_US / FC_ANGLE_LIMIT_DEG   # 8.525
 # modes; throttle is direct). With ACRO_MODE False all of this is dead code and the
 # flight is the proven Angle-mode behavior, byte-for-byte.
 #
-# Rate curve (Air75 `dump all`, rateprofile 0, ACTIVE): rates_type=ACTUAL, roll/
-# pitch srate=7, expo=0 → LINEAR, full stick (±511.5us) = 70°/s. So a commanded body
-# rate → us at 511.5/70 = 7.307 us per °/s. (70°/s is low — it was set to linearize
-# Angle mode, not for aerobatic ACRO — but it's ample for a hover leveling loop;
-# raise srate later for a faster envelope, then cut KP_ANGLE_RATE proportionally.)
+# Rate curve (Air75, rateprofile 0, ACTIVE): rates_type=ACTUAL, expo=0 → LINEAR.
+# Bumped 2026-06-19 from 70°/s to 800°/s full stick for a more aggressive envelope —
+# FC setting: roll_rc_rate = roll_srate = pitch_rc_rate = pitch_srate = 80, *_expo = 0
+# (ACTUAL: max°/s = srate×10; rc_rate=srate & expo=0 ⇒ linear). So a commanded body
+# rate → us at 511.5/800 = 0.639 us per °/s.
+#   APPLY THE FC CHANGE AND ACRO_MAX_RATE_DPS BELOW TOGETHER — they MUST match, or the
+#   leveling loop sends the wrong us for the curve. KP_ANGLE_RATE does NOT change with
+#   the rate ceiling: the law commands a physical °/s (KP·err) and ACRO_RATE_US_PER_DPS
+#   converts it through the curve, so the hover levels identically — only the headroom
+#   (and the µs-per-°/s resolution) changes. KEEP IT LINEAR (expo 0) or this straight-
+#   line conversion breaks. (Re-tuning for aggressive moves is a SEPARATE later step.)
 #
 # THE VICON ATTITUDE MAP is empirically verified (2026-06-16, acro_attitude_check.py,
 # 3-pose bench test) and lives in vicon_source.drone_roll_pitch (heading-invariant;
@@ -73,9 +79,10 @@ KP_ANGLE_RATE = 10.0            # °/s of commanded body rate per ° of attitude
                                # transport-delayed and there is NO FC self-level net
                                # under this loop — if it wobbles FAST, LOWER this; if
                                # it's sluggish to level, raise it.
-ACRO_MAX_RATE_DPS = 70.0       # clamp on the commanded rate = the FC ACTUAL-rate
-                               # ceiling (srate=7 → 70°/s); full stick at the clamp.
-ACRO_RATE_US_PER_DPS = STICK_FULL_DEFLECTION_US / ACRO_MAX_RATE_DPS   # 7.307
+ACRO_MAX_RATE_DPS = 800.0      # clamp on the commanded rate = the FC ACTUAL-rate
+                               # ceiling. MUST equal the FC's linear full-stick rate
+                               # (rc_rate=srate=80 → 800°/s); full stick at the clamp.
+ACRO_RATE_US_PER_DPS = STICK_FULL_DEFLECTION_US / ACRO_MAX_RATE_DPS   # 0.639 (511.5/800)
 
 # ============ stick signs (Air75, verified via test_stick_directions.py) ========
 # us > 1500 ⇒ roll RIGHT / pitch FORWARD (nose down) / yaw RIGHT (CW).
@@ -261,13 +268,15 @@ TAKEOFF_AIRBORNE_M = 0.3
 # still on the stock progressive curve (center 70°/s / max 670°/s) — the same
 # soft-center plant that broke roll/pitch before 20260611_171558. Within our
 # MAX_YAW_US the drone could only do ~16°/s; the circle needs 46°/s sustained.
-# FIX (Betaflight CLI): linearize yaw at 300°/s —
-#     set yaw_rc_rate = 30 ; set yaw_srate = 30 ; set yaw_expo = 0 ; save
-# YAW_LINEAR_MAX_DPS documents that FC setting; the feedforward gain is derived
-# from it. FLY THE FC CHANGE AND THIS CONFIG TOGETHER (without the FC change the
-# FF is ~4x too weak near center — safe, the dwell gate just waits — but the
-# tangent tracking will lag badly).
-YAW_LINEAR_MAX_DPS = 300.0     # FC linear yaw rate: full stick (511.5us) = 300°/s
+# FIX (Betaflight CLI): linearize yaw. Bumped 2026-06-19 from 300 to 700°/s (to match
+# the 800°/s roll/pitch envelope) —
+#     set yaw_rc_rate = 70 ; set yaw_srate = 70 ; set yaw_expo = 0 ; save
+# YAW_LINEAR_MAX_DPS documents that FC setting; the feedforward gain is derived from
+# it. FLY THE FC CHANGE AND THIS CONFIG TOGETHER. NOTE: raising the curve makes the
+# µs-based yaw PID below 700/300 = 2.33× HOTTER per µs, so those gains were scaled by
+# 300/700 to keep the heading-hold behavior (and the °/s authority) IDENTICAL — this
+# is a curve-matching change, NOT the aggressive re-tune.
+YAW_LINEAR_MAX_DPS = 700.0     # FC linear yaw rate: full stick (511.5us) = 700°/s
 # Yaw-rate FEEDFORWARD: the mission's heading setpoint moves (46°/s around the
 # circle, YAW_SLEW_DPS in pre-rotations); P-only would need ~22° of standing error
 # to hold that rate. The controller differences the commanded heading and adds
@@ -285,21 +294,21 @@ YAW_FF_US_PER_DPS = STICK_FULL_DEFLECTION_US / YAW_LINEAR_MAX_DPS   # 1.705
 #   I (small, clamped) trims constant residuals the deadbanded P never fixes —
 #     e.g. FF scale error while the heading ramps around the circle (true curve
 #     slope ≠ exactly 300°/s ⇒ constant rate deficit ⇒ standing heading error).
-KP_YAW_US_PER_RAD = 200.0      # 3.49 us/deg
-KI_YAW_US_PER_RAD_S = 30.0     # trims a 5.7° standing offset in ~10 s
-MAX_YAW_I_US = 30              # integral contribution cap (windup guard)
-KD_YAW_US_PER_RAD_PER_S = 25.0 # damping: 1 rad/s of error rate → 25 us opposing
+# Scaled ×300/700 (2026-06-19) when the yaw curve went 300→700°/s, so the heading→
+# yaw-rate loop gain is unchanged (the FC now does 2.33× the °/s per µs). Pre-bump
+# values were KP 200 / KI 30 / MAX_I 30 / KD 25 at the 300°/s curve.
+KP_YAW_US_PER_RAD = 85.7       # was 200 @300°/s → 85.7 @700°/s (same 117°/s per rad)
+KI_YAW_US_PER_RAD_S = 12.9     # was 30
+MAX_YAW_I_US = 13              # integral contribution cap (windup guard); was 30
+KD_YAW_US_PER_RAD_PER_S = 10.7 # damping; was 25
 YAW_RATE_LPF_S = 0.10          # 1-pole LPF on the differenced Vicon yaw rate the D
                                # term uses (50 Hz diff of ~0.2° noise ⇒ ~14°/s rate
                                # noise raw — filter before it reaches KD)
-MAX_YAW_US = 450               # 450us = 264°/s authority (450/1.705). The 3 m/s circle
-                               # needs 172°/s sustained (FF = 293us), leaving 157us
-                               # (~92°/s) for the yaw PID on top — plenty of correction
-                               # headroom. The PHYSICAL ceiling is full stick 511.5us =
-                               # 300°/s (the FC linear yaw curve); 450 stays under it.
-                               # (Was mistakenly 300us = only 176°/s, which left just
-                               # 7us of headroom and looked like saturation — that was a
-                               # too-low clamp, NOT the drone's limit.)
+MAX_YAW_US = 193               # 193us = 264°/s authority on the 700°/s curve
+                               # (193/511.5×700). Scaled from 450 @300°/s — SAME 264°/s
+                               # authority, just fewer µs (the physical ceiling is now
+                               # full stick 511.5us = 700°/s). Raise toward full stick
+                               # during the aggressive re-tune if you want >264°/s yaw.
 YAW_DEADBAND_RAD = math.radians(2.0)   # zeroes the error fed to P+I (no twitching at
                                # rest); FF and D always run
 
@@ -566,6 +575,79 @@ SINE_CW = False               # True = clockwise from above; False = CCW (like C
 SINE_FACE_TANGENT = True      # nose follows travel direction (like the circle); False
                                # = strafe at the launch yaw
 SINE_SPEED_MPS = 2.0          # carrot ground speed along the circle (its OWN knob)
+
+# ============ flip maneuver (flip_flight.py = roll · pitch_flip_flight.py = pitch) ==
+# hover → ONE open-loop 360° body flip about the ROLL or PITCH axis (dead-reckoned) →
+# the controller catches + re-stabilizes at the hover point → hold stable
+# FLIP_STABLE_HOLD_S → land. ACRO-ONLY (the flip is a RATE command; Angle mode caps at
+# angle_limit 60°, so it can't rotate past level). OPEN LOOP: for 360/FLIP_RATE_DPS
+# seconds the leveling loop is bypassed and a fixed rate stick is sent on the chosen
+# axis — the FC's inner rate loop tracks it; then the leveling + position loop cleans
+# up the rest. The AXIS is chosen by the SCRIPT (flip_flight.py → roll,
+# pitch_flip_flight.py → pitch); both reuse every knob below.
+#   FLY WITH ALTITUDE MARGIN (CLIMB_M ≥ ~3): MEASURED on the first good roll
+#   (20260619_122711) the drone dropped ~1.9 m (2.98 → 1.05 m), MOSTLY AFTER the flip
+#   while the altitude loop arrested the downward velocity built while inverted. That
+#   needs both the margin AND the recovery-throttle boost below. The flip only fires
+#   once stable at hover height; the leveling sign is already proven by the acro hover,
+#   so there's no new hand/DRY_RUN direction check (the flip direction is cosmetic — a
+#   full 360° returns to level either way).
+FLIP_SEQUENCE = ["roll", "pitch", "roll", "pitch"]       # the flips to do, in order — each "roll" or "pitch". The
+                               # drone recovers + re-stabilizes at hover BETWEEN each
+                               # (FLIP_BETWEEN_STABLE_S). E.g. ["roll","pitch","roll","pitch"]
+                               # = roll, settle, pitch, settle, roll, settle, pitch, land.
+                               # Default ["roll"] = the proven single flip; extend once the
+                               # inverted-throttle-cut below is confirmed on a single flip.
+FLIP_RATE_DPS = 800.0          # commanded body rate during the flip = FULL STICK (=
+                               # ACRO_MAX_RATE_DPS): flip for 360/800 = 0.45 s → one turn.
+                               # The channel clamps at 2000us (±500), just shy of the
+                               # 511.5us full-deflection, so the stick saturates at
+                               # ~782°/s → ~0.45 s ≈ 352°; the controller catches the
+                               # remainder (the 20260619_122711 roll recovered to level
+                               # cleanly at scale 1.0).
+FLIP_DURATION_SCALE = 1.0      # flip time = (360/FLIP_RATE_DPS)·this. TRIM after a flight:
+                               # >1 if it UNDER-rotates (ends short), <1 if it OVER-rotates
+                               # past level. (Dead reckoning ignores the FC rate ramp +
+                               # stick clamp, so 360° is approximate by design.)
+FLIP_DIR = +1                  # +1 = positive stick (roll RIGHT / pitch FORWARD nose-down),
+                               # -1 = the other way. Cosmetic — a full 360° ends level.
+FLIP_THROTTLE_BOOST_US = 80    # added to the LEARNED hover throttle while UPRIGHT during
+                               # the flip (entry/exit) to offset lift lost while tilted.
+# THROTTLE WHILE INVERTED: when the body has rotated past FLIP_INVERTED_TILT_DEG from
+# level, its thrust points partly DOWN — so holding throttle there drives the drone
+# into the ground (the main cause of the flip sink). Instead CUT throttle to
+# FLIP_INVERTED_THROTTLE_US through that window; the FC's rate PID (airmode) keeps the
+# flip spinning and the drone coasts ballistically. Dead-reckoned from the flip clock,
+# so it's right even through a Vicon dropout. If the flip stalls mid-rotation at idle,
+# raise FLIP_INVERTED_THROTTLE_US a little (gives the mix more authority).
+FLIP_INVERTED_TILT_DEG = 90.0  # cut throttle once rotated past this from level (90° =
+                               # thrust horizontal; >90° = pointing down). Lower = cut
+                               # for a wider window (earlier/later); 90 = the inverted half.
+FLIP_INVERTED_THROTTLE_US = channels.IDLE_THR_US  # throttle while inverted (idle = no
+                               # thrust = "no throttle command", as requested).
+# RECOVERY throttle (AFTER the flip): the hover altitude loop is deliberately gentle
+# (THR_CLIMB_TRIM_US=100, VMAX_UP_MPS=0.5) and arrests the ~2 m flip sink too slowly.
+# During the recover phase the loop uses these HIGHER caps so it punches throttle hard
+# to catch the drop, then reverts to the gentle hover tuning. These ONLY bind during
+# the big post-flip transient — hover + takeoff are untouched.
+FLIP_RECOVER_CLIMB_TRIM_US = 300  # max +us above hover while recovering (vs 100 hover) →
+                               # hover≈1356 + 300 = ~1656us, just under MAX_THROTTLE_US.
+                               # Raise toward ~340 if it still sinks (keep hover+this < 1700).
+FLIP_RECOVER_VMAX_MPS = 2.0    # climb-speed cap while recovering (vs 0.5 hover), so the
+                               # climb-back isn't throttled down once the sink is arrested.
+FLIP_RECOVER_KV_UP = 80.0      # throttle us per (m/s) of velocity error while recovering
+                               # (vs 40 hover) — twice the punch per m/s of sink, so it
+                               # actually reaches the higher trim cap at real fall speeds.
+FLIP_PREROLL_STABLE_S = 1.5    # must hover stable (within the tols below) this long
+                               # before the flip fires
+FLIP_BETWEEN_STABLE_S = 2.0    # BETWEEN flips in a sequence: after recovering, hold this
+                               # long of steady hover (back at the hover point) before the
+                               # next flip fires — "enough time to stabilize and recover".
+FLIP_STABLE_HOLD_S = 3.0       # after the LAST flip, hold stable this long before landing
+FLIP_STABLE_POS_M = 0.4        # "stable" = within this of the hover point (horiz + vert)
+FLIP_STABLE_TILT_DEG = 20.0    # AND roll/pitch within this of level
+FLIP_RECOVER_TIMEOUT_S = 8.0   # backstop: land after this long post-flip even if never
+                               # fully "stable", so it can't hang in the air
 
 # ============ loop rate (shared) ============
 TX_HZ = channels.TX_HZ         # 50 Hz, same as the data logger

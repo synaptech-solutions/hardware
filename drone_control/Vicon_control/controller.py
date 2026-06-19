@@ -150,7 +150,8 @@ class ViconHoverController:
         v_lat = s * vx - c * vy
         return v_fwd, v_lat
 
-    def _altitude_us(self, z, vz, dt, descent_rate=None, tilt_comp=1.0):
+    def _altitude_us(self, z, vz, dt, descent_rate=None, tilt_comp=1.0,
+                     vmax_up=None, climb_trim_us=None, kv_up=None):
         """PI velocity loop. position error → capped target velocity (or a fixed
         descent rate when landing) → velocity error → P (transient) + I. The
         integrator (hover_us) accumulates velocity error into an absolute throttle
@@ -161,16 +162,21 @@ class ViconHoverController:
         thrust component stays constant while tilted (feedforward; the reactive
         loop alone let altitude dip −22 cm on the 2 m/s laps). Applied OUTSIDE
         the integrator: hover_us keeps learning LEVEL hover."""
+        # vmax_up / climb_trim_us override the config climb caps for this call (None =
+        # use the config defaults). A maneuver recovery (e.g. arresting the big sink
+        # after a flip) passes higher values so the loop can punch throttle harder than
+        # the gentle hover defaults allow — without changing the hover/takeoff tuning.
+        vmax_up = config.VMAX_UP_MPS if vmax_up is None else vmax_up
+        climb_trim_us = config.THR_CLIMB_TRIM_US if climb_trim_us is None else climb_trim_us
+        kv_up = config.KV_UP_US_PER_MPS if kv_up is None else kv_up
         alt_err = None
         if descent_rate is None:
             alt_err = self.z_tgt - z                      # >0 → below target
-            v_des = _clamp(config.KP_UP * alt_err,
-                           -config.VMAX_UP_MPS, config.VMAX_UP_MPS)
+            v_des = _clamp(config.KP_UP * alt_err, -vmax_up, vmax_up)
         else:
             v_des = -abs(descent_rate)                     # commanded descent
         e_v = v_des - vz                                   # >0 → need more lift
-        thr_p = _clamp(config.KV_UP_US_PER_MPS * e_v,
-                       -config.THR_DESC_TRIM_US, config.THR_CLIMB_TRIM_US)
+        thr_p = _clamp(kv_up * e_v, -config.THR_DESC_TRIM_US, climb_trim_us)
         if dt > 0.0:
             self.hover_us = _clamp(
                 self.hover_us + config.KI_UP_US_PER_M * e_v * dt,
@@ -237,8 +243,13 @@ class ViconHoverController:
         return int(round(channels.NEUTRAL_US
                          + sign * rate_dps * config.ACRO_RATE_US_PER_DPS))
 
-    def step(self, pose, dt, descent_rate=None, level_only=False):
+    def step(self, pose, dt, descent_rate=None, level_only=False,
+             vmax_up=None, climb_trim_us=None, kv_up=None):
         """One control step.
+
+        vmax_up / climb_trim_us: optional altitude-loop climb-authority overrides for
+        this call (None = config defaults). Used to throttle up harder when arresting
+        a maneuver's altitude loss (e.g. after a flip) without retuning the hover.
 
         pose: dict from ViconPoseSource.get_pose() (x,y,z,yaw,vx,vy,vz).
         descent_rate: if set (m/s), command that descent instead of holding z
@@ -323,7 +334,8 @@ class ViconHoverController:
                         config.TILT_COMP_MAX)
 
         thr_us, alt_err, v_des_up, e_v_up = self._altitude_us(
-            z, pose["vz"], dt, descent_rate=descent_rate, tilt_comp=tilt_comp)
+            z, pose["vz"], dt, descent_rate=descent_rate, tilt_comp=tilt_comp,
+            vmax_up=vmax_up, climb_trim_us=climb_trim_us, kv_up=kv_up)
         yaw_us, e_yaw = self._yaw_us(yaw, dt, tgt_yaw_rate)
 
         return {

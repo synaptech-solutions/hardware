@@ -486,24 +486,51 @@ def run(args, make_mission=None):
             # otherwise relay the switch so HIGH=start / LOW=erase still work on the ground.
             ch[channels.AUX2_CH] = (channels.AUX2_HIGH_US if state in ("FLYING", "LANDING")
                                     else aux2_us_for_switch(js, cal.get("record")))
-            ctl_out = None
+            ctl_out = None         # controller output dict (also feeds the status line)
+            raw = None             # open-loop maneuver override (e.g. flip roll), if any
             setpoint = None        # world-frame carrot to log this frame (None = blank)
-            if state == "FLYING" and pose_fresh:
-                # Until airborne (TAKEOFF_AIRBORNE_M above the launch altitude), hold
-                # level + freeze horizontal integrators so it lifts straight up.
+            # An OPEN-LOOP maneuver (the flip roll) is dead-reckoned and uses NO Vicon,
+            # so it must keep commanding through a BRIEF tracking dropout (a flipped
+            # drone often loses tracking for a moment) rather than falling into the
+            # stale-Vicon blind sink, which would neutralize the sticks and abort the
+            # roll. open_loop reflects the mission's phase from last tick; the
+            # >VICON_KILL_S cut (state machine above) is still the backstop for a REAL
+            # loss (the 0.45 s roll fits comfortably under the 0.60 s kill).
+            open_loop = (state == "FLYING" and pose is not None
+                         and hasattr(mission, "open_loop_active")
+                         and mission.open_loop_active())
+            if state == "FLYING" and pose is not None and (pose_fresh or open_loop):
+                # Until airborne (TAKEOFF_AIRBORNE_M above launch), hold level + freeze
+                # horizontal integrators so it lifts straight up.
                 airborne = (launch is not None
                             and (pose["z"] - launch[2]) > config.TAKEOFF_AIRBORNE_M)
-                # The mission supplies the world setpoint (a crawling carrot for the
-                # waypoint course; a fixed point for HoldMission) AND its velocity
-                # (D-term feedforward — pacing the carrot isn't braking-worthy).
-                # set_setpoint keeps the learned hover throttle + integrators
-                # (set_target would wipe them). done → land via the SAME path as
-                # SPACEBAR.
+                # The mission supplies the world setpoint + its velocity (D-term FF).
+                # set_setpoint keeps the learned hover throttle + integrators. done →
+                # land via the SAME path as SPACEBAR.
                 (tx, ty, tz, tyaw, tvx, tvy,
                  tax, tay, done) = mission.update(pose, dt, airborne, land_requested)
                 controller.set_setpoint(tx, ty, tz, tyaw, tvx, tvy, tax, tay)
                 setpoint = (tx, ty, tz, tyaw, tvx, tvy)   # logged → dashboard overlay
-                ctl_out = controller.step(pose, dt, level_only=not airborne)
+                # A maneuver mission can take over with OPEN-LOOP raw sticks (bypassing
+                # the leveling controller — you can't attitude-hold while flipping).
+                # Then controller.step is SKIPPED (hover throttle + integrators freeze
+                # for the recovery handoff) and `raw` is applied below; ctl_out STAYS
+                # None so the status-line render never sees the raw dict. The CLOSED-LOOP
+                # controller only runs on a FRESH pose (so a stale tick during the roll
+                # keeps commanding the open-loop sticks, not a blind hover step).
+                raw = (mission.override(pose, dt, airborne, controller.hover_us)
+                       if hasattr(mission, "override") else None)
+                if raw is None and pose_fresh:
+                    # A maneuver recovery (e.g. catching the big sink after a flip) asks
+                    # the altitude loop to punch throttle harder than the gentle hover
+                    # caps — only during its recover phase; hover/takeoff are untouched.
+                    boost = (hasattr(mission, "recovery_active")
+                             and mission.recovery_active())
+                    ctl_out = controller.step(
+                        pose, dt, level_only=not airborne,
+                        vmax_up=(config.FLIP_RECOVER_VMAX_MPS if boost else None),
+                        climb_trim_us=(config.FLIP_RECOVER_CLIMB_TRIM_US if boost else None),
+                        kv_up=(config.FLIP_RECOVER_KV_UP if boost else None))
                 # Mark each sync-spin's start/end on the session clock (= Abs_time), so
                 # combine.py can window each spin for the latency/drift witness.
                 cur_phase = getattr(mission, "phase", None)
@@ -520,16 +547,19 @@ def run(args, make_mission=None):
                     sys.stdout.write(f"\n{CSI}32m✔ FLIGHT COMPLETE — landing.{CSI}0m\n")
             elif state == "LANDING" and pose is not None:
                 ctl_out = controller.step(pose, dt, descent_rate=config.LAND_SPEED_MPS)
-            elif state == "FLYING" and pose is not None:
-                # Stale Vicon (STALE < age < KILL): don't act on stale position —
-                # hold level attitude and bleed throttle for a gentle blind sink.
+            # Apply: open-loop maneuver override first, else the controller output, else
+            # (FLYING with a momentarily-stale pose and no override) a gentle blind sink.
+            src = raw if raw is not None else ctl_out
+            if src is not None:
+                ch[channels.CH_ROLL] = src["roll_us"]
+                ch[channels.CH_PITCH] = src["pitch_us"]
+                ch[channels.CH_YAW] = src["yaw_us"]
+                ch[channels.CH_THR] = src["throttle_us"]
+            elif state == "FLYING" and pose is not None and not pose_fresh:
+                # Stale Vicon (STALE < age < KILL), no open-loop override: hold level +
+                # bleed throttle for a gentle blind sink until the pose recovers.
                 ch[channels.CH_THR] = int(clamp(controller.hover_us - BLIND_DESC_BLEED_US,
                                                 channels.IDLE_THR_US, config.MAX_THROTTLE_US))
-            if ctl_out is not None:
-                ch[channels.CH_ROLL] = ctl_out["roll_us"]
-                ch[channels.CH_PITCH] = ctl_out["pitch_us"]
-                ch[channels.CH_YAW] = ctl_out["yaw_us"]
-                ch[channels.CH_THR] = ctl_out["throttle_us"]
             ch = [int(clamp(c, 1000, 2000)) for c in ch]
 
             # --- log every commanded frame while a session is active ---

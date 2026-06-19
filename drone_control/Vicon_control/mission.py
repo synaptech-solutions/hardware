@@ -48,6 +48,7 @@ import bisect
 import math
 
 from . import config
+from common import channels
 
 
 def _carrot_vel(px, py, cx, cy, dt, vmax):
@@ -253,11 +254,171 @@ class SyncSpinMission:
         lines += self.inner.describe()
         return lines
 
+    def override(self, pose, dt, airborne, hover_us):
+        """Forward an open-loop maneuver override (e.g. the 360° roll) to the inner
+        mission, but ONLY while the inner mission is actually running — never during
+        the bookend yaw spins (those are closed-loop). None otherwise."""
+        if self.phase == "inner" and hasattr(self.inner, "override"):
+            return self.inner.override(pose, dt, airborne, hover_us)
+        return None
+
+    def open_loop_active(self):
+        """Forward the inner mission's open-loop flag (only while it's running), so the
+        flight loop keeps driving an open-loop maneuver through a brief Vicon dropout."""
+        return (self.phase == "inner" and hasattr(self.inner, "open_loop_active")
+                and self.inner.open_loop_active())
+
+    def recovery_active(self):
+        """Forward the inner mission's recovery flag (only while it's running), so the
+        flight loop boosts the altitude climb authority during a maneuver recovery."""
+        return (self.phase == "inner" and hasattr(self.inner, "recovery_active")
+                and self.inner.recovery_active())
+
     def summary(self):
         return {"kind": "sync_spin",
                 "rate_dps": config.SPIN_RATE_DPS, "turns": config.SPIN_TURNS,
                 "settle_s": self.settle, "dir": "ccw" if self.rate >= 0 else "cw",
                 "inner": self.inner.summary()}
+
+
+# ----------------------------------------------------------------------------- #
+class FlipManeuver:
+    """Hover → a SEQUENCE of open-loop 360° body flips (each ROLL or PITCH), re-
+    stabilizing at the hover point BETWEEN each → final stable hold → done (land). The
+    sequence is config.FLIP_SEQUENCE, e.g. ["roll","pitch","roll","pitch"] (or pass
+    `axes`). ACRO-ONLY (a flip is a RATE command; Angle mode caps at angle_limit).
+
+    Per flip: settle (stabilize at hover) → roll (open-loop dead-reckoned rate stick on
+    the axis — and THROTTLE IS CUT while inverted, so the drone never thrusts itself
+    downward; the flight loop bypasses the leveling controller) → recover (controller
+    catches it + climbs hard to arrest the sink). The recover holds FLIP_BETWEEN_STABLE_S
+    of stable hover before the NEXT flip; after the LAST flip it holds FLIP_STABLE_HOLD_S,
+    then done. update() runs the phase clock + reports the fixed HOVER setpoint;
+    override() drives the open-loop flip — accuracy is not the point, the loops clean up."""
+
+    def __init__(self, launch, axes=None):
+        seq = list(axes) if axes is not None else list(config.FLIP_SEQUENCE)
+        if not seq or any(a not in ("roll", "pitch") for a in seq):
+            raise ValueError(f"FlipManeuver needs a non-empty list of 'roll'/'pitch', got {seq!r}")
+        self.axes = seq
+        self.idx = 0                                         # which flip in the sequence
+        x0, y0, z0, yaw0 = launch
+        self.hx, self.hy = x0, y0
+        self.hz, self.hyaw = z0 + config.CLIMB_M, yaw0      # hover point to recover to
+        self.phase = "settle"                                # settle → (roll → recover)×N → done
+        self.t_in_phase = 0.0
+        self.stable_t = 0.0
+        self.flip_dur = abs(360.0 / config.FLIP_RATE_DPS) * config.FLIP_DURATION_SCALE
+        self.done = False
+
+    @property
+    def axis(self):                                          # the current flip's axis
+        return self.axes[min(self.idx, len(self.axes) - 1)]
+
+    def _last(self):
+        return self.idx >= len(self.axes) - 1
+
+    def _stable(self, pose):
+        return (math.hypot(self.hx - pose["x"], self.hy - pose["y"]) < config.FLIP_STABLE_POS_M
+                and abs(self.hz - pose["z"]) < config.FLIP_STABLE_POS_M
+                and abs(math.degrees(pose.get("roll", 0.0))) < config.FLIP_STABLE_TILT_DEG
+                and abs(math.degrees(pose.get("pitch", 0.0))) < config.FLIP_STABLE_TILT_DEG)
+
+    def _hover(self):
+        return self.hx, self.hy, self.hz, self.hyaw, 0.0, 0.0, 0.0, 0.0, self.done
+
+    def update(self, pose, dt, airborne, land_requested=False):
+        if land_requested:
+            self.done = True                       # SPACEBAR mid-flip → hand back + land
+        if self.done:
+            return self._hover()
+        self.t_in_phase += dt
+        if self.phase == "settle":                 # initial stabilize before flip 0
+            self.stable_t = (self.stable_t + dt) if (airborne and self._stable(pose)) else 0.0
+            if self.stable_t >= config.FLIP_PREROLL_STABLE_S:
+                self.phase, self.t_in_phase, self.stable_t = "roll", 0.0, 0.0
+        elif self.phase == "roll":                 # open-loop flip (override() drives it)
+            if self.t_in_phase >= self.flip_dur:
+                self.phase, self.t_in_phase, self.stable_t = "recover", 0.0, 0.0
+        elif self.phase == "recover":              # catch + stabilize between/after flips
+            self.stable_t = (self.stable_t + dt) if self._stable(pose) else 0.0
+            hold = config.FLIP_STABLE_HOLD_S if self._last() else config.FLIP_BETWEEN_STABLE_S
+            if self.stable_t >= hold or self.t_in_phase >= config.FLIP_RECOVER_TIMEOUT_S:
+                if self._last():
+                    self.done = True               # whole sequence finished → land
+                else:
+                    self.idx += 1                  # next flip, straight into its roll
+                    self.phase, self.t_in_phase, self.stable_t = "roll", 0.0, 0.0
+        return self._hover()
+
+    def override(self, pose, dt, airborne, hover_us):
+        """Raw open-loop stick frame during a flip (ROLL phase): full rate on the flip
+        axis, the other two neutral. THROTTLE: hover+boost while UPRIGHT, but CUT to
+        FLIP_INVERTED_THROTTLE_US while INVERTED — dead-reckoned (the middle window
+        where the body has rotated past FLIP_INVERTED_TILT_DEG from level) so the
+        now-downward thrust never drives the drone into the ground. None otherwise."""
+        if self.phase != "roll" or self.done:
+            return None
+        sign = config.SIGN_ROLL if self.axis == "roll" else config.SIGN_PITCH
+        rate_us = config.FLIP_DIR * sign * config.FLIP_RATE_DPS * config.ACRO_RATE_US_PER_DPS
+        # Dead-reckoned rotation fraction 0→1 ≈ 0°→360°. Inverted (net thrust points
+        # DOWN) in the middle window; e.g. FLIP_INVERTED_TILT_DEG=90 → frac 0.25..0.75.
+        frac = (self.t_in_phase / self.flip_dur) if self.flip_dur > 1e-6 else 1.0
+        inv = config.FLIP_INVERTED_TILT_DEG / 360.0
+        if inv < frac < (1.0 - inv):
+            thr = config.FLIP_INVERTED_THROTTLE_US           # inverted → cut throttle
+        else:
+            thr = min(max(hover_us + config.FLIP_THROTTLE_BOOST_US,
+                          channels.IDLE_THR_US), config.MAX_THROTTLE_US)
+        cmd = {"roll_us": channels.NEUTRAL_US, "pitch_us": channels.NEUTRAL_US,
+               "yaw_us": channels.NEUTRAL_US, "throttle_us": int(round(thr))}
+        cmd[f"{self.axis}_us"] = int(round(channels.NEUTRAL_US + rate_us))  # only the flip axis
+        return cmd
+
+    def open_loop_active(self):
+        """True while a flip is in progress. The flip is DEAD-RECKONED and uses no
+        Vicon, so the flight loop keeps sending override() through a brief tracking
+        dropout (a flipped drone often loses tracking for a moment) instead of falling
+        into the stale-Vicon blind sink — which would neutralize the sticks and abort
+        the flip. A real loss (> VICON_KILL_S) still cuts via the loop's failsafe."""
+        return (not self.done) and self.phase == "roll"
+
+    def recovery_active(self):
+        """True during a RECOVER phase → the flight loop boosts the altitude loop's
+        climb authority (FLIP_RECOVER_*) to arrest the big sink the flip builds,
+        instead of the gentle hover climb caps."""
+        return (not self.done) and self.phase == "recover"
+
+    def status(self):
+        tag = f"{self.idx + 1}/{len(self.axes)} {self.axis}"
+        if self.done:
+            return "flips done"
+        if self.phase == "roll":
+            return f"FLIP {tag} {self.t_in_phase:.2f}/{self.flip_dur:.2f}s"
+        if self.phase == "recover":
+            hold = config.FLIP_STABLE_HOLD_S if self._last() else config.FLIP_BETWEEN_STABLE_S
+            return f"recover {tag} {self.stable_t:.1f}/{hold:.0f}s"
+        return f"settle {self.stable_t:.1f}/{config.FLIP_PREROLL_STABLE_S:.1f}s"
+
+    def describe(self):
+        return [f"  Flip sequence {self.axes} @ {config.FLIP_RATE_DPS:.0f}°/s "
+                f"({self.flip_dur:.2f}s each, dir {'+' if config.FLIP_DIR >= 0 else '-'}, "
+                f"throttle CUT to {config.FLIP_INVERTED_THROTTLE_US}us while inverted) →",
+                f"    recover + stabilize {config.FLIP_BETWEEN_STABLE_S:.0f}s between each "
+                f"(climb-boost +{config.FLIP_RECOVER_CLIMB_TRIM_US}us) → hold "
+                f"{config.FLIP_STABLE_HOLD_S:.0f}s → land, at hover "
+                f"({self.hx:+.2f},{self.hy:+.2f},{self.hz:+.2f}).  [ACRO-only]"]
+
+    def summary(self):
+        return {"kind": "flip", "sequence": list(self.axes), "rate_dps": config.FLIP_RATE_DPS,
+                "flip_dur_s": self.flip_dur, "dir": config.FLIP_DIR,
+                "throttle_boost_us": config.FLIP_THROTTLE_BOOST_US,
+                "inverted_throttle_us": config.FLIP_INVERTED_THROTTLE_US,
+                "inverted_tilt_deg": config.FLIP_INVERTED_TILT_DEG,
+                "recover_climb_trim_us": config.FLIP_RECOVER_CLIMB_TRIM_US,
+                "between_stable_s": config.FLIP_BETWEEN_STABLE_S,
+                "stable_hold_s": config.FLIP_STABLE_HOLD_S,
+                "hover": {"x": self.hx, "y": self.hy, "z": self.hz, "yaw_rad": self.hyaw}}
 
 
 # ----------------------------------------------------------------------------- #
