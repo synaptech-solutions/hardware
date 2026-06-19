@@ -63,9 +63,14 @@ def run(args):
         sys.exit(f"Policy not found: {args.policy}")
     policy = MLPPolicy(args.policy)
     print(f"Policy:   {policy.describe()}")
-    if policy.obs_dim not in (22, 23):
-        print(f"{CSI}1;33mWARNING obs_dim={policy.obs_dim} (expected 22, or 23 for "
-              f"the mass-conditioned hover task) — frames/layout may not match.{CSI}0m")
+    # obs_dim is variable (action_hist scales with the trained latency span); warn
+    # only if it disagrees with the exported layout's term-width sum.
+    import re as _re
+    _layout_dim = sum(int(x) for x in _re.findall(r"\((\d+)\)",
+                                                  str(policy.meta.get("obs_layout", ""))))
+    if _layout_dim and _layout_dim != policy.obs_dim:
+        print(f"{CSI}1;33mWARNING obs_dim={policy.obs_dim} != layout sum {_layout_dim} "
+              f"— frames/layout may not match.{CSI}0m")
 
     control_dt = float(policy.meta.get("control_dt", 1.0 / config.TX_HZ))
     controller = HoverPolicyController(

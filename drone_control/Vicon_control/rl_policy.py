@@ -3,6 +3,7 @@ Run a trained betaflight-gym RL hover policy on the live Vicon feed (ACRO).
 """
 import json
 import math
+import re
 from dataclasses import dataclass
 
 import numpy as np
@@ -122,6 +123,18 @@ class HoverPolicyController:
         # the policy picks the right hover throttle for this airframe. Defaults
         # to the nominal the policy was centred on (exported as meta mass_kg).
         self._obs_has_mass = "mass" in str(policy.meta.get("obs_layout", ""))
+        # Action history: training feeds the last K commanded actions (newest
+        # first) as the "action_hist" obs term so the policy can compensate for
+        # transport latency (a single last_action can't span a multi-step delay).
+        # Recover K from the exported layout; fall back to 1 (legacy single
+        # last_action(4)) for older policies.
+        _layout = str(policy.meta.get("obs_layout", ""))
+        _m = re.search(r"action_hist\((\d+)\)", _layout)
+        self._act_hist_len = (max(1, int(_m.group(1)) // policy.act_dim) if _m else 1)
+        # velocity+gyro frame stack: past H frames of [vel_b(3), rates(3)] (the
+        # "state_hist" obs term), newest first. 0 if the policy didn't train with it.
+        _ms = re.search(r"state_hist\((\d+)\)", _layout)
+        self._sr_hist_len = (max(0, int(_ms.group(1)) // 6) if _ms else 0)
         self.mass_kg = (mass_kg if mass_kg is not None
                         else policy.meta.get("mass_kg"))
         if self._obs_has_mass and self.mass_kg is None:
@@ -142,6 +155,11 @@ class HoverPolicyController:
         self.east_w = None
         self.down_w = np.array([0.0, 0.0, -1.0])
         self.last_action = np.zeros(self.policy.act_dim)   # prev RAW policy output
+        # newest-first ring buffer of the last K commanded actions (the obs
+        # "action_hist" term); K=1 reduces to the old single last_action.
+        self.act_hist = np.zeros((self._act_hist_len, self.policy.act_dim))
+        # past H frames of [vel_b(3), body_rates(3)] (newest first); H=0 -> unused
+        self.sr_hist = np.zeros((self._sr_hist_len, 6))
         self._prev_Rfrd = None        # for body-rate differencing
         self._rate_f = np.zeros(3)    # LPF'd body rates (rad/s, FRD)
         self.landing = False
@@ -171,8 +189,9 @@ class HoverPolicyController:
     # -- observation --------------------------------------------------------
 
     def build_obs(self, pose, dt):
-        """The egocentric obs (body FRD), matching tasks/hover.py — 22 dims, or
-        23 with a trailing measured-mass term for a mass-conditioned policy."""
+        """The egocentric obs (body FRD), matching tasks/hover.py. Width depends
+        on the policy's layout: pos_err(3)+self_vel(3)+rot(9)+body_rates(3)+
+        action_hist(4·K)+[mass(1)], where K = self._act_hist_len."""
         R = quat_to_matrix(pose["qx"], pose["qy"], pose["qz"], pose["qw"])
         Rfrd = self.axis.frd_world_axes(R)        # cols = forward/right/down (world)
         # project a world vector onto the body FRD axes
@@ -194,9 +213,18 @@ class HoverPolicyController:
             self._rate_f += (omega - self._rate_f) * a
         self._prev_Rfrd = Rfrd
 
-        obs = np.concatenate([pos_err, vel_b, rot, self._rate_f, self.last_action])
+        # Layout matches tasks/hover.py byte-for-byte: current frame in vel_b +
+        # self._rate_f, then the state_hist block (past vel+gyro frames, newest
+        # first), then action_hist (newest first, == sim act_buf[:, 0] most recent).
+        obs = np.concatenate([pos_err, vel_b, rot, self._rate_f,
+                              self.sr_hist.reshape(-1), self.act_hist.reshape(-1)])
         if self._obs_has_mass:
             obs = np.concatenate([obs, [self.mass_kg]])   # measured real mass (kg)
+        # push this frame's [vel_b, rates] for the NEXT obs (after using the old
+        # stack above), mirroring the sim's post-step state push.
+        if self._sr_hist_len > 0:
+            self.sr_hist = np.roll(self.sr_hist, 1, axis=0)
+            self.sr_hist[0] = np.concatenate([vel_b, self._rate_f])
         return obs
 
     # -- one control step ---------------------------------------------------
@@ -217,7 +245,11 @@ class HoverPolicyController:
 
         obs = self.build_obs(pose, dt)
         action = self.policy.act(obs)              # the policy commands AETR directly
-        self.last_action = action                  # threaded into the next obs
+        self.last_action = action                  # most recent (compat / logging)
+        # push into the newest-first history AFTER building this tick's obs, so
+        # next tick sees [a_now, a_prev, ...] — exactly the sim's post-step act_buf.
+        self.act_hist = np.roll(self.act_hist, 1, axis=0)
+        self.act_hist[0] = action
         sent = action * self.sign
 
         us = self._action_to_us(sent)

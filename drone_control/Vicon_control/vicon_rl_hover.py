@@ -88,9 +88,14 @@ def run(args):
                  f"(scripts/train.py writes <run>/policy.npz).")
     policy = MLPPolicy(args.policy)
     print(f"Policy:   {policy.describe()}")
-    if policy.obs_dim not in (22, 23):
-        print(f"{CSI}1;33mWARNING obs_dim={policy.obs_dim} (expected 22, or 23 "
-              f"for the mass-conditioned hover task) — frames/layout may not match.{CSI}0m")
+    # sanity: obs_dim must equal the sum of the exported layout's term widths
+    # (obs_dim is variable now — action_hist scales with the trained latency span).
+    import re as _re
+    _layout_dim = sum(int(x) for x in _re.findall(r"\((\d+)\)",
+                                                  str(policy.meta.get("obs_layout", ""))))
+    if _layout_dim and _layout_dim != policy.obs_dim:
+        print(f"{CSI}1;33mWARNING obs_dim={policy.obs_dim} != layout sum {_layout_dim} "
+              f"— frames/layout may not match.{CSI}0m")
 
     if not VICON_OK:
         sys.exit(f"Vicon deps missing ({_VICON_ERR}) — run with the repo .venv.")
