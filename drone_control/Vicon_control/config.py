@@ -436,14 +436,14 @@ LEASH_M = 1.2                  # the carrot never gets more than this far ahead 
 # LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / INITIAL_HOVER_S / CARROT_ACCEL_MPS2;
 # has its OWN speed (CIRCLE_SPEED_MPS) — the circle banks/yaws far harder than the
 # square's strafes, so they're tuned independently.
-CIRCLE_SPEED_MPS = 3.0         # CIRCLE carrot speed. 3.0 is ~the fastest the CURRENT
+CIRCLE_SPEED_MPS = 3.5         # CIRCLE carrot speed. 3.0 is ~the fastest the CURRENT
                                # 1 m circle sustains: bank 43° (g-limited, 17° under
                                # the FC limit) is comfy, but the yaw FF hits 293us at
                                # ω=172°/s against the 300°/s FC linear yaw curve — yaw
                                # authority is the real wall. Go faster only on a LARGER
                                # radius (bank ∝ v²/r, yaw rate ∝ v/r — both ease with r).
-CIRCLE_RADIUS_M = 2.0          # circle radius AND the forward approach distance
-CIRCLE_LAPS = 3                # consecutive laps of the circle (one continuous arc —
+CIRCLE_RADIUS_M = 2.5          # circle radius AND the forward approach distance
+CIRCLE_LAPS = 5                # consecutive laps of the circle (one continuous arc —
                                # no dwells between laps; entry/exit dwells unchanged)
 CIRCLE_CW = False              # True = clockwise viewed from above (the carrot goes
                                # forward-point → right → back → left → forward-point);
@@ -499,7 +499,7 @@ YAW_ARRIVE_TOL_DEG = 5.0       # a dwell with a heading target waits (same arriv
 # False unless you slow down further. DRY-RUN and preview.py first.
 FIG8_END_X_M = 2.0             # centre→end distance along world X; loop radius R is
                                # half this. Far ends pass through (±FIG8_END_X_M, 0).
-FIG8_LAPS = 2                  # full figure-8 traversals (each = right loop + left
+FIG8_LAPS = 5                  # full figure-8 traversals (each = right loop + left
                                # loop). The whole run flows at cruise; only the first
                                # loop ramps up and only the last brakes to the home dwell.
 FIG8_CW = False                # sense of the lemniscate (which loop is traced first,
@@ -515,6 +515,32 @@ FIG8_SPEED_MPS = 2.0           # carrot speed. LOWER than the circle's cruise on
                                # the lemniscate's peak curvature is 3/FIG8_END_X_M at the
                                # ends, so peak bank ∝ v²; 1.2 m/s keeps it ~4.3 m/s² (24°,
                                # like the circle). Raise toward ~1.5 m/s max (see DYNAMICS).
+
+# ============ helix mission (helix_flight.py only) =============================
+# helix_flight.py: the CIRCLE, but the carrot climbs while it laps. Take off + hover
+# at CLIMB_M, fly forward HELIX_RADIUS_M to the circle (centred on the launch
+# origin), trace HELIX_LAPS turns while rising HELIX_HEIGHT_M total, settle at the
+# top, return, land. Bird's-eye it IS the circle (same machinery, same FACE_TANGENT/
+# CW behavior); only z ramps along the laps. Reuses SETTLE_S / INITIAL_HOVER_S /
+# LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / CARROT_ACCEL_MPS2 / YAW_SLEW_DPS.
+#
+# ALTITUDE: the laps span world z from z_base = launch+CLIMB_M to
+# z_top = z_base + HELIX_HEIGHT_M  →  with CLIMB_M=1.0 and the default below the
+# drone tops out ~1.6 m above launch. CHECK YOUR CEILING and DRY-RUN/preview first.
+# The climb rate the drone must hold is HELIX_HEIGHT_M·HELIX_SPEED_MPS /
+# (2π·HELIX_RADIUS_M·HELIX_LAPS) — keep it under VMAX_UP_MPS (0.50) or the drone
+# lags the rising carrot (default: 0.6·2.0/(2π·1.5·3) ≈ 0.04 m/s, very gentle).
+HELIX_RADIUS_M = 2.0           # spiral radius AND the forward approach distance
+HELIX_LAPS = 5                 # number of turns climbed (one continuous rising arc)
+HELIX_HEIGHT_M = 3.5           # TOTAL climb over the laps (z_base → z_base+this),
+                               # linear with arc length. The helix-specific knob.
+HELIX_CW = False               # True = clockwise viewed from above; False = CCW
+                               # (same convention as CIRCLE_CW)
+HELIX_FACE_TANGENT = True      # nose follows travel direction (yaw rate = v/R =
+                               # 1.33 rad/s = 76°/s at the defaults, well under the
+                               # ~264°/s yaw authority). False = strafe at launch yaw.
+HELIX_SPEED_MPS = 2.5          # carrot ground speed along the spiral (its OWN knob,
+                               # like CIRCLE_SPEED_MPS). Bank ∝ v²/R, yaw rate ∝ v/R.
 
 # ============ loop rate (shared) ============
 TX_HZ = channels.TX_HZ         # 50 Hz, same as the data logger

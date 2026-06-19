@@ -517,10 +517,15 @@ def _line_seg(p0, p1, label, yaw=None):
             "geom": {"kind": "line", "p0": [p0[0], p0[1]], "p1": [p1[0], p1[1]]}}
 
 
-def _arc_seg(center, radius, theta0, dtheta, label, yaw=None):
+def _arc_seg(center, radius, theta0, dtheta, label, yaw=None, z0=None, z1=None):
     """Arc of `radius` about `center`, from angle theta0 sweeping dtheta (signed;
     negative = clockwise viewed from above, since world yaw is CCW-positive about
-    +Z and the bird's-eye view looks down -Z). Length = radius*|dtheta|."""
+    +Z and the bird's-eye view looks down -Z). Length = radius*|dtheta|.
+
+    z0/z1 (optional): linear altitude ramp along the arc length — the carrot climbs
+    from z0 at s=0 to z1 at s=len. This is what turns the circle into a HELIX (the
+    (x,y) spiral is identical to the circle; only z varies). Omit both → flat arc
+    (the circle/figure-8 path, unchanged)."""
     length = radius * abs(dtheta)
     sgn = 1.0 if dtheta >= 0.0 else -1.0
 
@@ -534,10 +539,15 @@ def _arc_seg(center, radius, theta0, dtheta, label, yaw=None):
         th = theta0 + sgn * (s / radius)
         return math.atan2(sgn * math.cos(th), -sgn * math.sin(th))
 
-    return {"type": "move", "at": at, "len": length, "label": label,
-            "yaw": yaw, "heading": heading,
-            "geom": {"kind": "arc", "center": [center[0], center[1]],
-                     "radius": radius, "theta0": theta0, "dtheta": dtheta}}
+    geom = {"kind": "arc", "center": [center[0], center[1]],
+            "radius": radius, "theta0": theta0, "dtheta": dtheta}
+    seg = {"type": "move", "at": at, "len": length, "label": label,
+           "yaw": yaw, "heading": heading, "geom": geom}
+    if z0 is not None and z1 is not None:
+        geom["z0"], geom["z1"] = z0, z1
+        seg["z_at"] = lambda s: z0 + (z1 - z0) * (min(s, length) / length
+                                                  if length > 1e-9 else 1.0)
+    return seg
 
 
 def _dwell_seg(point, dur, label, yaw=None):
@@ -654,6 +664,12 @@ class PathMission:
             raise ValueError("PathMission needs at least one segment")
         self.segs = list(segments)
         self.z = launch[2] + config.CLIMB_M
+        # Current carrot altitude. Tracks self.z unless a move segment carries a
+        # z-ramp (a HELIX arc), which crawls cz from its z0 to z1 over the segment;
+        # cz then HOLDS that value through the following segments (so e.g. the helix
+        # exit dwell + return leg stay at the climbed-to height). With no z-ramp
+        # anywhere, cz == self.z forever → circle/figure-8/square are unchanged.
+        self.cz = self.z
         self.yaw_sp = launch[3]    # commanded heading (slewed, never stepped)
         self.cruise = float(cruise_mps)
         self.leash = float(leash_m)
@@ -676,7 +692,7 @@ class PathMission:
 
     def _drone_close(self, pose, px, py):
         return (math.hypot(px - pose["x"], py - pose["y"]) < self.arrive_tol
-                and abs(self.z - pose["z"]) < self.arrive_tol)
+                and abs(self.cz - pose["z"]) < self.arrive_tol)
 
     def _slew_yaw(self, target, dt):
         """Move the commanded heading toward `target` (shortest way), rate-capped."""
@@ -728,7 +744,7 @@ class PathMission:
             self.done = True                   # SPACEBAR → abandon the path, land
         if self.done or self.i >= len(self.segs):
             self.done = True
-            return self.cx, self.cy, self.z, self.yaw_sp, 0.0, 0.0, 0.0, 0.0, True
+            return self.cx, self.cy, self.cz, self.yaw_sp, 0.0, 0.0, 0.0, 0.0, True
         seg = self.segs[self.i]
         px, py = self.cx, self.cy
         self.t_in_seg += dt
@@ -763,6 +779,8 @@ class PathMission:
                 else:
                     self.s, self.v = ns, v_next
             self.cx, self.cy = seg["at"](self.s)
+            if "z_at" in seg:                  # helix arc: crawl the carrot's altitude
+                self.cz = seg["z_at"](self.s)
             if seg["yaw"] == "tangent":
                 self._slew_yaw(seg["heading"](self.s), dt)
             else:
@@ -772,7 +790,7 @@ class PathMission:
         svx, svy = _carrot_vel(px, py, self.cx, self.cy, dt, self.cruise)
         sax, say = _carrot_acc(self.svx, self.svy, svx, svy, dt)
         self.svx, self.svy = svx, svy
-        return self.cx, self.cy, self.z, self.yaw_sp, svx, svy, sax, say, self.done
+        return self.cx, self.cy, self.cz, self.yaw_sp, svx, svy, sax, say, self.done
 
     def _yaw_label(self, seg):
         if seg["yaw"] is None:
@@ -807,9 +825,11 @@ class PathMission:
                              f"for {seg['dur']:.0f}s  [{self._yaw_label(seg)}]")
             else:
                 end = seg["at"](seg["len"])
+                zr = (f"  z {seg['z_at'](0.0):+.2f}→{seg['z_at'](seg['len']):+.2f}m"
+                      if "z_at" in seg else "")
                 lines.append(f"    [{k}] move  {seg['label']:11s} "
                              f"len={seg['len']:.2f}m → ({end[0]:+.2f},{end[1]:+.2f})"
-                             f"  [{self._yaw_label(seg)}]")
+                             f"{zr}  [{self._yaw_label(seg)}]")
         return lines
 
     def summary(self):
@@ -885,6 +905,54 @@ def build_circle_mission(launch):
     return PathMission(
         launch, segs,
         cruise_mps=config.CIRCLE_SPEED_MPS, leash_m=config.LEASH_M,
+        arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S)
+
+
+# ----------------------------------------------------------------------------- #
+def build_helix_mission(launch):
+    """Build the HELIX course: the circle, but the carrot CLIMBS as it laps. Take
+    off + hover at config.CLIMB_M, fly forward config.HELIX_RADIUS_M to the circle
+    (centred on the launch origin), trace config.HELIX_LAPS turns while rising
+    config.HELIX_HEIGHT_M total (linearly with arc length), settle at the top,
+    return, land. SAME PathMission / carrot / feedforward / leash / dwell machinery
+    as the circle — the ONLY difference is the arc carries a z-ramp (z0→z1), so the
+    bird's-eye (x,y) spiral is identical to the circle and only the altitude changes.
+
+    Altitude: the laps span world z from z_base = launch + CLIMB_M up to
+    z_top = z_base + HELIX_HEIGHT_M. Forward/entry legs sit at z_base, the carrot
+    holds z_top through the exit/return/home legs, and the landing descends from
+    z_top. The climb rate the drone must track is
+        HELIX_HEIGHT_M · HELIX_SPEED_MPS / (2π·HELIX_RADIUS_M·HELIX_LAPS);
+    keep it under the altitude loop's VMAX_UP_MPS (else the drone lags the rising
+    carrot and catches up only at the top dwell). Heading + direction behave exactly
+    like the circle (HELIX_FACE_TANGENT / HELIX_CW). DRY-RUN + preview.py first."""
+    x0, y0, z0, yaw0 = launch
+    c, s = math.cos(yaw0), math.sin(yaw0)
+    r = config.HELIX_RADIUS_M
+    start = (x0 + c * r, y0 + s * r)         # forward r in the launch body frame
+    center = (x0, y0)                         # spiral centered on the launch origin
+    th0 = math.atan2(start[1] - center[1], start[0] - center[0])
+    laps = max(1, int(config.HELIX_LAPS))
+    dtheta = (-1.0 if config.HELIX_CW else 1.0) * 2.0 * math.pi * laps
+    z_base = z0 + config.CLIMB_M              # == PathMission's self.z (hover height)
+    z_top = z_base + config.HELIX_HEIGHT_M
+    arc = _arc_seg(center, r, th0, dtheta, f"helix x{laps}",
+                   yaw=("tangent" if config.HELIX_FACE_TANGENT else None),
+                   z0=z_base, z1=z_top)
+    yaw_entry = arc["heading"](0.0) if config.HELIX_FACE_TANGENT else None
+    yaw_exit = yaw0 if config.HELIX_FACE_TANGENT else None
+    segs = [
+        _dwell_seg((x0, y0), config.INITIAL_HOVER_S, "takeoff/hover"),
+        _line_seg((x0, y0), start, "forward"),
+        _dwell_seg(start, config.SETTLE_S, "helix-entry", yaw=yaw_entry),
+        arc,
+        _dwell_seg(start, config.SETTLE_S, "helix-exit", yaw=yaw_exit),
+        _line_seg(start, (x0, y0), "return"),
+        _dwell_seg((x0, y0), config.SETTLE_S, "home/settle"),
+    ]
+    return PathMission(
+        launch, segs,
+        cruise_mps=config.HELIX_SPEED_MPS, leash_m=config.LEASH_M,
         arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S)
 
 
