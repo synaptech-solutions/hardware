@@ -343,7 +343,7 @@ CELLS = 1
 
 # ---- OOD runaway-climb kill (RL policy deployment) ----
 OOD_KILL_ENABLED = True
-OOD_CEILING_M = 0.5            # this far ABOVE the policy's altitude target = kill
+OOD_CEILING_M = 1.5            # this far ABOVE the policy's altitude target = kill
 OOD_KILL_S = 0.0              # the overshoot must persist this long before the cut
                               # (0 = kill on the first tick over the ceiling; raise
 
