@@ -73,7 +73,8 @@ def _rebuild_segments(segments):
         elif geom and geom.get("kind") == "arc":
             seg = _arc_seg(tuple(geom["center"]), float(geom["radius"]),
                            float(geom["theta0"]), float(geom["dtheta"]),
-                           s.get("label", ""), yaw=yaw)
+                           s.get("label", ""), yaw=yaw,
+                           z0=geom.get("z0"), z1=geom.get("z1"))  # helix climb, if any
         elif geom and geom.get("kind") == "lemniscate":
             seg = _lemniscate_seg(tuple(geom["center"]), float(geom["a"]),
                                   s.get("label", ""), yaw=yaw,
@@ -102,18 +103,26 @@ def _rebuild_segments(segments):
 
 
 def _trace_segments(segs, z, n_per_m=40.0):
-    """Densely sample move segments (and include dwell vertices) → (x, y, z) arrays."""
-    xs, ys = [], []
+    """Densely sample move segments (and include dwell vertices) → (x, y, z) arrays.
+    z tracks a running height: flat at `z` until a move carries a z-ramp (a helix
+    arc), which climbs it; that height then holds through the following segments —
+    mirroring PathMission.cz, so the overlay matches the actual carrot altitude."""
+    xs, ys, zs = [], [], []
+    cur_z = float(z)
     for seg in segs:
         if seg["type"] == "dwell":
-            xs.append(seg["point"][0]); ys.append(seg["point"][1])
+            xs.append(seg["point"][0]); ys.append(seg["point"][1]); zs.append(cur_z)
         else:
             n = max(2, int(seg["len"] * n_per_m))
+            zfn = seg.get("z_at")
             for k in range(n + 1):
-                px, py = seg["at"](seg["len"] * k / n)
+                s = seg["len"] * k / n
+                px, py = seg["at"](s)
                 xs.append(px); ys.append(py)
-    xs = np.asarray(xs, float); ys = np.asarray(ys, float)
-    return xs, ys, np.full(xs.shape, float(z))
+                zs.append(zfn(s) if zfn else cur_z)
+            if zfn:
+                cur_z = zfn(seg["len"])        # hold the climbed-to height afterward
+    return np.asarray(xs, float), np.asarray(ys, float), np.asarray(zs, float)
 
 
 def planned_path(flight_path):

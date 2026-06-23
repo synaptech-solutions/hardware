@@ -195,7 +195,8 @@ def run(args):
         cmd_log = CommandLogger()
         telem = TelemetryLogger()
         if CV2_OK:
-            recorder = VideoRecorder(config.DEVICE_INDEX, config.WIDTH, config.HEIGHT)
+            recorder = VideoRecorder(config.DEVICE_INDEX, config.WIDTH, config.HEIGHT,
+                                     out_height=getattr(config, "VIDEO_OUT_HEIGHT", None))
             video_msg = f"video /dev/video{config.DEVICE_INDEX}"
         else:
             video_msg = "video OFF (no cv2 — run with .venv/bin/python)"

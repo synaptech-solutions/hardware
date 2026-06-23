@@ -19,7 +19,8 @@ failsafe still wraps the flight.
                     behavior byte-for-byte (vicon_hover.run uses it by default).
   WaypointMission — walk a list of FIXED world waypoints with a moving setpoint
                     ("carrot") at cruise speed and a per-waypoint dwell; done after
-                    the final hold. build_square_mission() builds the course.
+                    the final hold. build_waypoint_mission() builds it from the
+                    absolute-world-coordinate course in config.WAYPOINTS.
 
 WHY A MOVING SETPOINT (not a step): the position PID is KP≈15 deg/m, so stepping
 the target 2 m would command 30° → clamp to MAX_TILT → the drone slams to max tilt,
@@ -47,6 +48,7 @@ import bisect
 import math
 
 from . import config
+from common import channels
 
 
 def _carrot_vel(px, py, cx, cy, dt, vmax):
@@ -252,11 +254,171 @@ class SyncSpinMission:
         lines += self.inner.describe()
         return lines
 
+    def override(self, pose, dt, airborne, hover_us):
+        """Forward an open-loop maneuver override (e.g. the 360° roll) to the inner
+        mission, but ONLY while the inner mission is actually running — never during
+        the bookend yaw spins (those are closed-loop). None otherwise."""
+        if self.phase == "inner" and hasattr(self.inner, "override"):
+            return self.inner.override(pose, dt, airborne, hover_us)
+        return None
+
+    def open_loop_active(self):
+        """Forward the inner mission's open-loop flag (only while it's running), so the
+        flight loop keeps driving an open-loop maneuver through a brief Vicon dropout."""
+        return (self.phase == "inner" and hasattr(self.inner, "open_loop_active")
+                and self.inner.open_loop_active())
+
+    def recovery_active(self):
+        """Forward the inner mission's recovery flag (only while it's running), so the
+        flight loop boosts the altitude climb authority during a maneuver recovery."""
+        return (self.phase == "inner" and hasattr(self.inner, "recovery_active")
+                and self.inner.recovery_active())
+
     def summary(self):
         return {"kind": "sync_spin",
                 "rate_dps": config.SPIN_RATE_DPS, "turns": config.SPIN_TURNS,
                 "settle_s": self.settle, "dir": "ccw" if self.rate >= 0 else "cw",
                 "inner": self.inner.summary()}
+
+
+# ----------------------------------------------------------------------------- #
+class FlipManeuver:
+    """Hover → a SEQUENCE of open-loop 360° body flips (each ROLL or PITCH), re-
+    stabilizing at the hover point BETWEEN each → final stable hold → done (land). The
+    sequence is config.FLIP_SEQUENCE, e.g. ["roll","pitch","roll","pitch"] (or pass
+    `axes`). ACRO-ONLY (a flip is a RATE command; Angle mode caps at angle_limit).
+
+    Per flip: settle (stabilize at hover) → roll (open-loop dead-reckoned rate stick on
+    the axis — and THROTTLE IS CUT while inverted, so the drone never thrusts itself
+    downward; the flight loop bypasses the leveling controller) → recover (controller
+    catches it + climbs hard to arrest the sink). The recover holds FLIP_BETWEEN_STABLE_S
+    of stable hover before the NEXT flip; after the LAST flip it holds FLIP_STABLE_HOLD_S,
+    then done. update() runs the phase clock + reports the fixed HOVER setpoint;
+    override() drives the open-loop flip — accuracy is not the point, the loops clean up."""
+
+    def __init__(self, launch, axes=None):
+        seq = list(axes) if axes is not None else list(config.FLIP_SEQUENCE)
+        if not seq or any(a not in ("roll", "pitch") for a in seq):
+            raise ValueError(f"FlipManeuver needs a non-empty list of 'roll'/'pitch', got {seq!r}")
+        self.axes = seq
+        self.idx = 0                                         # which flip in the sequence
+        x0, y0, z0, yaw0 = launch
+        self.hx, self.hy = x0, y0
+        self.hz, self.hyaw = z0 + config.CLIMB_M, yaw0      # hover point to recover to
+        self.phase = "settle"                                # settle → (roll → recover)×N → done
+        self.t_in_phase = 0.0
+        self.stable_t = 0.0
+        self.flip_dur = abs(360.0 / config.FLIP_RATE_DPS) * config.FLIP_DURATION_SCALE
+        self.done = False
+
+    @property
+    def axis(self):                                          # the current flip's axis
+        return self.axes[min(self.idx, len(self.axes) - 1)]
+
+    def _last(self):
+        return self.idx >= len(self.axes) - 1
+
+    def _stable(self, pose):
+        return (math.hypot(self.hx - pose["x"], self.hy - pose["y"]) < config.FLIP_STABLE_POS_M
+                and abs(self.hz - pose["z"]) < config.FLIP_STABLE_POS_M
+                and abs(math.degrees(pose.get("roll", 0.0))) < config.FLIP_STABLE_TILT_DEG
+                and abs(math.degrees(pose.get("pitch", 0.0))) < config.FLIP_STABLE_TILT_DEG)
+
+    def _hover(self):
+        return self.hx, self.hy, self.hz, self.hyaw, 0.0, 0.0, 0.0, 0.0, self.done
+
+    def update(self, pose, dt, airborne, land_requested=False):
+        if land_requested:
+            self.done = True                       # SPACEBAR mid-flip → hand back + land
+        if self.done:
+            return self._hover()
+        self.t_in_phase += dt
+        if self.phase == "settle":                 # initial stabilize before flip 0
+            self.stable_t = (self.stable_t + dt) if (airborne and self._stable(pose)) else 0.0
+            if self.stable_t >= config.FLIP_PREROLL_STABLE_S:
+                self.phase, self.t_in_phase, self.stable_t = "roll", 0.0, 0.0
+        elif self.phase == "roll":                 # open-loop flip (override() drives it)
+            if self.t_in_phase >= self.flip_dur:
+                self.phase, self.t_in_phase, self.stable_t = "recover", 0.0, 0.0
+        elif self.phase == "recover":              # catch + stabilize between/after flips
+            self.stable_t = (self.stable_t + dt) if self._stable(pose) else 0.0
+            hold = config.FLIP_STABLE_HOLD_S if self._last() else config.FLIP_BETWEEN_STABLE_S
+            if self.stable_t >= hold or self.t_in_phase >= config.FLIP_RECOVER_TIMEOUT_S:
+                if self._last():
+                    self.done = True               # whole sequence finished → land
+                else:
+                    self.idx += 1                  # next flip, straight into its roll
+                    self.phase, self.t_in_phase, self.stable_t = "roll", 0.0, 0.0
+        return self._hover()
+
+    def override(self, pose, dt, airborne, hover_us):
+        """Raw open-loop stick frame during a flip (ROLL phase): full rate on the flip
+        axis, the other two neutral. THROTTLE: hover+boost while UPRIGHT, but CUT to
+        FLIP_INVERTED_THROTTLE_US while INVERTED — dead-reckoned (the middle window
+        where the body has rotated past FLIP_INVERTED_TILT_DEG from level) so the
+        now-downward thrust never drives the drone into the ground. None otherwise."""
+        if self.phase != "roll" or self.done:
+            return None
+        sign = config.SIGN_ROLL if self.axis == "roll" else config.SIGN_PITCH
+        rate_us = config.FLIP_DIR * sign * config.FLIP_RATE_DPS * config.ACRO_RATE_US_PER_DPS
+        # Dead-reckoned rotation fraction 0→1 ≈ 0°→360°. Inverted (net thrust points
+        # DOWN) in the middle window; e.g. FLIP_INVERTED_TILT_DEG=90 → frac 0.25..0.75.
+        frac = (self.t_in_phase / self.flip_dur) if self.flip_dur > 1e-6 else 1.0
+        inv = config.FLIP_INVERTED_TILT_DEG / 360.0
+        if inv < frac < (1.0 - inv):
+            thr = config.FLIP_INVERTED_THROTTLE_US           # inverted → cut throttle
+        else:
+            thr = min(max(hover_us + config.FLIP_THROTTLE_BOOST_US,
+                          channels.IDLE_THR_US), config.MAX_THROTTLE_US)
+        cmd = {"roll_us": channels.NEUTRAL_US, "pitch_us": channels.NEUTRAL_US,
+               "yaw_us": channels.NEUTRAL_US, "throttle_us": int(round(thr))}
+        cmd[f"{self.axis}_us"] = int(round(channels.NEUTRAL_US + rate_us))  # only the flip axis
+        return cmd
+
+    def open_loop_active(self):
+        """True while a flip is in progress. The flip is DEAD-RECKONED and uses no
+        Vicon, so the flight loop keeps sending override() through a brief tracking
+        dropout (a flipped drone often loses tracking for a moment) instead of falling
+        into the stale-Vicon blind sink — which would neutralize the sticks and abort
+        the flip. A real loss (> VICON_KILL_S) still cuts via the loop's failsafe."""
+        return (not self.done) and self.phase == "roll"
+
+    def recovery_active(self):
+        """True during a RECOVER phase → the flight loop boosts the altitude loop's
+        climb authority (FLIP_RECOVER_*) to arrest the big sink the flip builds,
+        instead of the gentle hover climb caps."""
+        return (not self.done) and self.phase == "recover"
+
+    def status(self):
+        tag = f"{self.idx + 1}/{len(self.axes)} {self.axis}"
+        if self.done:
+            return "flips done"
+        if self.phase == "roll":
+            return f"FLIP {tag} {self.t_in_phase:.2f}/{self.flip_dur:.2f}s"
+        if self.phase == "recover":
+            hold = config.FLIP_STABLE_HOLD_S if self._last() else config.FLIP_BETWEEN_STABLE_S
+            return f"recover {tag} {self.stable_t:.1f}/{hold:.0f}s"
+        return f"settle {self.stable_t:.1f}/{config.FLIP_PREROLL_STABLE_S:.1f}s"
+
+    def describe(self):
+        return [f"  Flip sequence {self.axes} @ {config.FLIP_RATE_DPS:.0f}°/s "
+                f"({self.flip_dur:.2f}s each, dir {'+' if config.FLIP_DIR >= 0 else '-'}, "
+                f"throttle CUT to {config.FLIP_INVERTED_THROTTLE_US}us while inverted) →",
+                f"    recover + stabilize {config.FLIP_BETWEEN_STABLE_S:.0f}s between each "
+                f"(climb-boost +{config.FLIP_RECOVER_CLIMB_TRIM_US}us) → hold "
+                f"{config.FLIP_STABLE_HOLD_S:.0f}s → land, at hover "
+                f"({self.hx:+.2f},{self.hy:+.2f},{self.hz:+.2f}).  [ACRO-only]"]
+
+    def summary(self):
+        return {"kind": "flip", "sequence": list(self.axes), "rate_dps": config.FLIP_RATE_DPS,
+                "flip_dur_s": self.flip_dur, "dir": config.FLIP_DIR,
+                "throttle_boost_us": config.FLIP_THROTTLE_BOOST_US,
+                "inverted_throttle_us": config.FLIP_INVERTED_THROTTLE_US,
+                "inverted_tilt_deg": config.FLIP_INVERTED_TILT_DEG,
+                "recover_climb_trim_us": config.FLIP_RECOVER_CLIMB_TRIM_US,
+                "between_stable_s": config.FLIP_BETWEEN_STABLE_S,
+                "stable_hold_s": config.FLIP_STABLE_HOLD_S,
+                "hover": {"x": self.hx, "y": self.hy, "z": self.hz, "yaw_rad": self.hyaw}}
 
 
 # ----------------------------------------------------------------------------- #
@@ -278,7 +440,8 @@ class WaypointMission:
     """
 
     def __init__(self, launch, waypoints, *, cruise_mps, leash_m,
-                 arrive_tol_m, arrive_timeout_s, labels=None):
+                 arrive_tol_m, arrive_timeout_s, labels=None, face_path=False,
+                 yaw_slew_dps=None, yaw_tol_deg=None):
         if not waypoints:
             raise ValueError("WaypointMission needs at least one waypoint")
         self.wps = list(waypoints)
@@ -298,6 +461,16 @@ class WaypointMission:
         self.t_in_phase = 0.0
         self.dwell_elapsed = 0.0
         self.done = False
+        # Heading: hold the launch yaw (strafe), OR follow the path — nose points
+        # along the leg of travel, pre-rotating to the next leg during each dwell
+        # (same slew + arrival-gate machinery PathMission uses for the circle).
+        self.launch_x, self.launch_y, self.launch_yaw = launch[0], launch[1], launch[3]
+        self.face_path = bool(face_path)
+        self.yaw_sp = launch[3]                       # commanded heading (slewed, never stepped)
+        self.yaw_slew = math.radians(yaw_slew_dps if yaw_slew_dps is not None
+                                     else config.YAW_SLEW_DPS)
+        self.yaw_tol = math.radians(yaw_tol_deg if yaw_tol_deg is not None
+                                    else config.YAW_ARRIVE_TOL_DEG)
 
     def _advance_carrot(self, wx, wy, pose, dt):
         """Crawl the carrot toward (wx, wy), leashed to the drone. Trapezoid speed:
@@ -323,16 +496,58 @@ class WaypointMission:
         self.sx, self.sy = nx, ny
         self.v = v_next
 
+    def _slew_yaw(self, target, dt):
+        """Move the commanded heading toward `target` (shortest way), rate-capped."""
+        if target is None:
+            return
+        err = _wrap_pi(target - self.yaw_sp)
+        step = max(-self.yaw_slew * dt, min(self.yaw_slew * dt, err))
+        self.yaw_sp = _wrap_pi(self.yaw_sp + step)
+
+    def _yaw_arrived(self, pose, target):
+        """Heading setpoint finished slewing AND the drone's nose followed it."""
+        if target is None:
+            return True
+        if abs(_wrap_pi(target - self.yaw_sp)) > 1e-3:
+            return False
+        pyaw = pose.get("yaw")
+        return pyaw is None or abs(_wrap_pi(pyaw - target)) < self.yaw_tol
+
+    def _heading_target(self):
+        """The world heading the nose should hold. Strafe → launch yaw. Face-path →
+        the current leg's travel direction while moving; while holding at a vertex,
+        PRE-ROTATE to the next leg's direction (so the next leg starts nose-aligned).
+        Returns None (= hold current yaw_sp) when there's no leg to face."""
+        if not self.face_path:
+            return self.launch_yaw
+        i = self.idx
+        here = (self.wps[i][0], self.wps[i][1])
+        if self.phase == "GOTO":
+            prev = ((self.wps[i - 1][0], self.wps[i - 1][1]) if i >= 1
+                    else (self.launch_x, self.launch_y))
+            if math.hypot(here[0] - prev[0], here[1] - prev[1]) > 1e-6:
+                return math.atan2(here[1] - prev[1], here[0] - prev[0])
+        # HOLD, or a zero-length GOTO (e.g. takeoff at the launch point): face the
+        # NEXT leg if there is one, else just hold the current heading.
+        if i + 1 < len(self.wps):
+            nxt = (self.wps[i + 1][0], self.wps[i + 1][1])
+            if math.hypot(nxt[0] - here[0], nxt[1] - here[1]) > 1e-6:
+                return math.atan2(nxt[1] - here[1], nxt[0] - here[0])
+        return None
+
     def update(self, pose, dt, airborne, land_requested=False):
-        """One tick. Returns (x, y, z, yaw, svx, svy, done): the (x, y) is the
-        moving carrot, (svx, svy) its velocity (for the controller's velocity
-        feedforward); z + yaw are the active waypoint's."""
+        """One tick. Returns (x, y, z, yaw, svx, svy, sax, say, done): the (x, y) is
+        the moving carrot, (svx, svy) its velocity (controller D feedforward); z is
+        the active waypoint's; yaw is the held launch heading (strafe) or the slewed
+        path-following heading (face_path)."""
         if land_requested:
             self.done = True                   # SPACEBAR → abandon the course, land
         wx, wy, wz, wyaw, dwell = self.wps[self.idx]
         px, py = self.sx, self.sy
         if not self.done:
             self.t_in_phase += dt
+            tgt = self._heading_target()       # launch yaw (strafe) or the leg/next-leg dir
+            self._slew_yaw(tgt, dt)
             if self.phase == "GOTO":
                 if airborne:
                     self._advance_carrot(wx, wy, pose, dt)
@@ -342,11 +557,17 @@ class WaypointMission:
                     and abs(wz - pose["z"]) < self.arrive_tol)
                 timed_out = airborne and self.t_in_phase > self.arrive_timeout
                 if (carrot_at_wp and drone_close) or timed_out:
-                    self.phase, self.dwell_elapsed = "HOLD", 0.0
+                    self.phase, self.dwell_elapsed, self.t_in_phase = "HOLD", 0.0, 0.0
             elif self.phase == "HOLD":
                 self.sx, self.sy = wx, wy          # park the carrot on the vertex
                 self.v = 0.0
-                self.dwell_elapsed += dt
+                # Face-path: count the dwell only once the nose has pre-rotated to the
+                # next leg (same gate PathMission uses); timeout backstop so a never-
+                # quite-aligned nose can't hang the course. Strafe: yaw_ok is always
+                # True, so this is byte-identical to the old behavior.
+                yaw_ok = (not self.face_path) or self._yaw_arrived(pose, tgt)
+                if self.dwell_elapsed > 0.0 or yaw_ok or self.t_in_phase > self.arrive_timeout:
+                    self.dwell_elapsed += dt
                 if self.dwell_elapsed >= dwell:
                     if self.idx + 1 < len(self.wps):
                         self.idx += 1
@@ -356,31 +577,39 @@ class WaypointMission:
         svx, svy = _carrot_vel(px, py, self.sx, self.sy, dt, self.cruise)
         sax, say = _carrot_acc(self.svx, self.svy, svx, svy, dt)
         self.svx, self.svy = svx, svy
-        return self.sx, self.sy, wz, wyaw, svx, svy, sax, say, self.done
+        return self.sx, self.sy, wz, self.yaw_sp, svx, svy, sax, say, self.done
 
     def status(self):
         if self.done:
             return "MISSION done"
         wp = self.wps[self.idx]
+        head = f" hd{math.degrees(self.yaw_sp):+.0f}°" if self.face_path else ""
         if self.phase == "GOTO":
             d = math.hypot(wp[0] - self.sx, wp[1] - self.sy)
-            return f"WP{self.idx}/{len(self.wps) - 1} goto carrot{d:.2f}m"
+            return f"WP{self.idx}/{len(self.wps) - 1} goto carrot{d:.2f}m{head}"
         return (f"WP{self.idx}/{len(self.wps) - 1} hold "
-                f"{self.dwell_elapsed:.1f}/{wp[4]:.0f}s")
+                f"{self.dwell_elapsed:.1f}/{wp[4]:.0f}s{head}")
 
     def describe(self):
+        mode = ("nose follows path" if self.face_path
+                else f"heading held at launch yaw {math.degrees(self.launch_yaw):+.0f}°")
         lines = [f"  Mission: {len(self.wps)}-waypoint course "
                  f"(cruise {self.cruise:.2f} m/s, leash {self.leash:.2f} m, "
-                 f"arrive tol {self.arrive_tol:.2f} m):"]
+                 f"arrive tol {self.arrive_tol:.2f} m; {mode}):"]
         for i, w in enumerate(self.wps):
             lbl = self.labels[i] if self.labels else f"WP{i}"
+            tail = f"  yaw {math.degrees(w[3]):+.0f}°"
+            if self.face_path and i + 1 < len(self.wps):
+                nxt = self.wps[i + 1]
+                if math.hypot(nxt[0] - w[0], nxt[1] - w[1]) > 1e-6:
+                    tail = f"  → leg head {math.degrees(math.atan2(nxt[1]-w[1], nxt[0]-w[0])):+.0f}°"
             lines.append(f"    WP{i} {lbl:13s} world=({w[0]:+.2f},{w[1]:+.2f},"
-                         f"{w[2]:+.2f}) yaw={math.degrees(w[3]):+.0f}°  hold {w[4]:.0f}s")
+                         f"{w[2]:+.2f})  hold {w[4]:.0f}s{tail}")
         return lines
 
     def summary(self):
         return {
-            "kind": "waypoint",
+            "kind": "waypoint", "face_path": self.face_path,
             "cruise_mps": self.cruise, "leash_m": self.leash,
             "arrive_tol_m": self.arrive_tol, "arrive_timeout_s": self.arrive_timeout,
             "waypoints_world": [
@@ -391,35 +620,26 @@ class WaypointMission:
 
 
 # ----------------------------------------------------------------------------- #
-def build_square_mission(launch):
-    """Build the default course from config: take off + hover, then a LEG_M square
-    (forward → right → back → left, holding DWELL_S at each vertex) returning over
-    the origin, then land. Body-frame spec → fixed world waypoints via the launch
-    yaw (see module docstring for the transform)."""
+def build_waypoint_mission(launch):
+    """Build a WaypointMission from config.WAYPOINTS — points in ABSOLUTE VICON WORLD
+    coordinates (x, y, z), used AS-IS (no launch rotation or offset), so a waypoint at
+    world (−2, 0) is exactly there regardless of where/which-way the drone launched.
+    Per-point z (meters); z=None → CLIMB_M above the launch altitude. Heading is HELD
+    at the captured launch yaw throughout (the drone strafes, nose fixed). The carrot
+    starts at the launch position and crawls to WP0 first (make WP0 the takeoff point)."""
     x0, y0, z0, yaw0 = launch
-    z = z0 + config.CLIMB_M
-    c, s = math.cos(yaw0), math.sin(yaw0)
-    leg = config.LEG_M
-    # Cumulative (forward, right) vertex positions in the LAUNCH BODY FRAME, with
-    # the dwell at each: takeoff hover, then the four square corners.
-    body = [
-        ("takeoff/hover", 0.0, 0.0, config.INITIAL_HOVER_S),
-        ("forward",       leg, 0.0, config.DWELL_S),
-        ("right",         leg, leg, config.DWELL_S),
-        ("back",          0.0, leg, config.DWELL_S),
-        ("left/home",     0.0, 0.0, config.DWELL_S),
-    ]
+    if not config.WAYPOINTS:
+        raise ValueError("config.WAYPOINTS is empty — define at least the WP0 takeoff point")
     wps, labels = [], []
-    for label, fwd, right, dwell in body:
-        dx = c * fwd + s * right
-        dy = s * fwd - c * right
-        wps.append((x0 + dx, y0 + dy, z, yaw0, dwell))
+    for x, y, z, dwell, label in config.WAYPOINTS:
+        zw = z0 + config.CLIMB_M if z is None else float(z)
+        wps.append((float(x), float(y), zw, yaw0, float(dwell)))
         labels.append(label)
     return WaypointMission(
         launch, wps,
         cruise_mps=config.CRUISE_SPEED_MPS, leash_m=config.LEASH_M,
         arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S,
-        labels=labels)
+        labels=labels, face_path=config.WAYPOINT_FACE_PATH)
 
 
 # ----------------------------------------------------------------------------- #
@@ -458,10 +678,19 @@ def _line_seg(p0, p1, label, yaw=None):
             "geom": {"kind": "line", "p0": [p0[0], p0[1]], "p1": [p1[0], p1[1]]}}
 
 
-def _arc_seg(center, radius, theta0, dtheta, label, yaw=None):
+def _arc_seg(center, radius, theta0, dtheta, label, yaw=None, z0=None, z1=None,
+             z_sine=None):
     """Arc of `radius` about `center`, from angle theta0 sweeping dtheta (signed;
     negative = clockwise viewed from above, since world yaw is CCW-positive about
-    +Z and the bird's-eye view looks down -Z). Length = radius*|dtheta|."""
+    +Z and the bird's-eye view looks down -Z). Length = radius*|dtheta|.
+
+    Optional VERTICAL profile along the arc length s (turns the flat circle into a
+    3D path; the (x,y) is unchanged either way). At most one of:
+      z0/z1   linear ramp z0→z1 over the arc — a HELIX.
+      z_sine  (z_mid, amp, cycles, phase): z = z_mid + amp·sin(2π·cycles·(s/len)+phase)
+              — the height oscillates `cycles` full sine periods over the whole arc
+              (so the carrot rides up and down while it laps the circle).
+    Omit both → flat arc (the plain circle/figure-8, unchanged)."""
     length = radius * abs(dtheta)
     sgn = 1.0 if dtheta >= 0.0 else -1.0
 
@@ -475,10 +704,22 @@ def _arc_seg(center, radius, theta0, dtheta, label, yaw=None):
         th = theta0 + sgn * (s / radius)
         return math.atan2(sgn * math.cos(th), -sgn * math.sin(th))
 
-    return {"type": "move", "at": at, "len": length, "label": label,
-            "yaw": yaw, "heading": heading,
-            "geom": {"kind": "arc", "center": [center[0], center[1]],
-                     "radius": radius, "theta0": theta0, "dtheta": dtheta}}
+    def _u(s):                                  # normalized arc position in [0, 1]
+        return (min(s, length) / length) if length > 1e-9 else 0.0
+
+    geom = {"kind": "arc", "center": [center[0], center[1]],
+            "radius": radius, "theta0": theta0, "dtheta": dtheta}
+    seg = {"type": "move", "at": at, "len": length, "label": label,
+           "yaw": yaw, "heading": heading, "geom": geom}
+    if z_sine is not None:
+        z_mid, amp, cycles, phase = z_sine
+        geom["z_sine"] = {"z_mid": z_mid, "amp": amp, "cycles": cycles, "phase": phase}
+        seg["z_at"] = lambda s: z_mid + amp * math.sin(
+            2.0 * math.pi * cycles * _u(s) + phase)
+    elif z0 is not None and z1 is not None:
+        geom["z0"], geom["z1"] = z0, z1
+        seg["z_at"] = lambda s: z0 + (z1 - z0) * _u(s)
+    return seg
 
 
 def _dwell_seg(point, dur, label, yaw=None):
@@ -595,6 +836,12 @@ class PathMission:
             raise ValueError("PathMission needs at least one segment")
         self.segs = list(segments)
         self.z = launch[2] + config.CLIMB_M
+        # Current carrot altitude. Tracks self.z unless a move segment carries a
+        # z-ramp (a HELIX arc), which crawls cz from its z0 to z1 over the segment;
+        # cz then HOLDS that value through the following segments (so e.g. the helix
+        # exit dwell + return leg stay at the climbed-to height). With no z-ramp
+        # anywhere, cz == self.z forever → circle/figure-8/square are unchanged.
+        self.cz = self.z
         self.yaw_sp = launch[3]    # commanded heading (slewed, never stepped)
         self.cruise = float(cruise_mps)
         self.leash = float(leash_m)
@@ -617,7 +864,7 @@ class PathMission:
 
     def _drone_close(self, pose, px, py):
         return (math.hypot(px - pose["x"], py - pose["y"]) < self.arrive_tol
-                and abs(self.z - pose["z"]) < self.arrive_tol)
+                and abs(self.cz - pose["z"]) < self.arrive_tol)
 
     def _slew_yaw(self, target, dt):
         """Move the commanded heading toward `target` (shortest way), rate-capped."""
@@ -669,7 +916,7 @@ class PathMission:
             self.done = True                   # SPACEBAR → abandon the path, land
         if self.done or self.i >= len(self.segs):
             self.done = True
-            return self.cx, self.cy, self.z, self.yaw_sp, 0.0, 0.0, 0.0, 0.0, True
+            return self.cx, self.cy, self.cz, self.yaw_sp, 0.0, 0.0, 0.0, 0.0, True
         seg = self.segs[self.i]
         px, py = self.cx, self.cy
         self.t_in_seg += dt
@@ -704,6 +951,8 @@ class PathMission:
                 else:
                     self.s, self.v = ns, v_next
             self.cx, self.cy = seg["at"](self.s)
+            if "z_at" in seg:                  # helix arc: crawl the carrot's altitude
+                self.cz = seg["z_at"](self.s)
             if seg["yaw"] == "tangent":
                 self._slew_yaw(seg["heading"](self.s), dt)
             else:
@@ -713,7 +962,7 @@ class PathMission:
         svx, svy = _carrot_vel(px, py, self.cx, self.cy, dt, self.cruise)
         sax, say = _carrot_acc(self.svx, self.svy, svx, svy, dt)
         self.svx, self.svy = svx, svy
-        return self.cx, self.cy, self.z, self.yaw_sp, svx, svy, sax, say, self.done
+        return self.cx, self.cy, self.cz, self.yaw_sp, svx, svy, sax, say, self.done
 
     def _yaw_label(self, seg):
         if seg["yaw"] is None:
@@ -748,9 +997,13 @@ class PathMission:
                              f"for {seg['dur']:.0f}s  [{self._yaw_label(seg)}]")
             else:
                 end = seg["at"](seg["len"])
+                zr = ""
+                if "z_at" in seg:              # helix ramp / sine bob: show the z span
+                    zv = [seg["z_at"](seg["len"] * j / 24.0) for j in range(25)]
+                    zr = f"  z[{min(zv):+.2f},{max(zv):+.2f}]m"
                 lines.append(f"    [{k}] move  {seg['label']:11s} "
                              f"len={seg['len']:.2f}m → ({end[0]:+.2f},{end[1]:+.2f})"
-                             f"  [{self._yaw_label(seg)}]")
+                             f"{zr}  [{self._yaw_label(seg)}]")
         return lines
 
     def summary(self):
@@ -826,6 +1079,102 @@ def build_circle_mission(launch):
     return PathMission(
         launch, segs,
         cruise_mps=config.CIRCLE_SPEED_MPS, leash_m=config.LEASH_M,
+        arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S)
+
+
+# ----------------------------------------------------------------------------- #
+def build_helix_mission(launch):
+    """Build the HELIX course: the circle, but the carrot CLIMBS as it laps. Take
+    off + hover at config.CLIMB_M, fly forward config.HELIX_RADIUS_M to the circle
+    (centred on the launch origin), trace config.HELIX_LAPS turns while rising
+    config.HELIX_HEIGHT_M total (linearly with arc length), settle at the top,
+    return, land. SAME PathMission / carrot / feedforward / leash / dwell machinery
+    as the circle — the ONLY difference is the arc carries a z-ramp (z0→z1), so the
+    bird's-eye (x,y) spiral is identical to the circle and only the altitude changes.
+
+    Altitude: the laps span world z from z_base = launch + CLIMB_M up to
+    z_top = z_base + HELIX_HEIGHT_M. Forward/entry legs sit at z_base, the carrot
+    holds z_top through the exit/return/home legs, and the landing descends from
+    z_top. The climb rate the drone must track is
+        HELIX_HEIGHT_M · HELIX_SPEED_MPS / (2π·HELIX_RADIUS_M·HELIX_LAPS);
+    keep it under the altitude loop's VMAX_UP_MPS (else the drone lags the rising
+    carrot and catches up only at the top dwell). Heading + direction behave exactly
+    like the circle (HELIX_FACE_TANGENT / HELIX_CW). DRY-RUN + preview.py first."""
+    x0, y0, z0, yaw0 = launch
+    c, s = math.cos(yaw0), math.sin(yaw0)
+    r = config.HELIX_RADIUS_M
+    start = (x0 + c * r, y0 + s * r)         # forward r in the launch body frame
+    center = (x0, y0)                         # spiral centered on the launch origin
+    th0 = math.atan2(start[1] - center[1], start[0] - center[0])
+    laps = max(1, int(config.HELIX_LAPS))
+    dtheta = (-1.0 if config.HELIX_CW else 1.0) * 2.0 * math.pi * laps
+    z_base = z0 + config.CLIMB_M              # == PathMission's self.z (hover height)
+    z_top = z_base + config.HELIX_HEIGHT_M
+    arc = _arc_seg(center, r, th0, dtheta, f"helix x{laps}",
+                   yaw=("tangent" if config.HELIX_FACE_TANGENT else None),
+                   z0=z_base, z1=z_top)
+    yaw_entry = arc["heading"](0.0) if config.HELIX_FACE_TANGENT else None
+    yaw_exit = yaw0 if config.HELIX_FACE_TANGENT else None
+    segs = [
+        _dwell_seg((x0, y0), config.INITIAL_HOVER_S, "takeoff/hover"),
+        _line_seg((x0, y0), start, "forward"),
+        _dwell_seg(start, config.SETTLE_S, "helix-entry", yaw=yaw_entry),
+        arc,
+        _dwell_seg(start, config.SETTLE_S, "helix-exit", yaw=yaw_exit),
+        _line_seg(start, (x0, y0), "return"),
+        _dwell_seg((x0, y0), config.SETTLE_S, "home/settle"),
+    ]
+    return PathMission(
+        launch, segs,
+        cruise_mps=config.HELIX_SPEED_MPS, leash_m=config.LEASH_M,
+        arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S)
+
+
+# ----------------------------------------------------------------------------- #
+def build_sine_circle_mission(launch):
+    """Build the SINE-CIRCLE course: a circle whose ALTITUDE oscillates like a sine
+    wave while it laps. Take off + hover at CLIMB_M, fly forward SINE_RADIUS_M to the
+    circle (centred on the launch origin), trace SINE_LAPS laps while z rides
+    z_mid + SINE_AMP_M·sin(...) with SINE_CYCLES_PER_LAP humps per lap, settle, return,
+    land. SAME PathMission / carrot / leash / dwell machinery as the circle and helix
+    — the ONLY difference is the arc's z-profile is a sine instead of flat (circle) or
+    a ramp (helix); the bird's-eye (x,y) is the plain circle.
+
+    Altitude: z oscillates about z_mid = launch + CLIMB_M with amplitude SINE_AMP_M,
+    so it spans [z_mid - SINE_AMP_M, z_mid + SINE_AMP_M]. KEEP SINE_AMP_M < CLIMB_M so
+    the trough stays well above the ground. The sine starts at z_mid (phase 0, rising)
+    and — because cycles = SINE_CYCLES_PER_LAP·SINE_LAPS is a whole/half number — ends
+    back at z_mid, so the exit/return/landing are at the hover height. Peak vertical
+    speed is SINE_AMP_M·SINE_CYCLES_PER_LAP·SINE_SPEED_MPS / SINE_RADIUS_M; keep it
+    under the altitude loop's VMAX_UP_MPS or the drone lags the bobbing carrot.
+    Heading + direction behave exactly like the circle. DRY-RUN + preview.py first."""
+    x0, y0, z0, yaw0 = launch
+    c, s = math.cos(yaw0), math.sin(yaw0)
+    r = config.SINE_RADIUS_M
+    start = (x0 + c * r, y0 + s * r)          # forward r in the launch body frame
+    center = (x0, y0)                          # circle centered on the launch origin
+    th0 = math.atan2(start[1] - center[1], start[0] - center[0])
+    laps = max(1, int(config.SINE_LAPS))
+    dtheta = (-1.0 if config.SINE_CW else 1.0) * 2.0 * math.pi * laps
+    z_mid = z0 + config.CLIMB_M               # == PathMission's self.z (hover height)
+    cycles = config.SINE_CYCLES_PER_LAP * laps    # total sine periods over the arc
+    arc = _arc_seg(center, r, th0, dtheta, f"sine-circle x{laps}",
+                   yaw=("tangent" if config.SINE_FACE_TANGENT else None),
+                   z_sine=(z_mid, config.SINE_AMP_M, cycles, 0.0))
+    yaw_entry = arc["heading"](0.0) if config.SINE_FACE_TANGENT else None
+    yaw_exit = yaw0 if config.SINE_FACE_TANGENT else None
+    segs = [
+        _dwell_seg((x0, y0), config.INITIAL_HOVER_S, "takeoff/hover"),
+        _line_seg((x0, y0), start, "forward"),
+        _dwell_seg(start, config.SETTLE_S, "sine-entry", yaw=yaw_entry),
+        arc,
+        _dwell_seg(start, config.SETTLE_S, "sine-exit", yaw=yaw_exit),
+        _line_seg(start, (x0, y0), "return"),
+        _dwell_seg((x0, y0), config.SETTLE_S, "home/settle"),
+    ]
+    return PathMission(
+        launch, segs,
+        cruise_mps=config.SINE_SPEED_MPS, leash_m=config.LEASH_M,
         arrive_tol_m=config.ARRIVE_TOL_M, arrive_timeout_s=config.ARRIVE_TIMEOUT_S)
 
 
