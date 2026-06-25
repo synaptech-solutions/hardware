@@ -1,141 +1,115 @@
-"""Standalone drone video recorder — just the feed + a record toggle.
+"""Standalone drone video recorder — IDENTICAL output to a real flight, no flying.
 
-Opens the drone's video feed in a window. SPACE starts a recording; SPACE again
-stops it and saves the clip to DataExchange/<timestamp>.mp4. You can record as
-many clips as you like in one session; Q (or ESC) quits. No ViCON, no blackbox,
-no sync — this is purely for grabbing video off the feed.
+Grabs the drone's video feed and saves clips that are byte-for-byte the same kind
+of file a real flight produces — because it records with the EXACT same VideoRecorder
+and channels settings the flight data pipeline uses (vicon_hover.py / joystick_flight.py),
+not its own encoder. No Vicon, no blackbox, no commands/telemetry — just the video.
 
-OpenCV owns the camera (capture + preview window) and pipes each frame to an
-ffmpeg subprocess that encodes H.264. This keeps the reliable OpenCV preview but
-swaps the bloated 'mp4v' encode for libx264 — which, unlike OpenCV's built-in
-H.264, ships with ffmpeg on stock Ubuntu, so collection works on any machine.
+Each clip → <out-dir>/<timestamp>/{video.mkv, video_frames.csv}, the same pair a
+flight writes: same camera (channels.DEVICE_INDEX), same capture resolution
+(channels.WIDTH×HEIGHT), same uniform downscale (channels.VIDEO_OUT_HEIGHT), same
+H.264/libx264 CRF, and the same per-frame real-capture-time sidecar. So a clip from
+here drops straight into the same review/extraction tooling as flight footage.
 
-Camera: /dev/video4 (auto-tries video5 if the Cam Link re-enumerated). The C03 is
-an analog NTSC camera, so we capture at its native 720x480 (4:3) — capturing 1280x720
-just upscales SD with no extra detail and bloats files. Pass --width/--height to override.
+Controls (in the preview window):
+  SPACE  start a clip / stop & save     Q or ESC  quit
+The preview shows WHILE recording (the recorder owns the camera then, exactly as in
+flight); idle shows a prompt. Record as many clips as you like in one session.
 
-Run with the cv2 venv (ffmpeg must also be on PATH):
-  ../.venv/bin/python simple_video_recorder.py
-  ../.venv/bin/python simple_video_recorder.py --device 5 --crf 20 --out-dir /some/where
+Run with the repo venv (ffmpeg + cv2 on it):
+  .venv/bin/python pycode_ViCON/simple_video_recorder.py
+  .venv/bin/python pycode_ViCON/simple_video_recorder.py --out-dir /some/where
 """
 from __future__ import annotations
 
-import os
-import shutil
 import argparse
 import datetime
+import os
+import sys
 
-import cv2
-
-from ffmpeg_writer import FfmpegWriter
+import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(HERE)
+_DRONE_CONTROL = os.path.join(_REPO, "drone_control")
+if _DRONE_CONTROL not in sys.path:
+    sys.path.insert(0, _DRONE_CONTROL)
+
+from common import channels                                  # noqa: E402
+from common.recorders import (                               # noqa: E402
+    VideoRecorder, cv2, CV2_OK, FFMPEG_OK)
 
 
-def open_camera(
-    device: int, width: int, height: int, fps: int
-) -> tuple[cv2.VideoCapture | None, int | None]:
-    """Open /dev/video<device>, falling back to device+1 (Cam Link 4<->5 shift).
-
-    The encoder is sized from the actual frames later, so we only need the cap +
-    its index here; the printed size is whatever the device actually negotiated.
-    """
-    for dev in (device, device + 1):
-        cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-            cap.set(cv2.CAP_PROP_FPS, fps)  # C03 is analog NTSC (~30fps); 60 just dupes frames
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            aw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or width
-            ah = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or height
-            print(f"Camera: /dev/video{dev} {aw}x{ah} (requested {width}x{height})")
-            return cap, dev
-        cap.release()
-    return None, None
+def _placeholder(text):
+    """A small dark frame with a prompt, so the window + key handling work while
+    idle (the recorder only owns the camera — hence a live preview — while recording)."""
+    img = np.full((360, 640, 3), 30, np.uint8)
+    cv2.putText(img, text, (24, 190), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 0), 2)
+    return img
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--device", type=int, default=4, help="camera /dev/videoN (default 4)")
-    ap.add_argument("--width", type=int, default=720)   # native NTSC (the C03 is SD analog,
-    ap.add_argument("--height", type=int, default=480)  # 720x480 4:3 — 1280x720 was upscaled)
-    ap.add_argument("--fps", type=int, default=30, help="C03 is NTSC (~30fps); 60 just dupes")
-    ap.add_argument("--crf", type=int, default=23,
-                    help="H.264 quality, lower=better/bigger (default 23)")
     ap.add_argument("--out-dir", default=os.path.join(HERE, "DataExchange"),
-                    help="where clips are saved (default DataExchange/)")
+                    help="where clips are saved, one <timestamp>/ folder each "
+                         "(default pycode_ViCON/DataExchange/)")
+    ap.add_argument("--device", type=int, default=channels.DEVICE_INDEX,
+                    help=f"camera /dev/videoN (default channels.DEVICE_INDEX={channels.DEVICE_INDEX}, "
+                         "same as flights; change if the Cam Link re-enumerated)")
     args = ap.parse_args()
+
+    if not CV2_OK:
+        raise SystemExit("OpenCV (cv2) not available — run with the repo .venv.")
+    if not FFMPEG_OK:
+        raise SystemExit("ffmpeg not found on PATH — install it (e.g. apt install ffmpeg).")
     os.makedirs(args.out_dir, exist_ok=True)
 
-    if shutil.which("ffmpeg") is None:
-        raise SystemExit("ffmpeg not found on PATH — install it (e.g. apt install ffmpeg).")
-
-    cap, dev = open_camera(args.device, args.width, args.height, args.fps)
-    if cap is None:
-        raise SystemExit(f"could not open /dev/video{args.device} (or {args.device + 1}) — "
-                         "is the Cam Link plugged in and free?")
-
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    fps = fps if fps and fps > 1 else float(args.fps)
+    # The SAME recorder + settings the flight loop builds — this is what makes the
+    # output identical (resolution/aspect/downscale/encode/video_frames.csv).
+    recorder = VideoRecorder(args.device, channels.WIDTH, channels.HEIGHT,
+                             out_height=getattr(channels, "VIDEO_OUT_HEIGHT", None))
+    out_h = getattr(channels, "VIDEO_OUT_HEIGHT", None)
+    print(f"Recorder: capture {channels.WIDTH}x{channels.HEIGHT} on /dev/video{args.device}"
+          f"{f' -> downscale to {out_h}px tall' if out_h else ''}, "
+          f"H.264/MKV crf{recorder.crf} + video_frames.csv — identical to a flight clip.")
+    print("SPACE = start/stop recording   Q/ESC = quit")
 
     WIN = "drone feed  [SPACE]=record/stop  [Q]=quit"
     cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-
-    writer: FfmpegWriter | None = None
-    path: str | None = None
-    start_t: float | None = None
-    frames = 0
-    print("SPACE = start/stop recording   Q/ESC = quit")
+    path = None
     try:
         while True:
-            ok, frame = cap.read()
-            if not ok:
-                if (cv2.waitKey(1) & 0xFF) in (ord("q"), 27):
-                    break
-                continue
-
-            if writer is not None:
-                writer.write(frame)
-                frames += 1
-
-            disp = frame.copy()
-            if writer is not None:
-                el = datetime.datetime.now().timestamp() - start_t
-                cv2.putText(disp, f"REC  {el:5.1f}s  ({frames} frames)", (12, 34),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            if recorder.recording:
+                frame = recorder.get_latest_frame()
+                if frame is None:
+                    disp = _placeholder("starting camera ...")
+                else:
+                    disp = frame.copy()
+                    cv2.putText(disp, f"REC  {recorder.frames} frames", (14, 40),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
             else:
-                cv2.putText(disp, "SPACE = record    Q = quit", (12, 34),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2)
+                disp = _placeholder("SPACE = record    Q = quit")
             cv2.imshow(WIN, disp)
 
-            k = cv2.waitKey(1) & 0xFF
+            k = cv2.waitKey(30) & 0xFF
             if k == ord(" "):
-                if writer is None:                       # start a clip
+                if not recorder.recording:                    # start a clip
                     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    path = os.path.join(args.out_dir, stamp + ".mp4")
-                    fh, fw = frame.shape[:2]             # encode the real frame size
-                    writer = FfmpegWriter(path, fw, fh, fps, crf=args.crf)
-                    if not writer.isOpened():
-                        print("ERROR: could not start the ffmpeg encoder — not recording.")
-                        writer = None
-                        continue
-                    start_t = datetime.datetime.now().timestamp()
-                    frames = 0
+                    sdir = os.path.join(args.out_dir, stamp)
+                    os.makedirs(sdir, exist_ok=True)
+                    path = os.path.join(sdir, "video.mkv")
+                    recorder.start(datetime.datetime.now().timestamp(), path)
                     print(f"REC start -> {path}")
-                else:                                    # stop + save the clip
-                    writer.release()
-                    print(f"Saved {path}  ({frames} frames)")
-                    writer = None
+                else:                                          # stop + save
+                    recorder.stop()
+                    print(f"Saved {path}  ({recorder.frames} frames)  | {recorder.status}")
             elif k in (ord("q"), 27):
                 break
     finally:
-        if writer is not None:                           # quit mid-recording -> still save
-            writer.release()
-            print(f"Saved {path}  ({frames} frames)")
-        cap.release()
+        if recorder.recording:                                # quit mid-clip → still save
+            recorder.stop()
+            print(f"Saved {path}  ({recorder.frames} frames)")
         cv2.destroyAllWindows()
 
 

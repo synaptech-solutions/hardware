@@ -29,7 +29,7 @@ RECORD_VIDEO = True             # record the drone-feed video alongside the othe
 # FIRST FLIGHTS: set CLIMB_M = 0.3 and confirm a stable low hover before 1.0 m.
 # SHARED by hover / circle / square / figure-8 (all fly CLIMB_M above launch). Set
 # to 1.0 for the figure-8's spec'd flat 1 m height (z=1); the circle last flew 0.8.
-CLIMB_M = 3.0
+CLIMB_M = 1.0
 
 # ============ FC angle-mode stick → angle scaling (from the Air75 measurement) ===
 # Measured 2026-05-29: full deflection ≈ ±511.5us reaches angle_limit (60°), so
@@ -445,16 +445,16 @@ LEASH_M = 1.2                  # the carrot never gets more than this far ahead 
 # LEASH_M / ARRIVE_TOL_M / ARRIVE_TIMEOUT_S / INITIAL_HOVER_S / CARROT_ACCEL_MPS2;
 # has its OWN speed (CIRCLE_SPEED_MPS) — the circle banks/yaws far harder than the
 # square's strafes, so they're tuned independently.
-CIRCLE_SPEED_MPS = 3.5         # CIRCLE carrot speed. 3.0 is ~the fastest the CURRENT
+CIRCLE_SPEED_MPS = 3.0         # CIRCLE carrot speed. 3.0 is ~the fastest the CURRENT
                                # 1 m circle sustains: bank 43° (g-limited, 17° under
                                # the FC limit) is comfy, but the yaw FF hits 293us at
                                # ω=172°/s against the 300°/s FC linear yaw curve — yaw
                                # authority is the real wall. Go faster only on a LARGER
                                # radius (bank ∝ v²/r, yaw rate ∝ v/r — both ease with r).
 CIRCLE_RADIUS_M = 2.5          # circle radius AND the forward approach distance
-CIRCLE_LAPS = 5                # consecutive laps of the circle (one continuous arc —
+CIRCLE_LAPS = 10                # consecutive laps of the circle (one continuous arc —
                                # no dwells between laps; entry/exit dwells unchanged)
-CIRCLE_CW = False              # True = clockwise viewed from above (the carrot goes
+CIRCLE_CW = True               # True = clockwise viewed from above (the carrot goes
                                # forward-point → right → back → left → forward-point);
                                # False = counter-clockwise. CCW with FACE_TANGENT: the
                                # entry pre-rotation turns LEFT 90° from the launch
