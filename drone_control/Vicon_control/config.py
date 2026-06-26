@@ -29,7 +29,7 @@ RECORD_VIDEO = True             # record the drone-feed video alongside the othe
 # FIRST FLIGHTS: set CLIMB_M = 0.3 and confirm a stable low hover before 1.0 m.
 # SHARED by hover / circle / square / figure-8 (all fly CLIMB_M above launch). Set
 # to 1.0 for the figure-8's spec'd flat 1 m height (z=1); the circle last flew 0.8.
-CLIMB_M = 3.0
+CLIMB_M = 1.0
 
 # ============ FC angle-mode stick → angle scaling (from the Air75 measurement) ===
 # Measured 2026-05-29: full deflection ≈ ±511.5us reaches angle_limit (60°), so
@@ -56,10 +56,12 @@ STICK_US_PER_DEG = STICK_FULL_DEFLECTION_US / FC_ANGLE_LIMIT_DEG   # 8.525
 # flight is the proven Angle-mode behavior, byte-for-byte.
 #
 # Rate curve (Air75, rateprofile 0, ACTIVE): rates_type=ACTUAL, expo=0 → LINEAR.
-# Bumped 2026-06-19 from 70°/s to 800°/s full stick for a more aggressive envelope —
-# FC setting: roll_rc_rate = roll_srate = pitch_rc_rate = pitch_srate = 80, *_expo = 0
-# (ACTUAL: max°/s = srate×10; rc_rate=srate & expo=0 ⇒ linear). So a commanded body
-# rate → us at 511.5/800 = 0.639 us per °/s.
+# Reverted 2026-06-22 to the GENTLE 70°/s full-stick curve (the original ACRO bring-up
+# config) — FC setting: roll_rc_rate = roll_srate = pitch_rc_rate = pitch_srate = 7,
+# *_expo = 0 (ACTUAL: max°/s = srate×10; rc_rate=srate & expo=0 ⇒ linear). So a
+# commanded body rate → us at 511.5/70 = 7.307 us per °/s. (Was briefly 800°/s on
+# 06-19 for flip trajectories; reverted to the gentle curve to fly the hover.)
+# yaw stays rc_rate=srate=30 → 300°/s linear (yaw uses YAW_LINEAR_MAX_DPS, not this).
 #   APPLY THE FC CHANGE AND ACRO_MAX_RATE_DPS BELOW TOGETHER — they MUST match, or the
 #   leveling loop sends the wrong us for the curve. KP_ANGLE_RATE does NOT change with
 #   the rate ceiling: the law commands a physical °/s (KP·err) and ACRO_RATE_US_PER_DPS
@@ -79,10 +81,10 @@ KP_ANGLE_RATE = 10.0            # °/s of commanded body rate per ° of attitude
                                # transport-delayed and there is NO FC self-level net
                                # under this loop — if it wobbles FAST, LOWER this; if
                                # it's sluggish to level, raise it.
-ACRO_MAX_RATE_DPS = 800.0      # clamp on the commanded rate = the FC ACTUAL-rate
+ACRO_MAX_RATE_DPS = 70.0       # clamp on the commanded rate = the FC ACTUAL-rate
                                # ceiling. MUST equal the FC's linear full-stick rate
-                               # (rc_rate=srate=80 → 800°/s); full stick at the clamp.
-ACRO_RATE_US_PER_DPS = STICK_FULL_DEFLECTION_US / ACRO_MAX_RATE_DPS   # 0.639 (511.5/800)
+                               # (rc_rate=srate=7 → 70°/s); full stick at the clamp.
+ACRO_RATE_US_PER_DPS = STICK_FULL_DEFLECTION_US / ACRO_MAX_RATE_DPS   # 7.307 (511.5/70)
 
 # ============ stick signs (Air75, verified via test_stick_directions.py) ========
 # us > 1500 ⇒ roll RIGHT / pitch FORWARD (nose down) / yaw RIGHT (CW).

@@ -1,0 +1,34 @@
+{
+  "mask_h": 32,
+  "mask_w": 32,
+  "act_hist_len": 6,
+  "action_dim": 4,
+  "proprio_dim": 37,
+  "proprio_layout": "rot_matrix(9) body_rates(3) action_hist(24) mass(1)",
+  "action_order": "AETR (roll, pitch, throttle, yaw); us = 1500 + 500*clip(a,-1,1)",
+  "control_dt": 0.02,
+  "mass_kg": 0.0344,
+  "gate": {
+    "inner_half": [
+      0.275,
+      0.275
+    ],
+    "frame_width": 0.225,
+    "alt": 1.5,
+    "yaw": 0.0
+  },
+  "camera": {
+    "fov_x_deg": 99.0,
+    "fov_y_deg": 79.8,
+    "mount_pitch_deg": 40.0,
+    "offset_body": [
+      0.02,
+      0.0,
+      -0.05
+    ]
+  },
+  "task": "gate",
+  "drone_model": "air75_wisp",
+  "global_step": 969932800,
+  "hidden_size": 128
+}

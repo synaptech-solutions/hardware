@@ -16,6 +16,10 @@ dependencies = [
     "dash==4.2.0",              # interactive browser dashboards (dashboard_flight.py / dashboard_synced.py)
     "plotly==6.8.0",            # interactive browser dashboards (dashboard_flight.py / dashboard_synced.py)
     "pygame>=2.6.1",
+    "jax==0.9.2",               # CPU gate-segmentation inference (perception/, live_infer.py)
+    "jaxlib==0.9.2",            # CPU XLA backend; 0.9.2 is the newest cp314 wheel (py3.14)
+    "flax==0.12.6",             # GateNetUNet model definition + msgpack weight loading
+    "flatbuffers>=25.12.19",
 ]
 
 [tool.uv]
