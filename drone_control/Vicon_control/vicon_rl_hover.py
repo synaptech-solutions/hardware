@@ -38,6 +38,11 @@ from Vicon_control.rl_policy import MLPPolicy, HoverPolicyController, AxisMap  #
 CSI = "\033["
 REC_DIR = os.path.join(HERE, "flight_logs")
 LAND_TIMEOUT_S = 10.0
+# Live operator THROTTLE SCALE (w/s keys): a multiplier on the policy's throttle
+# command ONLY (roll/pitch/yaw untouched), to trim sim→real hover thrust in flight.
+THROTTLE_SCALE_STEP = 0.1
+THROTTLE_SCALE_MIN = 0.5
+THROTTLE_SCALE_MAX = 5.0
 
 
 def is_armed(mode):
@@ -49,7 +54,7 @@ def clamp(v, lo, hi):
 
 
 def render(state, ch, pose, ctl, tx_armed, fc_armed, record_on, pose_age,
-           flight_mode, pack_v, vic_samples, recording):
+           flight_mode, pack_v, vic_samples, recording, thr_scale=1.0):
     col = {"DISARMED": "0", "ARMED_IDLE": "33", "FLYING": "32", "LANDING": "36"}.get(state, "0")
     arm_txt = (f"{CSI}32mARM{CSI}0m" if tx_armed else "safe")
     fc_txt = "fcARM" if fc_armed else "fc-"
@@ -66,9 +71,12 @@ def render(state, ch, pose, ctl, tx_armed, fc_armed, record_on, pose_age,
     else:
         c = ""
     v = f"{pack_v:.2f}V" if pack_v is not None else "—"
+    # throttle-scale badge — bold yellow whenever it's off the 1.0 default
+    sc = (f"{CSI}1;33mTx{thr_scale:.1f}{CSI}0m" if abs(thr_scale - 1.0) > 1e-9
+          else f"Tx{thr_scale:.1f}")
     sys.stdout.write(
         f"\r{CSI}K[RL] {CSI}{col}m{state:10s}{CSI}0m {arm_txt} {fc_txt} "
-        f"rec{'ON' if record_on else '--'} ACRO | "
+        f"rec{'ON' if record_on else '--'} ACRO {sc} | "
         f"R{ch[channels.CH_ROLL]:4d} P{ch[channels.CH_PITCH]:4d} "
         f"T{ch[channels.CH_THR]:4d} Y{ch[channels.CH_YAW]:4d} | {p} {c} | "
         f"{vic} FC:{flight_mode or '—'} {v}")
@@ -113,9 +121,13 @@ def run(args):
     controller = HoverPolicyController(
         policy, axis_map=AxisMap(), target_alt=target_alt, control_dt=control_dt,
         sign_roll=args.sign_roll, sign_pitch=args.sign_pitch, sign_yaw=args.sign_yaw,
-        land_speed_mps=config.LAND_SPEED_MPS, land_cut_m=config.LAND_CUT_M)
+        land_speed_mps=config.LAND_SPEED_MPS, land_cut_m=config.LAND_CUT_M,
+        mass_kg=args.mass)
     print(f"Hover:    target_alt={controller.target_alt:.2f} m above launch  "
           f"(loop @ trained control_dt={control_dt*1000:.0f} ms = {1.0/control_dt:.0f} Hz)")
+    if controller.mass_kg is not None:
+        _src = "CLI --mass" if args.mass is not None else "policy meta"
+        print(f"Mass:     {controller.mass_kg*1000:.1f} g fed to the policy ({_src})")
 
     cmd_log = CommandLogger()
     telem = TelemetryLogger()
@@ -150,6 +162,7 @@ def run(args):
     fly_t0 = land_t0 = None
     last_ch = None
     ood_t0 = None                 # OOD runaway-climb debounce: when the kill condition first held
+    throttle_scale = 1.0          # live operator throttle multiplier (w = +0.1, s = -0.1)
 
     period = control_dt
     nxt = time.monotonic()
@@ -186,6 +199,8 @@ def run(args):
                 "policy": os.path.abspath(args.policy),
                 "policy_meta": policy.meta,
                 "target_alt_m": controller.target_alt,
+                "mass_kg": controller.mass_kg,
+                "mass_source": ("cli" if args.mass is not None else "policy_meta"),
                 "signs": {"roll": args.sign_roll, "pitch": args.sign_pitch,
                           "yaw": args.sign_yaw}}}
             write_session_json(session, recorder, vicon_rec, cmd_log, telem, cal,
@@ -218,15 +233,19 @@ def run(args):
         tty.setcbreak(stdin_fd)
         print(f"{CSI}36mSPACEBAR = land (policy descends to {config.LAND_CUT_M:.2f} m, "
               f"cut, disarm, save, exit).{CSI}0m")
+        print(f"{CSI}36mW / S = throttle scale +/- {THROTTLE_SCALE_STEP:.1f} (live, "
+              f"throttle only; starts 1.0, clamps {THROTTLE_SCALE_MIN:.1f}-{THROTTLE_SCALE_MAX:.1f}). "
+              f"Keep THIS terminal focused for keys.{CSI}0m")
 
-    def space_pressed():
-        if stdin_fd is None:
-            return False
-        hit = False
-        while select.select([sys.stdin], [], [], 0)[0]:
-            if sys.stdin.read(1) == " ":
-                hit = True
-        return hit
+    def poll_keys():
+        """Drain pending keypresses (cbreak stdin) → list of chars seen this tick."""
+        keys = []
+        if stdin_fd is not None:
+            while select.select([sys.stdin], [], [], 0)[0]:
+                c = sys.stdin.read(1)
+                if c:
+                    keys.append(c)
+        return keys
 
     try:
         while True:
@@ -246,8 +265,20 @@ def run(args):
             tx_armed = raw_armed and seen_disarmed
             record_on = record_switch_on(js, cal.get("record"))
 
-            if space_pressed() and state == "FLYING":
-                land_requested = True
+            for _key in poll_keys():
+                if _key == " ":
+                    if state == "FLYING":
+                        land_requested = True
+                elif _key in ("w", "W"):
+                    throttle_scale = round(min(throttle_scale + THROTTLE_SCALE_STEP,
+                                               THROTTLE_SCALE_MAX), 2)
+                    sys.stdout.write(f"\n{CSI}1;33m⏫ throttle scale → "
+                                     f"{throttle_scale:.1f}{CSI}0m\n")
+                elif _key in ("s", "S"):
+                    throttle_scale = round(max(throttle_scale - THROTTLE_SCALE_STEP,
+                                               THROTTLE_SCALE_MIN), 2)
+                    sys.stdout.write(f"\n{CSI}1;33m⏬ throttle scale → "
+                                     f"{throttle_scale:.1f}{CSI}0m\n")
 
             # --- drain telemetry (battery cutoff + blackbox-synced logging) ---
             sess_active = session["dir"] is not None
@@ -372,7 +403,11 @@ def run(args):
                     us = ctl_out["us"]
                     ch[channels.CH_ROLL] = int(us[0])
                     ch[channels.CH_PITCH] = int(us[1])
-                    ch[channels.CH_THR] = int(us[2])
+                    # Operator throttle scale (live, w/s): scale the policy's throttle
+                    # ABOVE the 1000us idle floor, so x1.0 = unchanged, >1 = more lift,
+                    # <1 = less. Roll/pitch/yaw are sent exactly as the policy commands.
+                    ch[channels.CH_THR] = int(clamp(
+                        1000 + (us[2] - 1000) * throttle_scale, 1000, 2000))
                     ch[channels.CH_YAW] = int(us[3])
 
                     # OOD runaway kill: the policy has driven the drone well above
@@ -417,13 +452,16 @@ def run(args):
 
             if now_mono - last_render > 0.066:
                 render(state, ch, pose, ctl_out, tx_armed, fc_armed, record_on, pose_age,
-                       flight_mode, pack_v, vicon_rec.samples, vicon_rec.recording)
+                       flight_mode, pack_v, vicon_rec.samples, vicon_rec.recording,
+                       thr_scale=throttle_scale)
                 if recorder is not None and CV2_OK:
                     if recorder.recording:
                         frame = recorder.get_latest_frame()
                         if frame is not None:
                             disp = frame.copy()
-                            cv2.putText(disp, f"{state}  T{ch[channels.CH_THR]}  vic{vicon_rec.samples}",
+                            cv2.putText(disp,
+                                        f"{state}  T{ch[channels.CH_THR]} x{throttle_scale:.1f}  "
+                                        f"vic{vicon_rec.samples}",
                                         (14, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
                             cv2.imshow(PREVIEW_WIN, disp)
                             cv2.waitKey(1)
@@ -466,6 +504,10 @@ def build_parser():
                          "(default: the bundled models/hover_acro.npz)")
     ap.add_argument("--target-alt", type=float, default=None,
                     help="hover altitude above launch (m); default = the policy's trained target_alt")
+    ap.add_argument("--mass", type=float, default=None,
+                    help="airframe mass (kg) fed to the policy's mass obs term — "
+                         "play with this to bias the hover throttle the policy picks. "
+                         "Default = the policy's trained meta mass_kg (e.g. 0.0344).")
     ap.add_argument("--js", default="/dev/input/js0", help="joystick device")
     ap.add_argument("--cal-file", default=DEFAULT_CAL_PATH, help="TX12 calibration JSON (shared)")
     ap.add_argument("--sign-roll", type=int, default=1, choices=(1, -1),
