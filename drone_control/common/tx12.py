@@ -40,7 +40,7 @@ def _jsiocgname(length):
     return 0x80006A13 | (length << 16)
 
 
-class Joystick:
+class _LinuxJoystick:
     """Non-blocking reader for /dev/input/jsN. Keeps the latest value of every
     axis and button. The kernel emits a synthetic INIT burst on open, so state
     is fully populated before the operator touches anything."""
@@ -95,6 +95,68 @@ class Joystick:
             os.close(self.fd)
         except OSError:
             pass
+
+
+class _PygameJoystick:
+    """Cross-platform joystick reader using pygame. Presents the same interface
+    as _LinuxJoystick (axes/buttons as dicts with int keys, axis values scaled
+    to signed-16-bit range to match Linux js_event semantics)."""
+
+    _JS_SCALE = 32767  # pygame [-1,1] → Linux [-32767,32767]
+
+    def __init__(self, index=0):
+        import pygame
+        self._pygame = pygame
+        if not pygame.joystick.get_init():
+            pygame.init()
+        if pygame.joystick.get_count() == 0:
+            raise FileNotFoundError("No joysticks found (pygame sees 0 devices)")
+        self._js = pygame.joystick.Joystick(index)
+        self._js.init()
+        self.name = self._js.get_name()
+        self.n_axes = self._js.get_numaxes()
+        self.n_buttons = self._js.get_numbuttons()
+        self.axes = {}
+        self.buttons = {}
+        self.alive = True
+        self.poll(settle=0.05)
+
+    def poll(self, settle=0.0):
+        deadline = time.monotonic() + settle
+        while True:
+            try:
+                self._pygame.event.pump()
+            except self._pygame.error:
+                self.alive = False
+                return
+            for i in range(self.n_axes):
+                self.axes[i] = int(round(self._js.get_axis(i) * self._JS_SCALE))
+            for i in range(self.n_buttons):
+                self.buttons[i] = self._js.get_button(i)
+            if settle <= 0.0 or time.monotonic() >= deadline:
+                return
+            time.sleep(0.005)
+
+    def snapshot(self):
+        return dict(self.axes), dict(self.buttons)
+
+    def close(self):
+        try:
+            self._js.quit()
+        except Exception:
+            pass
+
+
+def Joystick(path="/dev/input/js0"):
+    """Factory: returns a Linux or pygame joystick backend depending on platform."""
+    if sys.platform == "linux":
+        return _LinuxJoystick(path)
+    # macOS / Windows: use pygame, interpret path as device index if numeric
+    try:
+        index = int(path)
+    except (ValueError, TypeError):
+        index = 0
+    return _PygameJoystick(index)
 
 
 # ===================== calibration =====================

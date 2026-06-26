@@ -49,7 +49,7 @@ def clamp(v, lo, hi):
 
 
 def render(state, ch, pose, ctl, tx_armed, fc_armed, record_on, pose_age,
-           flight_mode, pack_v, vic_samples, recording):
+           flight_mode, pack_v, vic_samples, recording, ser_tx=0, ser_rx=0):
     col = {"DISARMED": "0", "ARMED_IDLE": "33", "FLYING": "32", "LANDING": "36"}.get(state, "0")
     arm_txt = (f"{CSI}32mARM{CSI}0m" if tx_armed else "safe")
     fc_txt = "fcARM" if fc_armed else "fc-"
@@ -71,7 +71,7 @@ def render(state, ch, pose, ctl, tx_armed, fc_armed, record_on, pose_age,
         f"rec{'ON' if record_on else '--'} ACRO | "
         f"R{ch[channels.CH_ROLL]:4d} P{ch[channels.CH_PITCH]:4d} "
         f"T{ch[channels.CH_THR]:4d} Y{ch[channels.CH_YAW]:4d} | {p} {c} | "
-        f"{vic} FC:{flight_mode or '—'} {v}")
+        f"{vic} FC:{flight_mode or '—'} {v} tx{ser_tx}B rx{ser_rx}B")
     sys.stdout.flush()
 
 
@@ -113,18 +113,26 @@ def run(args):
     controller = HoverPolicyController(
         policy, axis_map=AxisMap(), target_alt=target_alt, control_dt=control_dt,
         sign_roll=args.sign_roll, sign_pitch=args.sign_pitch, sign_yaw=args.sign_yaw,
-        land_speed_mps=config.LAND_SPEED_MPS, land_cut_m=config.LAND_CUT_M)
+        land_speed_mps=config.LAND_SPEED_MPS, land_cut_m=config.LAND_CUT_M,
+        mass_kg=args.mass_kg)
     print(f"Hover:    target_alt={controller.target_alt:.2f} m above launch  "
           f"(loop @ trained control_dt={control_dt*1000:.0f} ms = {1.0/control_dt:.0f} Hz)")
 
     cmd_log = CommandLogger()
     telem = TelemetryLogger()
+    do_video = CV2_OK and config.RECORD_VIDEO and not args.no_video
     recorder = (VideoRecorder(channels.DEVICE_INDEX, channels.WIDTH, channels.HEIGHT)
-                if (CV2_OK and config.RECORD_VIDEO) else None)
+                if do_video else None)
     vicon_rec = ViconRecorder()
     vicon_rec.prepare(external_udp=source.udp)
-    video_state = ("on" if config.RECORD_VIDEO else "OFF (config.RECORD_VIDEO=False)") \
-        if CV2_OK else "OFF (no cv2)"
+    if args.no_video:
+        video_state = "OFF (--no-video)"
+    elif not CV2_OK:
+        video_state = "OFF (no cv2)"
+    elif not config.RECORD_VIDEO:
+        video_state = "OFF (config.RECORD_VIDEO=False)"
+    else:
+        video_state = "on"
     print(f"Recording: flight_logs/<stamp>/ — video {video_state}"
           f", vicon {vicon_rec.status}, commands+telemetry")
 
@@ -158,6 +166,8 @@ def run(args):
     PREVIEW_WIN = "drone feed — vicon RL hover"
     window_open = False
 
+    ser_tx_bytes = 0
+    ser_rx_bytes = 0
     session = {"dir": None, "t0": None, "stamp": None}
 
     def begin_session():
@@ -253,6 +263,7 @@ def run(args):
             sess_active = session["dir"] is not None
             if ser is not None and ser.in_waiting:
                 chunk = ser.read(ser.in_waiting)
+                ser_rx_bytes += len(chunk)
                 for ftype, payload in parser.feed(chunk):
                     t_wall = time.time()
                     if sess_active:
@@ -407,17 +418,22 @@ def run(args):
             # --- transmit (+ keepalive ping), like the logger ---
             if ser is not None:
                 try:
-                    ser.write(build_rc_channels_packed(ch))
+                    pkt = build_rc_channels_packed(ch)
+                    ser.write(pkt)
+                    ser_tx_bytes += len(pkt)
                 except Exception as e:
                     print(f"\n!! Ranger write failed: {e} — disarming.", flush=True)
                     break
                 if now_mono - last_ping > 2.0:
-                    ser.write(build_device_ping())
+                    ping_pkt = build_device_ping()
+                    ser.write(ping_pkt)
+                    ser_tx_bytes += len(ping_pkt)
                     last_ping = now_mono
 
             if now_mono - last_render > 0.066:
                 render(state, ch, pose, ctl_out, tx_armed, fc_armed, record_on, pose_age,
-                       flight_mode, pack_v, vicon_rec.samples, vicon_rec.recording)
+                       flight_mode, pack_v, vicon_rec.samples, vicon_rec.recording,
+                       ser_tx_bytes, ser_rx_bytes)
                 if recorder is not None and CV2_OK:
                     if recorder.recording:
                         frame = recorder.get_latest_frame()
@@ -466,12 +482,16 @@ def build_parser():
                          "(default: the bundled models/hover_acro.npz)")
     ap.add_argument("--target-alt", type=float, default=None,
                     help="hover altitude above launch (m); default = the policy's trained target_alt")
-    ap.add_argument("--js", default="/dev/input/js0", help="joystick device")
+    ap.add_argument("--no-video", action="store_true", help="disable video recording")
+    js_default = "/dev/input/js0" if sys.platform == "linux" else "0"
+    ap.add_argument("--js", default=js_default, help="joystick device (Linux path or index)")
     ap.add_argument("--cal-file", default=DEFAULT_CAL_PATH, help="TX12 calibration JSON (shared)")
     ap.add_argument("--sign-roll", type=int, default=1, choices=(1, -1),
                     help="flip if the first hover shows roll commanded the wrong way")
     ap.add_argument("--sign-pitch", type=int, default=1, choices=(1, -1))
     ap.add_argument("--sign-yaw", type=int, default=1, choices=(1, -1))
+    ap.add_argument("--mass-kg", type=float, default=None,
+                    help="measured airframe mass (kg); default = policy's trained nominal")
     return ap
 
 
