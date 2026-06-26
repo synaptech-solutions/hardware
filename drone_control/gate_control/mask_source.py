@@ -112,6 +112,11 @@ class MaskSource:
             return None if self._frame is None else self._frame.copy()
 
     @property
+    def undistort_active(self) -> Optional[bool]:
+        """Effective undistort after start() (from infer.json unless overridden)."""
+        return None if self._predictor is None else bool(self._predictor.undistort)
+
+    @property
     def frames(self) -> int:
         return self._frames
 

@@ -134,7 +134,8 @@ def run(args):
                           fps=args.cam_fps, conf=config.GATE_MASK_CONF)
     print("Camera:   starting GateNet mask thread …")
     mask_src.start()
-    print(f"Camera:   {mask_src.status} (mask {policy.mask_h}x{policy.mask_w})")
+    print(f"Camera:   {mask_src.status} (mask {policy.mask_h}x{policy.mask_w}, "
+          f"undistort {mask_src.undistort_active})")
 
     cmd_log = CommandLogger()
     telem = TelemetryLogger()
