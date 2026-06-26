@@ -46,12 +46,13 @@ class MaskSource:
 
     def __init__(self, mask_size: int, *, device: int = 4, width: int = 720,
                  height: int = 480, fps: int = 30, weights_dir: Optional[str] = None,
-                 conf: Optional[float] = None) -> None:
+                 conf: Optional[float] = None, undistort: Optional[bool] = None) -> None:
         self.mask_size = int(mask_size)
         self.device = device
         self.width, self.height, self.fps = width, height, fps
         self.weights_dir = weights_dir
         self.conf = conf                           # threshold the prob, or None for soft
+        self.undistort = undistort                 # override infer.json (e.g. off for a webcam)
 
         self._lock = threading.Lock()
         self._mask = np.zeros((self.mask_size, self.mask_size), np.float32)
@@ -67,6 +68,8 @@ class MaskSource:
     def start(self) -> None:
         kw = {} if self.weights_dir is None else {"weights_dir": self.weights_dir}
         self._predictor = GatePredictor(**kw)
+        if self.undistort is not None:
+            self._predictor.undistort = self.undistort
         cap, dev = open_camera(self.device, self.width, self.height, self.fps)
         self.status = f"/dev/video{dev} {self.width}x{self.height}"
         self._stop.clear()
