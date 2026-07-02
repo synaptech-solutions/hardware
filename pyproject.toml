@@ -5,20 +5,17 @@ description = "Drone control, data logging, and Vicon tracking for hardware flig
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "opencv-python==4.13.0.92",  # video capture/recording (joystick_flight, *video_recorder, camera_setup, tag_hover)
-    "numpy==2.4.6",              # .mat I/O, sync math, geometry (everything)
-    "scipy==1.17.1",            # .mat I/O, sync math, geometry (everything)
-    "pyserial==3.5",            # CRSF over the Ranger USB serial
-    "pupil-apriltags==1.0.4.post11",  # tag detection (tag_hover, drone_detect)
-    "tqdm==4.68.1",             # Vicon sample-rate progress (lab parser)
-    "matplotlib==3.10.9",       # plot_flight.py / plot_synced.py (static PNGs)
-    "PyQt6==6.11.0",            # interactive 3D plot windows (matplotlib --3d)
-    "dash==4.2.0",              # interactive browser dashboards (dashboard_flight.py / dashboard_synced.py)
-    "plotly==6.8.0",            # interactive browser dashboards (dashboard_flight.py / dashboard_synced.py)
-    "jax==0.9.2",               # CPU gate-segmentation inference (perception/, live_infer.py)
-    "jaxlib==0.9.2",            # CPU XLA backend; 0.9.2 is the newest cp314 wheel (py3.14)
-    "flax==0.12.6",             # GateNetUNet model definition + msgpack weight loading
-    "flatbuffers>=25.12.19",
+    "opencv-python==4.13.0.92", # video capture/recording (joystick_flight, *video_recorder, camera_setup, tag_hover)
+    "numpy==2.4.6", # .mat I/O, sync math, geometry (everything)
+    "scipy==1.17.1", # .mat I/O, sync math, geometry (everything)
+    "pyserial==3.5", # CRSF over the Ranger USB serial
+    "pupil-apriltags==1.0.4.post11", # tag detection (tag_hover, drone_detect)
+    "tqdm==4.68.1", # Vicon sample-rate progress (lab parser)
+    "matplotlib==3.10.9", # plot_flight.py / plot_synced.py (static PNGs)
+    "PyQt6==6.11.0", # interactive 3D plot windows (matplotlib --3d)
+    "dash==4.2.0", # interactive browser dashboards (dashboard_flight.py / dashboard_synced.py)
+    "plotly==6.8.0", # interactive browser dashboards (dashboard_flight.py / dashboard_synced.py)
+    "evdev>=1.9.3",
 ]
 
 [tool.uv]

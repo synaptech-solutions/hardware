@@ -1,7 +1,9 @@
 """TX12 USB-joystick input: reader, calibration, and switch interpreters.
 
-The TX12 (EdgeTX) in "USB Joystick (HID)" mode appears as /dev/input/js0
-(7 axes, 24 buttons on this radio). This module reads the gimbals + arm / record /
+The TX12 (EdgeTX) in "USB Joystick (HID)" mode is read here via evdev
+(/dev/input/event*) — the WSL2 kernel has no joydev, so /dev/input/js0 never
+appears. The reader reproduces the joydev contract exactly (see Joystick) so the
+rest of this module is unchanged. It reads the gimbals + arm / record /
 mode switches and maps them to CRSF µs. EdgeTX's channel→USB-axis assignment is
 radio-specific, so the mapping is discovered by `--calibrate` and stored in
 tx12_joystick_cal.json (shared by the data logger and the Vicon controller).
@@ -14,8 +16,10 @@ import os
 import sys
 import json
 import time
-import struct
-import fcntl
+import glob
+import select
+
+from evdev import InputDevice, ecodes
 
 from . import channels
 
@@ -25,74 +29,125 @@ _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 DEFAULT_CAL_PATH = os.path.join(_REPO, "data_logging", "tx12_joystick_cal.json")
 
 
-# --- Linux joystick API (dependency-free; /dev/input/js0) ---
-# js_event is 8 bytes: __u32 time, __s16 value, __u8 type, __u8 number.
-JS_EVENT_FMT = "IhBB"
-JS_EVENT_SIZE = 8
-JS_EVENT_BUTTON = 0x01
-JS_EVENT_AXIS = 0x02
-JS_EVENT_INIT = 0x80          # OR'd into type for the synthetic open-time burst
-JSIOCGAXES = 0x80016A11       # u8: number of axes
-JSIOCGBUTTONS = 0x80016A12    # u8: number of buttons
+# --- TX12 input via evdev (/dev/input/event*) ---
+# The WSL2 kernel ships without joydev (CONFIG_INPUT_JOYDEV unset), so the radio
+# never appears as /dev/input/js0. We read it through evdev instead (which IS in
+# the kernel) and reproduce joydev's contract so the calibration + mapping code
+# below is unchanged:
+#   - axes numbered by ASCENDING EV_ABS code (axis 0,1,2…), exactly as joydev;
+#   - buttons numbered by ascending EV_KEY code;
+#   - axis values normalised to joydev's [-32767, 32767] range.
+# A pre-existing joydev calibration therefore stays meaningful (recalibrate to be
+# safe). This also works on native joydev systems (it reads the same evdev node).
+_NAME_HINTS = ("tx12", "edgetx", "opentx", "radiomaster", "jumper", "joystick")
 
 
-def _jsiocgname(length):
-    return 0x80006A13 | (length << 16)
+def _pick_device(path):
+    """Resolve the TX12's evdev node. Use ``path`` if it's a real event device;
+    otherwise scan /dev/input/event* and pick the best gamepad-like device (one
+    exposing ABS axes), preferring a name that looks like the radio."""
+    if path and path.startswith("/dev/input/event") and os.path.exists(path):
+        return path
+    best, best_score = None, -1
+    denied = []
+    # glob the nodes directly: evdev.list_devices() requires R+W access and skips
+    # nodes we can only read (the TX12's node is root:input, mode 0660).
+    for p in sorted(glob.glob("/dev/input/event*")):
+        try:
+            d = InputDevice(p)
+        except PermissionError:
+            denied.append(p)          # node exists but we can't open it
+            continue
+        except OSError:
+            continue
+        try:
+            has_abs = bool(d.capabilities().get(ecodes.EV_ABS))
+            nm = (d.name or "").lower()
+            score = (10 if has_abs else 0) + sum(2 for h in _NAME_HINTS if h in nm)
+            if has_abs and score > best_score:
+                best, best_score = p, score
+        finally:
+            d.close()
+    if best is None and denied:
+        # Found device node(s) but couldn't open them — almost always because the
+        # shell isn't in the 'input' group. Say so, instead of "no device".
+        raise PermissionError(
+            f"Found input device(s) {denied} but cannot open them (permission). "
+            f"Add yourself to the 'input' group, then start a NEW shell:\n"
+            f"    sudo usermod -aG input $USER     # then open a fresh terminal\n"
+            f"  (for the current shell only: 'newgrp input')")
+    return best
 
 
 class Joystick:
-    """Non-blocking reader for /dev/input/jsN. Keeps the latest value of every
-    axis and button. The kernel emits a synthetic INIT burst on open, so state
-    is fully populated before the operator touches anything."""
+    """Non-blocking TX12 reader over evdev, exposing the SAME interface the joydev
+    reader did: integer-indexed ``.axes`` / ``.buttons`` dicts (axis values in
+    [-32767, 32767]), ``.poll(settle)``, ``.snapshot()``, ``.alive``, ``.name``,
+    ``.n_axes``, ``.n_buttons``. Drop-in for calibration + switch mapping."""
 
     def __init__(self, path):
-        self.path = path
-        self.fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        b = bytearray(1)
-        fcntl.ioctl(self.fd, JSIOCGAXES, b)
-        self.n_axes = b[0]
-        fcntl.ioctl(self.fd, JSIOCGBUTTONS, b)
-        self.n_buttons = b[0]
-        name = bytearray(128)
-        fcntl.ioctl(self.fd, _jsiocgname(128), name)
-        self.name = name.split(b"\x00", 1)[0].decode(errors="replace")
-        self.axes = {}
-        self.buttons = {}
+        self.path = _pick_device(path)
+        if self.path is None:
+            raise FileNotFoundError(
+                "No TX12-like input device found. Attach the TX12 to WSL with "
+                "usbipd (usbipd attach --wsl --busid <X-Y>) and confirm it shows "
+                "up under /dev/input/event*.")
+        self.dev = InputDevice(self.path)
+        os.set_blocking(self.dev.fd, False)
+        self.name = self.dev.name
+        caps = self.dev.capabilities()
+        # axis index = position in ASCENDING EV_ABS code order (joydev's scheme)
+        abs_items = sorted(caps.get(ecodes.EV_ABS, []), key=lambda ci: ci[0])
+        self._abs_idx = {code: i for i, (code, _info) in enumerate(abs_items)}
+        self._absinfo = {code: info for code, info in abs_items}
+        key_codes = sorted(caps.get(ecodes.EV_KEY, []))
+        self._key_idx = {code: i for i, code in enumerate(key_codes)}
+        self.n_axes = len(abs_items)
+        self.n_buttons = len(key_codes)
+        # Seed state from current readings (evdev has no joydev-style INIT burst).
+        self.axes = {i: self._norm(code, self._absinfo[code].value)
+                     for code, i in self._abs_idx.items()}
+        active = set(self.dev.active_keys())
+        self.buttons = {i: (1 if code in active else 0)
+                        for code, i in self._key_idx.items()}
         self.alive = True
-        self.poll(settle=0.05)   # absorb the INIT burst
+
+    def _norm(self, code, value):
+        """Map a raw EV_ABS value onto joydev's [-32767, 32767] using the axis's
+        reported min/max, so calibrated thresholds carry over unchanged."""
+        info = self._absinfo[code]
+        lo, hi = info.min, info.max
+        if hi == lo:
+            return 0
+        return int(round((value - lo) / (hi - lo) * 65534.0 - 32767.0))
 
     def poll(self, settle=0.0):
-        """Drain all pending events. If settle>0, keep reading for that long
-        (used during calibration so a freshly-moved stick's final value lands)."""
+        """Drain all pending events (non-blocking). If settle>0, keep reading for
+        that long so a freshly-moved stick's final value lands (calibration)."""
         deadline = time.monotonic() + settle
         while True:
             try:
-                data = os.read(self.fd, JS_EVENT_SIZE * 128)
+                if select.select([self.dev.fd], [], [], 0)[0]:
+                    for e in self.dev.read():
+                        if e.type == ecodes.EV_ABS and e.code in self._abs_idx:
+                            self.axes[self._abs_idx[e.code]] = self._norm(e.code, e.value)
+                        elif e.type == ecodes.EV_KEY and e.code in self._key_idx:
+                            self.buttons[self._key_idx[e.code]] = 1 if e.value else 0
             except BlockingIOError:
-                data = b""
+                pass
             except OSError:
-                # ENODEV etc. — joystick unplugged.
-                self.alive = False
+                self.alive = False     # device unplugged
                 return
-            for i in range(0, len(data) - JS_EVENT_SIZE + 1, JS_EVENT_SIZE):
-                _t, val, typ, num = struct.unpack(
-                    JS_EVENT_FMT, data[i:i + JS_EVENT_SIZE])
-                base = typ & ~JS_EVENT_INIT
-                if base == JS_EVENT_AXIS:
-                    self.axes[num] = val
-                elif base == JS_EVENT_BUTTON:
-                    self.buttons[num] = val
             if settle <= 0.0 or time.monotonic() >= deadline:
                 return
-            if not data:
-                time.sleep(0.005)
+            time.sleep(0.005)
 
     def snapshot(self):
         return dict(self.axes), dict(self.buttons)
 
     def close(self):
         try:
-            os.close(self.fd)
+            self.dev.close()
         except OSError:
             pass
 
